@@ -44,6 +44,8 @@ pub struct Milestone {
     pub valid_after_ledger: u32,
     pub proof_hash: String,
     pub status: MilestoneStatus,
+    /// Ledger at which the most recent proof was submitted; 0 if never submitted.
+    pub proof_submitted_at: u32,
 }
 
 /// Top-level lifecycle state of an engagement.
@@ -118,7 +120,8 @@ pub struct AmendmentProposal {
 /// Alias for the frontend-facing name used by `get_pending_amendment`.
 pub type PendingAmendment = AmendmentProposal;
 
-/// The full engagement record stored on-chain
+/// The full engagement record stored on-chain — note that `proof_submitted_at` on
+/// each milestone is set by `submit_proof` and consumed by `force_confirm_milestone`.
 #[contracttype]
 #[derive(Clone)]
 pub struct Engagement {
@@ -275,6 +278,10 @@ pub enum DataKey {
     InactivityTimeoutLedgers,
     /// Admin-configurable storage TTL extension in ledgers (issue #40).
     StorageTtlExtendTo,
+    /// Admin-configurable confirm window in ledgers (default 86_400 — ~5 days).
+    ConfirmWindow,
+    /// Admin-configurable dispute window in ledgers (default 51_840 — ~3 days).
+    DisputeWindow,
     /// Contract version string (e.g. "0.2.0") for deployment verification (issue #16).
     Version,
     /// Minimum engagement amount in stroops to prevent dust engagements (issue #17).
@@ -294,9 +301,12 @@ const DEFAULT_MAX_RETENTION_DAYS: u32 = 365;
 const DEFAULT_INACTIVITY_TIMEOUT_LEDGERS: u32 = 1_036_800; // ~60 days
 const DEFAULT_STORAGE_TTL_EXTEND_TO: u32 = 1_036_800; // ~60 days
 const DEFAULT_VERSION: &str = "0.2.0";
-const DEFAULT_MIN_ENGAGEMENT_AMOUNT: i128 = 100_000; // 0.01 USDC
+const DEFAULT_MIN_ENGAGEMENT_AMOUNT: i128 = 100_000;  // 0.01 USDC
+const DEFAULT_CONFIRM_WINDOW_LEDGERS: u32 = 86_400;   // ~5 days
+const DEFAULT_DISPUTE_WINDOW_LEDGERS: u32 = 51_840;   // ~3 days
 const MAX_VERSION_LENGTH: u32 = 32;
 const MAX_PROOF_HASH_LENGTH: u32 = 200;
+const MAX_ENGAGEMENT_ID_LENGTH: u32 = 64;
 
 #[contractimpl]
 impl HireSettleContract {
@@ -507,6 +517,24 @@ impl HireSettleContract {
     ) -> String {
         Self::assert_not_paused(&env);
         company.require_auth();
+
+        // Validate engagement_id format: non-empty, ≤ 64 chars, [A-Za-z0-9-] only.
+        if engagement_id.len() == 0 || engagement_id.len() > MAX_ENGAGEMENT_ID_LENGTH {
+            panic!("InvalidEngagementId");
+        }
+        let id_len = engagement_id.len() as usize;
+        let mut id_buf = [0u8; MAX_ENGAGEMENT_ID_LENGTH as usize];
+        engagement_id.copy_into_slice(&mut id_buf[..id_len]);
+        for i in 0..id_len {
+            let b = id_buf[i];
+            let valid = (b >= b'A' && b <= b'Z')
+                || (b >= b'a' && b <= b'z')
+                || (b >= b'0' && b <= b'9')
+                || b == b'-';
+            if !valid {
+                panic!("InvalidEngagementId");
+            }
+        }
 
         if total_amount <= 0 {
             panic!("amount must be greater than zero");
@@ -792,6 +820,7 @@ impl HireSettleContract {
 
         milestone.proof_hash = proof_hash;
         milestone.status = MilestoneStatus::ProofSubmitted;
+        milestone.proof_submitted_at = current_ledger;
         engagement.milestones.set(milestone_index, milestone);
 
         if engagement.status == EngagementStatus::ReplacementRequested {
@@ -948,6 +977,17 @@ impl HireSettleContract {
 
         if milestone.status != MilestoneStatus::ProofSubmitted {
             panic!("can only dispute a submitted proof");
+        }
+
+        let current_ledger = env.ledger().sequence();
+        let dispute_window = env
+            .storage()
+            .instance()
+            .get(&DataKey::DisputeWindow)
+            .unwrap_or(DEFAULT_DISPUTE_WINDOW_LEDGERS);
+
+        if current_ledger > milestone.proof_submitted_at + dispute_window {
+            panic!("DisputeWindowClosed");
         }
 
         milestone.status = MilestoneStatus::Disputed;
@@ -2360,6 +2400,158 @@ impl HireSettleContract {
         env.storage()
             .persistent()
             .get(&DataKey::DisputeReason(engagement_id, milestone_index))
+    }
+
+    // ----------------------------------------------------------
+    // CONFIRM WINDOW — AUTO-CONFIRM AFTER INACTION
+    // ----------------------------------------------------------
+
+    /// Admin sets the confirm window in ledgers.
+    /// Default is 86_400 (~5 days at 5 s/ledger).
+    pub fn set_confirm_window(env: Env, admin: Address, ledgers: u32) {
+        Self::assert_admin(&env, &admin);
+        env.storage()
+            .instance()
+            .set(&DataKey::ConfirmWindow, &ledgers);
+        env.events()
+            .publish((Symbol::new(&env, "confirm_window_set"),), ledgers);
+    }
+
+    /// Return the current confirm window in ledgers.
+    pub fn get_confirm_window(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::ConfirmWindow)
+            .unwrap_or(DEFAULT_CONFIRM_WINDOW_LEDGERS)
+    }
+
+    // ----------------------------------------------------------
+    // DISPUTE WINDOW
+    // ----------------------------------------------------------
+
+    /// Admin sets the dispute window in ledgers.
+    /// Default is 51_840 (~3 days at 5 s/ledger).
+    pub fn set_dispute_window(env: Env, admin: Address, ledgers: u32) {
+        Self::assert_admin(&env, &admin);
+        env.storage()
+            .instance()
+            .set(&DataKey::DisputeWindow, &ledgers);
+        env.events()
+            .publish((Symbol::new(&env, "dispute_window_set"),), ledgers);
+    }
+
+    /// Return the current dispute window in ledgers.
+    pub fn get_dispute_window(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::DisputeWindow)
+            .unwrap_or(DEFAULT_DISPUTE_WINDOW_LEDGERS)
+    }
+
+    /// Force-confirm a milestone after the company has taken no action within the
+    /// configured confirm window.  Callable by anyone once the window has elapsed.
+    ///
+    /// Succeeds only when:
+    ///   - `current_ledger > proof_submitted_at + confirm_window`
+    ///   - milestone status is exactly `ProofSubmitted`
+    ///
+    /// Releases payment to the recruiter (with platform fee) and emits
+    /// `milestone_force_confirmed`.
+    pub fn force_confirm_milestone(
+        env: Env,
+        caller: Address,
+        engagement_id: String,
+        milestone_index: u32,
+    ) {
+        Self::assert_not_paused(&env);
+        caller.require_auth();
+
+        let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
+
+        if engagement.status != EngagementStatus::Active {
+            panic!("engagement is not active");
+        }
+
+        let mut milestone = engagement
+            .milestones
+            .get(milestone_index)
+            .unwrap_or_else(|| panic!("invalid milestone index"));
+
+        if milestone.status != MilestoneStatus::ProofSubmitted {
+            panic!("milestone is not in ProofSubmitted status");
+        }
+
+        let current_ledger = env.ledger().sequence();
+        let window = env
+            .storage()
+            .instance()
+            .get(&DataKey::ConfirmWindow)
+            .unwrap_or(DEFAULT_CONFIRM_WINDOW_LEDGERS);
+
+        if current_ledger <= milestone.proof_submitted_at + window {
+            panic!("ConfirmWindowNotElapsed");
+        }
+
+        // Release payment identically to confirm_milestone.
+        let payment = (engagement.total_amount * milestone.payment_percent as i128) / 100;
+        let platform_fee = Self::get_platform_fee_internal(&env);
+        let fee_amount = (payment * platform_fee.bps as i128) / 10_000;
+        let recruiter_payment = payment - fee_amount;
+        engagement.released_amount += payment;
+
+        let token_client = token::Client::new(&env, &engagement.token);
+        if fee_amount > 0 {
+            token_client.transfer(
+                &env.current_contract_address(),
+                &platform_fee.treasury,
+                &fee_amount,
+            );
+            env.events().publish(
+                (
+                    Symbol::new(&env, "platform_fee_collected"),
+                    engagement_id.clone(),
+                ),
+                (milestone_index, fee_amount, platform_fee.treasury),
+            );
+        }
+        token_client.transfer(
+            &env.current_contract_address(),
+            &engagement.recruiter,
+            &recruiter_payment,
+        );
+
+        milestone.status = MilestoneStatus::Confirmed;
+        engagement.milestones.set(milestone_index, milestone);
+
+        let all_done = (0..engagement.milestones.len()).all(|i| {
+            let s = engagement.milestones.get(i).unwrap().status;
+            s == MilestoneStatus::Confirmed || s == MilestoneStatus::Resolved
+        });
+
+        if all_done {
+            engagement.status = EngagementStatus::Completed;
+        }
+        engagement.last_activity_ledger = env.ledger().sequence();
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Engagement(engagement_id.clone()), &engagement);
+        Self::extend_engagement_ttl(&env, &engagement_id);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "milestone_force_confirmed"),
+                engagement_id.clone(),
+            ),
+            (milestone_index, payment),
+        );
+
+        if all_done {
+            env.events().publish(
+                (Symbol::new(&env, "engagement_completed"), engagement_id.clone()),
+                (engagement_id.clone(), engagement.released_amount, env.ledger().sequence()),
+            );
+        }
     }
 
     // ----------------------------------------------------------

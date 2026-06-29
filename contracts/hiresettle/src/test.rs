@@ -55,6 +55,7 @@ fn build_milestones(env: &Env) -> Vec<Milestone> {
             valid_after_ledger: 0,
             proof_hash: String::from_str(env, ""),
             status: MilestoneStatus::Pending,
+            proof_submitted_at: 0,
         },
         Milestone {
             name: String::from_str(env, "30-Day Retention"),
@@ -63,6 +64,7 @@ fn build_milestones(env: &Env) -> Vec<Milestone> {
             valid_after_ledger: 0,
             proof_hash: String::from_str(env, ""),
             status: MilestoneStatus::Locked,
+            proof_submitted_at: 0,
         },
         Milestone {
             name: String::from_str(env, "90-Day Retention"),
@@ -71,6 +73,7 @@ fn build_milestones(env: &Env) -> Vec<Milestone> {
             valid_after_ledger: 0,
             proof_hash: String::from_str(env, ""),
             status: MilestoneStatus::Locked,
+            proof_submitted_at: 0,
         },
     ]
 }
@@ -179,6 +182,7 @@ fn test_create_engagement_invalid_percentages() {
             valid_after_ledger: 0,
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
+            proof_submitted_at: 0,
         },
         Milestone {
             name: String::from_str(&env, "Retention"),
@@ -187,6 +191,7 @@ fn test_create_engagement_invalid_percentages() {
             valid_after_ledger: 0,
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Locked,
+            proof_submitted_at: 0,
         },
     ];
 
@@ -537,6 +542,7 @@ fn test_two_milestone_engagement_50_50() {
             valid_after_ledger: 0,
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
+            proof_submitted_at: 0,
         },
         Milestone {
             name: String::from_str(&env, "30-Day Retention"),
@@ -545,6 +551,7 @@ fn test_two_milestone_engagement_50_50() {
             valid_after_ledger: 0,
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Locked,
+            proof_submitted_at: 0,
         },
     ];
 
@@ -2295,6 +2302,7 @@ fn test_batch_confirm_atomic_rejection() {
             valid_after_ledger: 0,
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
+            proof_submitted_at: 0,
         },
         Milestone {
             name: String::from_str(&env, "Milestone B"),
@@ -2303,6 +2311,7 @@ fn test_batch_confirm_atomic_rejection() {
             valid_after_ledger: 0,
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
+            proof_submitted_at: 0,
         },
     ];
 
@@ -2346,6 +2355,7 @@ fn test_batch_confirm_emits_event_per_milestone() {
             valid_after_ledger: 0,
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
+            proof_submitted_at: 0,
         },
         Milestone {
             name: String::from_str(&env, "M2"),
@@ -2354,6 +2364,7 @@ fn test_batch_confirm_emits_event_per_milestone() {
             valid_after_ledger: 0,
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
+            proof_submitted_at: 0,
         },
     ];
 
@@ -2492,4 +2503,478 @@ fn test_dispute_reason_cleared_after_reject_resolution() {
 
     let reason = client.get_dispute_reason(&eng_id, &0);
     assert_eq!(reason, None);
+}
+
+// ============================================================
+// CONFIRM WINDOW — force_confirm_milestone
+// ============================================================
+
+#[test]
+fn test_get_confirm_window_default() {
+    let (env, contract_id, _token_id, _company, _recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    // Default is 86_400 ledgers (~5 days)
+    assert_eq!(client.get_confirm_window(), 86_400);
+}
+
+#[test]
+fn test_set_confirm_window_admin() {
+    let (env, contract_id, _token_id, company, _recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    client.set_confirm_window(&company, &500u32);
+    assert_eq!(client.get_confirm_window(), 500);
+}
+
+#[test]
+#[should_panic(expected = "unauthorized")]
+fn test_set_confirm_window_non_admin_rejected() {
+    let (env, contract_id, _token_id, _company, recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    client.set_confirm_window(&recruiter, &500u32);
+}
+
+/// force_confirm must fail if the window has NOT yet elapsed.
+#[test]
+#[should_panic(expected = "ConfirmWindowNotElapsed")]
+fn test_force_confirm_before_window_fails() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    // Short window: 100 ledgers
+    client.set_confirm_window(&company, &100u32);
+
+    let eng_id = String::from_str(&env, "ENG-FC-EARLY");
+    create_standard_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-FC-EARLY",
+    );
+
+    client.submit_proof(
+        &recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://proof"),
+    );
+
+    // Advance only 50 ledgers — window is 100, must not succeed
+    advance_ledger(&env, 50);
+
+    // Anyone (recruiter here) tries to force-confirm too early
+    client.force_confirm_milestone(&recruiter, &eng_id, &0);
+}
+
+/// force_confirm must succeed after the window has elapsed and release payment.
+#[test]
+fn test_force_confirm_after_window_releases_payment() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_id);
+
+    // Short window: 100 ledgers
+    client.set_confirm_window(&company, &100u32);
+
+    let eng_id = String::from_str(&env, "ENG-FC-OK");
+    create_standard_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-FC-OK",
+    );
+
+    client.submit_proof(
+        &recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://proof"),
+    );
+
+    // Advance past the window
+    advance_ledger(&env, 101);
+
+    // Third party (arbiter) force-confirms
+    client.force_confirm_milestone(&arbiter, &eng_id, &0);
+
+    // Milestone must now be Confirmed
+    let m0 = client.get_milestone(&eng_id, &0);
+    assert_eq!(m0.status, MilestoneStatus::Confirmed);
+
+    // Recruiter must have received 30% of 1_000_000_000
+    let expected = 1_000_000_000i128 * 30 / 100;
+    assert_eq!(token_client.balance(&recruiter), expected);
+
+    // released_amount must be updated
+    let eng = client.get_engagement(&eng_id);
+    assert_eq!(eng.released_amount, expected);
+}
+
+/// milestone_force_confirmed event must be emitted.
+#[test]
+fn test_force_confirm_emits_event() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    client.set_confirm_window(&company, &100u32);
+
+    let eng_id = String::from_str(&env, "ENG-FC-EVT");
+    create_standard_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-FC-EVT",
+    );
+
+    client.submit_proof(
+        &recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://proof"),
+    );
+
+    advance_ledger(&env, 101);
+    client.force_confirm_milestone(&recruiter, &eng_id, &0);
+
+    assert!(has_event(&env, "milestone_force_confirmed"));
+}
+
+/// Non-ProofSubmitted milestones (e.g. Pending) must not be force-confirmable.
+#[test]
+#[should_panic(expected = "milestone is not in ProofSubmitted status")]
+fn test_force_confirm_wrong_status_rejected() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    client.set_confirm_window(&company, &100u32);
+
+    let eng_id = String::from_str(&env, "ENG-FC-STATUS");
+    create_standard_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-FC-STATUS",
+    );
+
+    // Milestone 0 is still Pending (no proof submitted)
+    advance_ledger(&env, 200);
+    client.force_confirm_milestone(&recruiter, &eng_id, &0);
+}
+
+/// Locked milestones must also be rejected by force_confirm.
+#[test]
+#[should_panic(expected = "milestone is not in ProofSubmitted status")]
+fn test_force_confirm_locked_milestone_rejected() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    client.set_confirm_window(&company, &100u32);
+
+    let eng_id = String::from_str(&env, "ENG-FC-LOCKED");
+    create_standard_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-FC-LOCKED",
+    );
+
+    // Milestone 1 is Locked
+    advance_ledger(&env, 200);
+    client.force_confirm_milestone(&recruiter, &eng_id, &1);
+}
+
+/// Confirming the last milestone via force_confirm must mark the engagement Completed.
+#[test]
+fn test_force_confirm_last_milestone_completes_engagement() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_id);
+
+    // Short window: 100 ledgers — set before creating engagement
+    client.set_confirm_window(&company, &100u32);
+
+    // Use a single-milestone engagement for simplicity
+    let milestones = vec![
+        &env,
+        Milestone {
+            name: String::from_str(&env, "Placement"),
+            payment_percent: 100,
+            kind: MilestoneKind::Placement,
+            valid_after_ledger: 0,
+            proof_hash: String::from_str(&env, ""),
+            status: MilestoneStatus::Pending,
+            proof_submitted_at: 0,
+        },
+    ];
+
+    let eng_id = String::from_str(&env, "ENG-FC-COMPLETE");
+    client.create_engagement(
+        &eng_id,
+        &company,
+        &recruiter,
+        &ArbiterSetup { arbiters: vec![&env, arbiter.clone()], quorum: 1 },
+        &token_id,
+        &1_000_000_000,
+        &String::from_str(&env, "CTO"),
+        &milestones,
+        &vec![&env],
+        &None,
+    );
+
+    client.submit_proof(
+        &recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://proof"),
+    );
+
+    advance_ledger(&env, 101);
+    client.force_confirm_milestone(&arbiter, &eng_id, &0);
+
+    let eng = client.get_engagement(&eng_id);
+    assert_eq!(eng.status, EngagementStatus::Completed);
+    assert_eq!(token_client.balance(&recruiter), 1_000_000_000);
+    assert_eq!(eng.released_amount, 1_000_000_000);
+}
+
+// ============================================================
+// DISPUTE WINDOW — raise_dispute gated by proof_submitted_at
+// ============================================================
+
+#[test]
+fn test_get_dispute_window_default() {
+    let (env, contract_id, _token_id, _company, _recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    // Default is 51_840 ledgers (~3 days)
+    assert_eq!(client.get_dispute_window(), 51_840);
+}
+
+#[test]
+fn test_set_dispute_window_admin() {
+    let (env, contract_id, _token_id, company, _recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    client.set_dispute_window(&company, &200u32);
+    assert_eq!(client.get_dispute_window(), 200);
+}
+
+#[test]
+#[should_panic(expected = "unauthorized")]
+fn test_set_dispute_window_non_admin_rejected() {
+    let (env, contract_id, _token_id, _company, recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    client.set_dispute_window(&recruiter, &200u32);
+}
+
+/// Dispute raised within the window must succeed.
+#[test]
+fn test_dispute_within_window_accepted() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    // Short window: 200 ledgers
+    client.set_dispute_window(&company, &200u32);
+
+    let eng_id = String::from_str(&env, "ENG-DW-IN");
+    create_standard_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-DW-IN",
+    );
+
+    client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://proof"));
+
+    // Advance only 100 ledgers — well within the 200-ledger window
+    advance_ledger(&env, 100);
+
+    // Must succeed
+    client.raise_dispute(&company, &eng_id, &0, &String::from_str(&env, "wrong_doc"));
+    let m0 = client.get_milestone(&eng_id, &0);
+    assert_eq!(m0.status, MilestoneStatus::Disputed);
+}
+
+/// Dispute raised after the window must be rejected.
+#[test]
+#[should_panic(expected = "DisputeWindowClosed")]
+fn test_dispute_outside_window_rejected() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    // Short window: 200 ledgers
+    client.set_dispute_window(&company, &200u32);
+
+    let eng_id = String::from_str(&env, "ENG-DW-OUT");
+    create_standard_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-DW-OUT",
+    );
+
+    client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://proof"));
+
+    // Advance 201 ledgers — past the window
+    advance_ledger(&env, 201);
+
+    client.raise_dispute(&company, &eng_id, &0, &String::from_str(&env, "too_late"));
+}
+
+/// Dispute at exactly the boundary (current_ledger == proof_submitted_at + window) must succeed.
+#[test]
+fn test_dispute_at_boundary_accepted() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    // Window: 200 ledgers. proof submitted at ledger 100.
+    // Boundary: current_ledger == 100 + 200 == 300.
+    client.set_dispute_window(&company, &200u32);
+
+    let eng_id = String::from_str(&env, "ENG-DW-BOUND");
+    create_standard_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-DW-BOUND",
+    );
+
+    client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://proof"));
+
+    // Advance exactly to the boundary (200 ledgers from submission at 100 → seq 300)
+    advance_ledger(&env, 200);
+
+    // current_ledger (300) <= proof_submitted_at (100) + window (200) → allowed
+    client.raise_dispute(&company, &eng_id, &0, &String::from_str(&env, "boundary"));
+    let m0 = client.get_milestone(&eng_id, &0);
+    assert_eq!(m0.status, MilestoneStatus::Disputed);
+}
+
+/// One ledger past the boundary must be rejected.
+#[test]
+#[should_panic(expected = "DisputeWindowClosed")]
+fn test_dispute_one_past_boundary_rejected() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    client.set_dispute_window(&company, &200u32);
+
+    let eng_id = String::from_str(&env, "ENG-DW-PAST");
+    create_standard_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-DW-PAST",
+    );
+
+    client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://proof"));
+
+    // 201 ledgers past submission → current_ledger (301) > 100 + 200
+    advance_ledger(&env, 201);
+
+    client.raise_dispute(&company, &eng_id, &0, &String::from_str(&env, "one_past"));
+}
+
+/// Admin can update the window; new engagements immediately use the updated value.
+#[test]
+fn test_dispute_window_admin_update_takes_effect() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    // Start with a tight window of 50 ledgers
+    client.set_dispute_window(&company, &50u32);
+
+    let eng_id = String::from_str(&env, "ENG-DW-UPDATE");
+    create_standard_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-DW-UPDATE",
+    );
+
+    client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://proof"));
+
+    // Advance 60 ledgers — past the 50-ledger window
+    advance_ledger(&env, 60);
+
+    // Admin widens the window to 200 — dispute should now be allowed
+    client.set_dispute_window(&company, &200u32);
+
+    // current_ledger (160) <= 100 + 200 → should succeed
+    client.raise_dispute(&company, &eng_id, &0, &String::from_str(&env, "updated_window"));
+    let m0 = client.get_milestone(&eng_id, &0);
+    assert_eq!(m0.status, MilestoneStatus::Disputed);
+}
+
+// ============================================================
+// ENGAGEMENT ID FORMAT VALIDATION
+// ============================================================
+
+fn create_engagement_with_id(
+    env: &Env,
+    client: &HireSettleContractClient,
+    token_id: &Address,
+    company: &Address,
+    recruiter: &Address,
+    arbiter: &Address,
+    id: &str,
+) {
+    client.create_engagement(
+        &String::from_str(env, id),
+        company,
+        recruiter,
+        &ArbiterSetup {
+            arbiters: vec![env, arbiter.clone()],
+            quorum: 1,
+        },
+        token_id,
+        &1_000_000_000,
+        &String::from_str(env, "Engineer"),
+        &build_milestones(env),
+        &vec![env, 30u32, 90u32],
+        &None,
+    );
+}
+
+#[test]
+fn test_engagement_id_standard_format_accepted() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    // Documented example format
+    create_engagement_with_id(&env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-2026-001");
+    assert_eq!(
+        client.get_engagement(&String::from_str(&env, "ENG-2026-001")).status,
+        EngagementStatus::Active
+    );
+}
+
+#[test]
+fn test_engagement_id_all_alphanumeric_accepted() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    create_engagement_with_id(&env, &client, &token_id, &company, &recruiter, &arbiter, "ENG001");
+    assert_eq!(
+        client.get_engagement(&String::from_str(&env, "ENG001")).status,
+        EngagementStatus::Active
+    );
+}
+
+#[test]
+fn test_engagement_id_64_chars_accepted() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    // Exactly 64 characters
+    let id = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    assert_eq!(id.len(), 64);
+    create_engagement_with_id(&env, &client, &token_id, &company, &recruiter, &arbiter, id);
+    assert_eq!(
+        client.get_engagement(&String::from_str(&env, id)).status,
+        EngagementStatus::Active
+    );
+}
+
+#[test]
+#[should_panic(expected = "InvalidEngagementId")]
+fn test_engagement_id_65_chars_rejected() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    // Exactly 65 characters
+    let id = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    assert_eq!(id.len(), 65);
+    create_engagement_with_id(&env, &client, &token_id, &company, &recruiter, &arbiter, id);
+}
+
+#[test]
+#[should_panic(expected = "InvalidEngagementId")]
+fn test_engagement_id_empty_rejected() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    create_engagement_with_id(&env, &client, &token_id, &company, &recruiter, &arbiter, "");
+}
+
+#[test]
+#[should_panic(expected = "InvalidEngagementId")]
+fn test_engagement_id_space_rejected() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    create_engagement_with_id(&env, &client, &token_id, &company, &recruiter, &arbiter, "ENG 001");
+}
+
+#[test]
+#[should_panic(expected = "InvalidEngagementId")]
+fn test_engagement_id_slash_rejected() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    create_engagement_with_id(&env, &client, &token_id, &company, &recruiter, &arbiter, "ENG/001");
+}
+
+#[test]
+#[should_panic(expected = "InvalidEngagementId")]
+fn test_engagement_id_underscore_rejected() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    create_engagement_with_id(&env, &client, &token_id, &company, &recruiter, &arbiter, "ENG_001");
+}
+
+#[test]
+#[should_panic(expected = "InvalidEngagementId")]
+fn test_engagement_id_dot_rejected() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    create_engagement_with_id(&env, &client, &token_id, &company, &recruiter, &arbiter, "ENG.001");
 }
