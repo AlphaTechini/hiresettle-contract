@@ -8,14 +8,23 @@ const MAX_PLATFORM_FEE_BPS: u32 = 500;
 // DATA TYPES
 // ============================================================
 
+/// Lifecycle state of a single milestone.
 #[contracttype]
 #[derive(Clone, PartialEq, Debug)]
 pub enum MilestoneStatus {
+    /// Retention milestones start here; `unlock_milestone` moves them to `Pending`
+    /// once the required ledger window has elapsed.
     Locked,
+    /// The milestone is open: the recruiter may submit a proof hash.
     Pending,
+    /// The recruiter has submitted a proof hash; the company must now confirm or raise a dispute.
     ProofSubmitted,
+    /// The company confirmed the proof; payment has been released to the recruiter.
     Confirmed,
+    /// The company raised a dispute; arbiters must vote before the milestone can progress.
     Disputed,
+    /// Arbiters voted to approve the milestone payment (dispute resolved in recruiter's favour).
+    /// The milestone counts as done for the purposes of completing the engagement.
     Resolved,
 }
 
