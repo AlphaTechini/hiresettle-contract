@@ -83,21 +83,33 @@ pub type PendingAmendment = AmendmentProposal;
 #[contracttype]
 #[derive(Clone)]
 pub struct Engagement {
+    /// Unique string identifier chosen by the caller at `create_engagement` time.
     pub id: String,
+    /// The hiring company; only this address can confirm milestones, raise disputes, or cancel.
     pub company: Address,
+    /// The recruitment agency or recruiter receiving milestone payments.
     pub recruiter: Address,
     /// Ordered list of arbiters; quorum of these must agree to resolve a dispute.
     pub arbiters: Vec<Address>,
     /// Number of arbiter votes required to resolve a dispute (M of N).
     pub quorum: u32,
+    /// SAC address of the token held in escrow (e.g. USDC).
     pub token: Address,
+    /// Total fee locked in escrow at creation, in the token's smallest unit.
     pub total_amount: i128,
+    /// Cumulative amount already paid out across all confirmed/resolved milestones.
+    /// `total_amount - released_amount` equals the remaining escrow balance.
     pub released_amount: i128,
+    /// Free-text job title stored on-chain for display purposes.
     pub job_title: String,
     /// Optional IPFS CID linking to full job description / contract terms off-chain.
     pub metadata_hash: Option<String>,
+    /// Ledger sequence number at which the engagement was created.
     pub created_at_ledger: u32,
+    /// Ledger sequence number of the most recent state-changing call.
+    /// Used by `expire_engagement` to detect inactivity.
     pub last_activity_ledger: u32,
+    /// Ordered list of milestones; indices are stable and used throughout the contract API.
     pub milestones: Vec<Milestone>,
     pub status: EngagementStatus,
 }
