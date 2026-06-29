@@ -116,13 +116,32 @@ pub struct EngagementSummary {
     pub created_at_ledger: u32,
 }
 
-/// Per-dispute vote tally stored on-chain until the dispute resolves.
+/// Per-dispute, per-milestone vote tally stored on-chain until the dispute resolves.
+/// Cleared once the dispute is resolved or rejected.
 #[contracttype]
 #[derive(Clone)]
 pub struct ArbiterVoteRecord {
+    /// Number of arbiters who voted to approve payment to the recruiter.
     pub approve_votes: u32,
+    /// Number of arbiters who voted to reject payment and return the milestone to `Pending`.
     pub reject_votes: u32,
+    /// Addresses that have already cast a vote; prevents double-voting.
     pub voted: Vec<Address>,
+}
+
+/// Passed to `create_engagement` to configure the arbitration panel for an engagement.
+///
+/// Soroban's 10-parameter limit prevents passing these as individual args, so they
+/// are bundled into this struct.
+#[contracttype]
+#[derive(Clone)]
+pub struct ArbiterSetup {
+    /// Ordered list of arbiter addresses eligible to vote on disputes.
+    /// Must contain at least one address. All addresses must be distinct.
+    pub arbiters: Vec<Address>,
+    /// Number of votes required to resolve a dispute (M-of-N).
+    /// Must be ≥ 1 and ≤ `arbiters.len()`.
+    pub quorum: u32,
 }
 
 /// Returned by `get_arbiter_votes`.
@@ -131,15 +150,6 @@ pub struct ArbiterVoteRecord {
 pub struct ArbiterVoteCounts {
     pub approve_votes: u32,
     pub reject_votes: u32,
-}
-
-/// Bundles the arbiter list and quorum for `create_engagement`, keeping the
-/// parameter count within Soroban's 10-parameter limit.
-#[contracttype]
-#[derive(Clone)]
-pub struct ArbiterSetup {
-    pub arbiters: Vec<Address>,
-    pub quorum: u32,
 }
 
 /// Stored under `DataKey::PendingArbiter` during succession.
