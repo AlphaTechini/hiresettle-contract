@@ -28,21 +28,38 @@ pub enum MilestoneStatus {
     Resolved,
 }
 
+/// Distinguishes the two business-logic types of milestones.
 #[contracttype]
 #[derive(Clone, PartialEq)]
 pub enum MilestoneKind {
+    /// Triggered by the recruiter placing a candidate (offer accepted).
+    /// Starts `Pending` so the recruiter can submit proof immediately.
     Placement,
+    /// Triggered by the candidate remaining employed past a time gate.
+    /// Starts `Locked`; `unlock_milestone` moves it to `Pending` once
+    /// `env.ledger().sequence() >= valid_after_ledger`.
     Retention,
 }
 
 #[contracttype]
 #[derive(Clone)]
 pub struct Milestone {
+    /// Human-readable label shown in the UI (e.g. "30-day retention").
     pub name: String,
+    /// Percentage of `total_amount` released when this milestone is confirmed.
+    /// All milestone percentages across an engagement must sum to exactly 100.
     pub payment_percent: u32,
+    /// Business-logic type of this milestone — see [`MilestoneKind`].
+    /// Determines the starting status and whether a time gate applies.
     pub kind: MilestoneKind,
+    /// Ledger sequence number at or after which a `Retention` milestone can be unlocked.
+    /// Always `0` for `Placement` milestones (no time gate).
     pub valid_after_ledger: u32,
+    /// IPFS CID (or any URI) submitted by the recruiter as proof.
+    /// Empty string initially; populated by `submit_proof`; cleared back to empty
+    /// when a dispute is rejected or a replacement is requested.
     pub proof_hash: String,
+    /// Current lifecycle position of the milestone — see [`MilestoneStatus`].
     pub status: MilestoneStatus,
     /// Ledger at which the most recent proof was submitted; 0 if never submitted.
     pub proof_submitted_at: u32,
