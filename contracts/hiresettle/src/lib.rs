@@ -700,9 +700,28 @@ impl HireSettleContract {
     // SUBMIT PROOF
     // ----------------------------------------------------------
 
-    /// Recruiter submits a proof document for a Pending milestone.
-    /// Rejects with `ResubmitTooSoon` if called again within the configured
-    /// cooldown window after the previous submission on the same milestone.
+    /// Submit an IPFS CID (or any URI) as proof that a milestone deliverable has been met.
+    ///
+    /// # Caller
+    /// `recruiter` — must match the engagement's recruiter address and sign the transaction.
+    ///
+    /// # Behaviour
+    /// - The engagement must be `Active` or `ReplacementRequested`.
+    /// - The target milestone must be in `Pending` status (i.e. already unlocked).
+    /// - If a proof was previously submitted and rejected, the caller must wait
+    ///   `proof_cooldown` ledgers (default 2 880 ≈ 4 hours) before resubmitting.
+    /// - After successful submission the milestone moves to `ProofSubmitted`.
+    /// - If the engagement was `ReplacementRequested` and this is the placement milestone,
+    ///   the engagement reverts to `Active`.
+    ///
+    /// # Panics
+    /// - `"engagement not active"` — engagement is not `Active` or `ReplacementRequested`.
+    /// - `"milestone not pending"` — milestone is not in `Pending` status.
+    /// - `"proof cooldown active"` — resubmitting too soon after a previous proof.
+    /// - `"proof hash cannot be empty"` — empty string passed as `proof_hash`.
+    ///
+    /// # Events
+    /// Emits `("proof_submitted", engagement_id)` with `(milestone_index, proof_hash)`.
     pub fn submit_proof(
         env: Env,
         recruiter: Address,
