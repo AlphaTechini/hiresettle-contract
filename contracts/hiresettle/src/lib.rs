@@ -37,14 +37,44 @@ pub struct Milestone {
     pub status: MilestoneStatus,
 }
 
+/// Top-level lifecycle state of an engagement.
 #[contracttype]
 #[derive(Clone, PartialEq, Debug)]
 pub enum EngagementStatus {
+    /// The engagement is active and milestones can be submitted, confirmed,
+    /// disputed, or otherwise progressed through the normal workflow.
     Active,
+
+    /// All milestones have reached either `Confirmed` or `Resolved` and the
+    /// full engagement fee has been released to the recruiter.
+    ///
+    /// Terminal state — no further state transitions are possible.
     Completed,
+
+    /// The engagement was mutually cancelled by the company and recruiter
+    /// before completion. Any unreleased escrow has been refunded to the
+    /// company.
+    ///
+    /// Terminal state.
     Cancelled,
+
+    /// The company requested a replacement candidate after a previously
+    /// accepted placement. The placement milestone is reset to `Pending`
+    /// while the recruiter searches for a replacement. Once new placement
+    /// proof is submitted, the engagement returns to `Active`.
     ReplacementRequested,
+
+    /// The recruiter has requested an early exit from the engagement.
+    /// The company must either accept the request (which cancels the
+    /// engagement and refunds any unreleased escrow) or reject it,
+    /// returning the engagement to `Active`.
     ExitRequested,
+
+    /// The engagement exceeded the configured inactivity timeout and was
+    /// closed through `expire_engagement`. Any unreleased escrow was
+    /// refunded to the company.
+    ///
+    /// Terminal state.
     Expired,
 }
 
