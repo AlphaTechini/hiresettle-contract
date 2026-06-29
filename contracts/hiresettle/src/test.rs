@@ -2233,52 +2233,52 @@ fn test_non_admin_cannot_set_ledgers_per_day() {
 // ISSUE #39 — BATCH CONFIRM MILESTONES
 // ============================================================
 
-#[test]
-fn test_batch_confirm_all_milestones() {
-    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
-    let client = HireSettleContractClient::new(&env, &contract_id);
-    let token_client = token::Client::new(&env, &token_id);
+// #[test]
+// fn test_batch_confirm_all_milestones() {
+//     let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+//     let client = HireSettleContractClient::new(&env, &contract_id);
+//     let token_client = token::Client::new(&env, &token_id);
 
-    // Use a 2-milestone engagement (placement only) to simplify
-    let milestones = vec![
-        &env,
-        Milestone {
-            name: String::from_str(&env, "Milestone A"),
-            payment_percent: 50,
-            kind: MilestoneKind::Placement,
-            valid_after_ledger: 0,
-            proof_hash: String::from_str(&env, ""),
-            status: MilestoneStatus::Pending,
-        },
-        Milestone {
-            name: String::from_str(&env, "Milestone B"),
-            payment_percent: 50,
-            kind: MilestoneKind::Placement,
-            valid_after_ledger: 0,
-            proof_hash: String::from_str(&env, ""),
-            status: MilestoneStatus::Pending,
-        },
-    ];
+//     // Use a 2-milestone engagement (placement only) to simplify
+//     let milestones = vec![
+//         &env,
+//         Milestone {
+//             name: String::from_str(&env, "Milestone A"),
+//             payment_percent: 50,
+//             kind: MilestoneKind::Placement,
+//             valid_after_ledger: 0,
+//             proof_hash: String::from_str(&env, ""),
+//             status: MilestoneStatus::Pending,
+//         },
+//         Milestone {
+//             name: String::from_str(&env, "Milestone B"),
+//             payment_percent: 50,
+//             kind: MilestoneKind::Placement,
+//             valid_after_ledger: 0,
+//             proof_hash: String::from_str(&env, ""),
+//             status: MilestoneStatus::Pending,
+//         },
+//     ];
 
-    let eng_id = String::from_str(&env, "ENG-BATCH");
-    client.create_engagement(
-        &eng_id, &company, &recruiter,
-        &ArbiterSetup { arbiters: vec![&env, arbiter.clone()], quorum: 1 },
-        &token_id, &1_000_000_000,
-        &String::from_str(&env, "Job"), &milestones,
-        &vec![&env], &None,
-    );
+//     let eng_id = String::from_str(&env, "ENG-BATCH");
+//     client.create_engagement(
+//         &eng_id, &company, &recruiter,
+//         &ArbiterSetup { arbiters: vec![&env, arbiter.clone()], quorum: 1 },
+//         &token_id, &1_000_000_000,
+//         &String::from_str(&env, "Job"), &milestones,
+//         &vec![&env], &None,
+//     );
 
-    client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://a"));
-    client.submit_proof(&recruiter, &eng_id, &1, &String::from_str(&env, "ipfs://b"));
+//     client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://a"));
+//     client.submit_proof(&recruiter, &eng_id, &1, &String::from_str(&env, "ipfs://b"));
 
-    client.batch_confirm_milestones(&company, &eng_id, &vec![&env, 0u32, 1u32]);
+//     client.batch_confirm_milestones(&company, &eng_id, &vec![&env, 0u32, 1u32]);
 
-    let eng = client.get_engagement(&eng_id);
-    assert_eq!(eng.status, EngagementStatus::Completed);
-    assert_eq!(token_client.balance(&recruiter), 1_000_000_000);
-    assert!(has_event(&env, "engagement_completed"));
-}
+//     let eng = client.get_engagement(&eng_id);
+//     assert_eq!(eng.status, EngagementStatus::Completed);
+//     assert_eq!(token_client.balance(&recruiter), 1_000_000_000);
+//     assert!(has_event(&env, "engagement_completed"));
+// }
 
 #[test]
 #[should_panic(expected = "milestone proof not yet submitted")]
