@@ -200,6 +200,10 @@ pub enum DataKey {
     InactivityTimeoutLedgers,
     /// Admin-configurable storage TTL extension in ledgers (issue #40).
     StorageTtlExtendTo,
+    /// Contract version string (e.g. "0.2.0") for deployment verification (issue #16).
+    Version,
+    /// Minimum engagement amount in stroops to prevent dust engagements (issue #17).
+    MinEngagementAmount,
 }
 
 // ============================================================
@@ -214,6 +218,10 @@ const DEFAULT_PROOF_COOLDOWN: u32 = 2_880;   // ~4 hours
 const DEFAULT_MAX_RETENTION_DAYS: u32 = 365;
 const DEFAULT_INACTIVITY_TIMEOUT_LEDGERS: u32 = 1_036_800;  // ~60 days
 const DEFAULT_STORAGE_TTL_EXTEND_TO: u32 = 1_036_800;  // ~60 days
+const DEFAULT_VERSION: &str = "0.2.0";
+const DEFAULT_MIN_ENGAGEMENT_AMOUNT: i128 = 100_000;  // 0.01 USDC
+const MAX_VERSION_LENGTH: u32 = 32;
+const MAX_PROOF_HASH_LENGTH: u32 = 200;
 
 #[contractimpl]
 impl HireSettleContract {
@@ -231,6 +239,18 @@ impl HireSettleContract {
                 bps: 0,
                 treasury: admin,
             },
+        );
+        
+        // Issue #16: Initialize contract version
+        env.storage().persistent().set(
+            &DataKey::Version,
+            &String::from_str(&env, DEFAULT_VERSION),
+        );
+        
+        // Issue #17: Initialize minimum engagement amount
+        env.storage().persistent().set(
+            &DataKey::MinEngagementAmount,
+            &DEFAULT_MIN_ENGAGEMENT_AMOUNT,
         );
     }
 
@@ -264,6 +284,32 @@ impl HireSettleContract {
     pub fn get_platform_fee(env: Env) -> (u32, Address) {
         let fee = Self::get_platform_fee_internal(&env);
         (fee.bps, fee.treasury)
+    }
+
+    /// Admin sets the contract version string (issue #16).
+    /// `version` must be ≤ 32 characters.
+    /// Panics with "VersionTooLong" if version exceeds 32 chars.
+    /// Panics with "unauthorized" if caller is not admin.
+    pub fn set_version(env: Env, admin: Address, version: String) {
+        Self::assert_admin(&env, &admin);
+        
+        if version.len() > MAX_VERSION_LENGTH {
+            panic!("VersionTooLong");
+        }
+        
+        env.storage().persistent().set(&DataKey::Version, &version);
+        env.events()
+            .publish((Symbol::new(&env, "version_set"),), version);
+    }
+
+    /// Admin sets the minimum engagement amount in stroops (issue #17).
+    /// Panics with "unauthorized" if caller is not admin.
+    pub fn set_min_amount(env: Env, admin: Address, amount: i128) {
+        Self::assert_admin(&env, &admin);
+        
+        env.storage().persistent().set(&DataKey::MinEngagementAmount, &amount);
+        env.events()
+            .publish((Symbol::new(&env, "min_amount_set"),), amount);
     }
 
     /// Pause state-changing contract operations.
@@ -388,6 +434,12 @@ impl HireSettleContract {
             panic!("amount must be greater than zero");
         }
 
+        // Issue #17: Minimum amount validation
+        let min_amount = Self::get_min_amount(env.clone());
+        if total_amount < min_amount {
+            panic!("AmountBelowMinimum");
+        }
+
         // Issue #26: reject token if allowlist is active and token not in it.
         let allowlist_enabled: bool = env
             .storage()
@@ -442,7 +494,7 @@ impl HireSettleContract {
 
         let current_ledger = env.ledger().sequence();
         let lpd = Self::get_ledgers_per_day_internal(&env);
-        let max_retention_days = Self::get_max_retention_days(&env);
+        let max_retention_days = Self::get_max_retention_days(env.clone());
         let mut retention_index: u32 = 0;
         let mut resolved_milestones: Vec<Milestone> = Vec::new(&env);
 
@@ -456,6 +508,12 @@ impl HireSettleContract {
                 MilestoneKind::Retention => {
                     let days = retention_days.get(retention_index).unwrap_or(30);
                     retention_index += 1;
+                    
+                    // Issue #19: Zero retention days validation
+                    if days == 0 {
+                        panic!("RetentionDaysZero");
+                    }
+                    
                     if days > max_retention_days {
                         panic!("RetentionDaysTooLarge");
                     }
@@ -471,7 +529,7 @@ impl HireSettleContract {
 
         let engagement = Engagement {
             id: engagement_id.clone(),
-            company,
+            company: company.clone(),
             recruiter,
             arbiters,
             quorum,
@@ -589,6 +647,16 @@ impl HireSettleContract {
         proof_hash: String,
     ) {
         Self::assert_not_paused(&env);
+        
+        // Issue #20: Proof hash format validation (before require_auth for fail-fast)
+        if proof_hash.len() == 0 {
+            panic!("InvalidProofHash");
+        }
+        
+        if proof_hash.len() > MAX_PROOF_HASH_LENGTH {
+            panic!("ProofHashTooLong");
+        }
+        
         recruiter.require_auth();
 
         let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
@@ -1103,6 +1171,24 @@ impl HireSettleContract {
     // ----------------------------------------------------------
     // READ-ONLY QUERIES
     // ----------------------------------------------------------
+
+    /// Get the deployed contract version string (issue #16).
+    /// No authentication required.
+    pub fn get_version(env: Env) -> String {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Version)
+            .unwrap_or_else(|| String::from_str(&env, DEFAULT_VERSION))
+    }
+
+    /// Get the current minimum engagement amount in stroops (issue #17).
+    /// No authentication required.
+    pub fn get_min_amount(env: Env) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MinEngagementAmount)
+            .unwrap_or(DEFAULT_MIN_ENGAGEMENT_AMOUNT)
+    }
 
     pub fn get_engagement(env: Env, engagement_id: String) -> Engagement {
         Self::get_engagement_internal(&env, &engagement_id)
@@ -1910,7 +1996,7 @@ impl HireSettleContract {
             panic!("Cannot expire completed engagement");
         }
 
-        let timeout = Self::get_inactivity_timeout_ledgers(&env);
+        let timeout = Self::get_inactivity_timeout_ledgers(env.clone());
         let current_ledger = env.ledger().sequence();
 
         if current_ledger <= engagement.last_activity_ledger + timeout {
@@ -1960,7 +2046,7 @@ impl HireSettleContract {
 
     /// Helper to extend TTL for engagement storage.
     fn extend_engagement_ttl(env: &Env, engagement_id: &String) {
-        let extend_to = Self::get_storage_ttl_extend_to(env);
+        let extend_to = Self::get_storage_ttl_extend_to(env.clone());
         env.storage().persistent().extend_ttl(
             &DataKey::Engagement(engagement_id.clone()),
             100_000,
