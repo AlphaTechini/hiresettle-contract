@@ -2328,8 +2328,29 @@ impl HireSettleContract {
             .unwrap_or(DEFAULT_INACTIVITY_TIMEOUT_LEDGERS)
     }
 
-    /// Expire an engagement after inactivity timeout.
-    /// Permissionless after timeout.
+    /// Mark an engagement as `Expired` and refund the remaining escrow to the company.
+    /// This is a **permissionless keeper function** — any address may call it; no signature
+    /// is required. It is designed to be triggered by off-chain bots or backend pollers.
+    ///
+    /// # Expiry Condition
+    /// The engagement is eligible for expiry when:
+    /// `env.ledger().sequence() - last_activity_ledger >= inactivity_timeout_ledgers`
+    ///
+    /// The default `inactivity_timeout_ledgers` is set at contract initialisation and can be
+    /// updated by the admin via `set_inactivity_timeout_ledgers`.
+    ///
+    /// # Behaviour
+    /// - The engagement must not be `Completed`.
+    /// - Any escrow balance not yet released (`total_amount - released_amount`) is transferred
+    ///   back to the company address.
+    /// - The engagement status is set to `Expired`.
+    ///
+    /// # Panics
+    /// - `"Cannot expire completed engagement"` — engagement is already `Completed`.
+    /// - `"Inactivity timeout not reached"` — the inactivity threshold has not yet been reached.
+    ///
+    /// # Events
+    /// Emits `("engagement_expired", engagement_id)` with the refund amount.
     pub fn expire_engagement(env: Env, engagement_id: String) {
         let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
 
