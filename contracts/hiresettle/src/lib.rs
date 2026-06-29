@@ -1963,7 +1963,25 @@ impl HireSettleContract {
     // ISSUE #32 — RECRUITER EARLY-EXIT
     // ----------------------------------------------------------
 
-    /// Recruiter requests an early exit. Sets engagement to ExitRequested.
+    /// Signal that the recruiter wishes to exit the engagement early without completing
+    /// all remaining milestones.
+    ///
+    /// This is the first step of the three-step early-exit protocol. After calling this,
+    /// the company must respond with [`accept_early_exit`] or [`reject_early_exit`].
+    ///
+    /// # Caller
+    /// `recruiter` — must match the engagement's recruiter and sign the transaction.
+    ///
+    /// # Behaviour
+    /// Sets the engagement status to `ExitRequested`. The company must then call
+    /// [`accept_early_exit`] or [`reject_early_exit`].
+    ///
+    /// # Panics
+    /// - `"engagement is not active"` — engagement is not `Active`.
+    /// - `"unauthorized"` — caller is not the recruiter.
+    ///
+    /// # Events
+    /// Emits `("early_exit_requested", engagement_id)`.
     pub fn request_early_exit(env: Env, recruiter: Address, engagement_id: String) {
         Self::assert_not_paused(&env);
         recruiter.require_auth();
@@ -1994,7 +2012,27 @@ impl HireSettleContract {
         );
     }
 
-    /// Company accepts the early exit: refunds unreleased balance, moves to Cancelled.
+    /// Accept the recruiter's early-exit request.
+    ///
+    /// This is the second step of the early-exit protocol, called by the company in
+    /// response to a prior [`request_early_exit`]. See also [`reject_early_exit`] for
+    /// the alternative resolution.
+    ///
+    /// # Caller
+    /// `company` — must match the engagement's company and sign the transaction.
+    ///
+    /// # Behaviour
+    /// - Pays the recruiter for every milestone already `Confirmed` or `Resolved`
+    ///   (proportional to `released_amount`).
+    /// - Refunds the remaining escrow balance (`total_amount - released_amount`) to the company.
+    /// - Sets the engagement status to `Cancelled`.
+    ///
+    /// # Panics
+    /// - `"no exit request pending"` — engagement is not in `ExitRequested` status.
+    /// - `"unauthorized"` — caller is not the company.
+    ///
+    /// # Events
+    /// Emits `("early_exit_accepted", engagement_id)` with the refund amount.
     pub fn accept_early_exit(env: Env, company: Address, engagement_id: String) {
         Self::assert_not_paused(&env);
         company.require_auth();
@@ -2035,7 +2073,25 @@ impl HireSettleContract {
         );
     }
 
-    /// Company rejects the early exit: returns engagement to Active.
+    /// Reject the recruiter's early-exit request, returning the engagement to `Active`.
+    ///
+    /// This is the second step of the early-exit protocol, called by the company in
+    /// response to a prior [`request_early_exit`]. See also [`accept_early_exit`] for
+    /// the alternative resolution.
+    ///
+    /// # Caller
+    /// `company` — must match the engagement's company and sign the transaction.
+    ///
+    /// # Behaviour
+    /// Sets the engagement status back to `Active`. The recruiter must continue working
+    /// through the remaining milestones.
+    ///
+    /// # Panics
+    /// - `"no exit request pending"` — engagement is not in `ExitRequested` status.
+    /// - `"unauthorized"` — caller is not the company.
+    ///
+    /// # Events
+    /// Emits `("early_exit_rejected", engagement_id)`.
     pub fn reject_early_exit(env: Env, company: Address, engagement_id: String) {
         Self::assert_not_paused(&env);
         company.require_auth();
