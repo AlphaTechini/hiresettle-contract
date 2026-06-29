@@ -8,14 +8,23 @@ const MAX_PLATFORM_FEE_BPS: u32 = 500;
 // DATA TYPES
 // ============================================================
 
+/// Lifecycle state of a single milestone.
 #[contracttype]
 #[derive(Clone, PartialEq, Debug)]
 pub enum MilestoneStatus {
+    /// Retention milestones start here; `unlock_milestone` moves them to `Pending`
+    /// once the required ledger window has elapsed.
     Locked,
+    /// The milestone is open: the recruiter may submit a proof hash.
     Pending,
+    /// The recruiter has submitted a proof hash; the company must now confirm or raise a dispute.
     ProofSubmitted,
+    /// The company confirmed the proof; payment has been released to the recruiter.
     Confirmed,
+    /// The company raised a dispute; arbiters must vote before the milestone can progress.
     Disputed,
+    /// Arbiters voted to approve the milestone payment (dispute resolved in recruiter's favour).
+    /// The milestone counts as done for the purposes of completing the engagement.
     Resolved,
 }
 
@@ -39,14 +48,44 @@ pub struct Milestone {
     pub proof_submitted_at: u32,
 }
 
+/// Top-level lifecycle state of an engagement.
 #[contracttype]
 #[derive(Clone, PartialEq, Debug)]
 pub enum EngagementStatus {
+    /// The engagement is active and milestones can be submitted, confirmed,
+    /// disputed, or otherwise progressed through the normal workflow.
     Active,
+
+    /// All milestones have reached either `Confirmed` or `Resolved` and the
+    /// full engagement fee has been released to the recruiter.
+    ///
+    /// Terminal state — no further state transitions are possible.
     Completed,
+
+    /// The engagement was mutually cancelled by the company and recruiter
+    /// before completion. Any unreleased escrow has been refunded to the
+    /// company.
+    ///
+    /// Terminal state.
     Cancelled,
+
+    /// The company requested a replacement candidate after a previously
+    /// accepted placement. The placement milestone is reset to `Pending`
+    /// while the recruiter searches for a replacement. Once new placement
+    /// proof is submitted, the engagement returns to `Active`.
     ReplacementRequested,
+
+    /// The recruiter has requested an early exit from the engagement.
+    /// The company must either accept the request (which cancels the
+    /// engagement and refunds any unreleased escrow) or reject it,
+    /// returning the engagement to `Active`.
     ExitRequested,
+
+    /// The engagement exceeded the configured inactivity timeout and was
+    /// closed through `expire_engagement`. Any unreleased escrow was
+    /// refunded to the company.
+    ///
+    /// Terminal state.
     Expired,
 }
 
@@ -86,46 +125,91 @@ pub type PendingAmendment = AmendmentProposal;
 #[contracttype]
 #[derive(Clone)]
 pub struct Engagement {
+    /// Unique string identifier chosen by the caller at `create_engagement` time.
     pub id: String,
+    /// The hiring company; only this address can confirm milestones, raise disputes, or cancel.
     pub company: Address,
+    /// The recruitment agency or recruiter receiving milestone payments.
     pub recruiter: Address,
     /// Ordered list of arbiters; quorum of these must agree to resolve a dispute.
     pub arbiters: Vec<Address>,
     /// Number of arbiter votes required to resolve a dispute (M of N).
     pub quorum: u32,
+    /// SAC address of the token held in escrow (e.g. USDC).
     pub token: Address,
+    /// Total fee locked in escrow at creation, in the token's smallest unit.
     pub total_amount: i128,
+    /// Cumulative amount already paid out across all confirmed/resolved milestones.
+    /// `total_amount - released_amount` equals the remaining escrow balance.
     pub released_amount: i128,
+    /// Free-text job title stored on-chain for display purposes.
     pub job_title: String,
     /// Optional IPFS CID linking to full job description / contract terms off-chain.
     pub metadata_hash: Option<String>,
+    /// Ledger sequence number at which the engagement was created.
     pub created_at_ledger: u32,
+    /// Ledger sequence number of the most recent state-changing call.
+    /// Used by `expire_engagement` to detect inactivity.
     pub last_activity_ledger: u32,
+    /// Ordered list of milestones; indices are stable and used throughout the contract API.
     pub milestones: Vec<Milestone>,
     pub status: EngagementStatus,
 }
 
+/// A lightweight read-only view of an engagement, suitable for list/dashboard APIs.
+///
+/// For full milestone detail, use `get_engagement`.
 #[contracttype]
 #[derive(Clone)]
 pub struct EngagementSummary {
+    /// Unique engagement identifier.
     pub id: String,
+    /// Free-text job title stored at creation time.
     pub job_title: String,
+    /// The hiring company address.
     pub company: Address,
+    /// The recruiter address receiving milestone payments.
     pub recruiter: Address,
+    /// Total fee locked in escrow at creation, in the token's smallest unit.
     pub total_amount: i128,
+    /// Cumulative amount paid out across all confirmed/resolved milestones so far.
+    ///
+    /// Remaining escrow = `total_amount - released_amount`.
     pub released_amount: i128,
+    /// Current lifecycle status of the engagement.
     pub status: EngagementStatus,
+    /// Total number of milestones in the engagement (does not change after creation).
     pub milestone_count: u32,
+    /// Ledger sequence number at which the engagement was created.
     pub created_at_ledger: u32,
 }
 
-/// Per-dispute vote tally stored on-chain until the dispute resolves.
+/// Per-dispute, per-milestone vote tally stored on-chain until the dispute resolves.
+/// Cleared once the dispute is resolved or rejected.
 #[contracttype]
 #[derive(Clone)]
 pub struct ArbiterVoteRecord {
+    /// Number of arbiters who voted to approve payment to the recruiter.
     pub approve_votes: u32,
+    /// Number of arbiters who voted to reject payment and return the milestone to `Pending`.
     pub reject_votes: u32,
+    /// Addresses that have already cast a vote; prevents double-voting.
     pub voted: Vec<Address>,
+}
+
+/// Passed to `create_engagement` to configure the arbitration panel for an engagement.
+///
+/// Soroban's 10-parameter limit prevents passing these as individual args, so they
+/// are bundled into this struct.
+#[contracttype]
+#[derive(Clone)]
+pub struct ArbiterSetup {
+    /// Ordered list of arbiter addresses eligible to vote on disputes.
+    /// Must contain at least one address. All addresses must be distinct.
+    pub arbiters: Vec<Address>,
+    /// Number of votes required to resolve a dispute (M-of-N).
+    /// Must be ≥ 1 and ≤ `arbiters.len()`.
+    pub quorum: u32,
 }
 
 /// Returned by `get_arbiter_votes`.
@@ -134,15 +218,6 @@ pub struct ArbiterVoteRecord {
 pub struct ArbiterVoteCounts {
     pub approve_votes: u32,
     pub reject_votes: u32,
-}
-
-/// Bundles the arbiter list and quorum for `create_engagement`, keeping the
-/// parameter count within Soroban's 10-parameter limit.
-#[contracttype]
-#[derive(Clone)]
-pub struct ArbiterSetup {
-    pub arbiters: Vec<Address>,
-    pub quorum: u32,
 }
 
 /// Stored under `DataKey::PendingArbiter` during succession.
@@ -220,11 +295,11 @@ pub enum DataKey {
 #[contract]
 pub struct HireSettleContract;
 
-const LEDGERS_PER_DAY: u32 = 17_280;        // 86 400s ÷ 5s per ledger
-const DEFAULT_PROOF_COOLDOWN: u32 = 2_880;   // ~4 hours
+const LEDGERS_PER_DAY: u32 = 17_280; // 86 400s ÷ 5s per ledger
+const DEFAULT_PROOF_COOLDOWN: u32 = 2_880; // ~4 hours
 const DEFAULT_MAX_RETENTION_DAYS: u32 = 365;
-const DEFAULT_INACTIVITY_TIMEOUT_LEDGERS: u32 = 1_036_800;  // ~60 days
-const DEFAULT_STORAGE_TTL_EXTEND_TO: u32 = 1_036_800;  // ~60 days
+const DEFAULT_INACTIVITY_TIMEOUT_LEDGERS: u32 = 1_036_800; // ~60 days
+const DEFAULT_STORAGE_TTL_EXTEND_TO: u32 = 1_036_800; // ~60 days
 const DEFAULT_VERSION: &str = "0.2.0";
 const DEFAULT_MIN_ENGAGEMENT_AMOUNT: i128 = 100_000;  // 0.01 USDC
 const DEFAULT_CONFIRM_WINDOW_LEDGERS: u32 = 86_400;   // ~5 days
@@ -250,13 +325,12 @@ impl HireSettleContract {
                 treasury: admin,
             },
         );
-        
+
         // Issue #16: Initialize contract version
-        env.storage().persistent().set(
-            &DataKey::Version,
-            &String::from_str(&env, DEFAULT_VERSION),
-        );
-        
+        env.storage()
+            .persistent()
+            .set(&DataKey::Version, &String::from_str(&env, DEFAULT_VERSION));
+
         // Issue #17: Initialize minimum engagement amount
         env.storage().persistent().set(
             &DataKey::MinEngagementAmount,
@@ -302,11 +376,11 @@ impl HireSettleContract {
     /// Panics with "unauthorized" if caller is not admin.
     pub fn set_version(env: Env, admin: Address, version: String) {
         Self::assert_admin(&env, &admin);
-        
+
         if version.len() > MAX_VERSION_LENGTH {
             panic!("VersionTooLong");
         }
-        
+
         env.storage().persistent().set(&DataKey::Version, &version);
         env.events()
             .publish((Symbol::new(&env, "version_set"),), version);
@@ -316,8 +390,10 @@ impl HireSettleContract {
     /// Panics with "unauthorized" if caller is not admin.
     pub fn set_min_amount(env: Env, admin: Address, amount: i128) {
         Self::assert_admin(&env, &admin);
-        
-        env.storage().persistent().set(&DataKey::MinEngagementAmount, &amount);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::MinEngagementAmount, &amount);
         env.events()
             .publish((Symbol::new(&env, "min_amount_set"),), amount);
     }
@@ -396,7 +472,9 @@ impl HireSettleContract {
         if admin != stored_admin {
             panic!("unauthorized");
         }
-        env.storage().instance().set(&DataKey::ProofCooldown, &ledgers);
+        env.storage()
+            .instance()
+            .set(&DataKey::ProofCooldown, &ledgers);
     }
 
     fn get_proof_cooldown(env: &Env) -> u32 {
@@ -536,12 +614,12 @@ impl HireSettleContract {
                 MilestoneKind::Retention => {
                     let days = retention_days.get(retention_index).unwrap_or(30);
                     retention_index += 1;
-                    
+
                     // Issue #19: Zero retention days validation
                     if days == 0 {
                         panic!("RetentionDaysZero");
                     }
-                    
+
                     if days > max_retention_days {
                         panic!("RetentionDaysTooLarge");
                     }
@@ -664,9 +742,28 @@ impl HireSettleContract {
     // SUBMIT PROOF
     // ----------------------------------------------------------
 
-    /// Recruiter submits a proof document for a Pending milestone.
-    /// Rejects with `ResubmitTooSoon` if called again within the configured
-    /// cooldown window after the previous submission on the same milestone.
+    /// Submit an IPFS CID (or any URI) as proof that a milestone deliverable has been met.
+    ///
+    /// # Caller
+    /// `recruiter` — must match the engagement's recruiter address and sign the transaction.
+    ///
+    /// # Behaviour
+    /// - The engagement must be `Active` or `ReplacementRequested`.
+    /// - The target milestone must be in `Pending` status (i.e. already unlocked).
+    /// - If a proof was previously submitted and rejected, the caller must wait
+    ///   `proof_cooldown` ledgers (default 2 880 ≈ 4 hours) before resubmitting.
+    /// - After successful submission the milestone moves to `ProofSubmitted`.
+    /// - If the engagement was `ReplacementRequested` and this is the placement milestone,
+    ///   the engagement reverts to `Active`.
+    ///
+    /// # Panics
+    /// - `"engagement not active"` — engagement is not `Active` or `ReplacementRequested`.
+    /// - `"milestone not pending"` — milestone is not in `Pending` status.
+    /// - `"proof cooldown active"` — resubmitting too soon after a previous proof.
+    /// - `"proof hash cannot be empty"` — empty string passed as `proof_hash`.
+    ///
+    /// # Events
+    /// Emits `("proof_submitted", engagement_id)` with `(milestone_index, proof_hash)`.
     pub fn submit_proof(
         env: Env,
         recruiter: Address,
@@ -675,16 +772,16 @@ impl HireSettleContract {
         proof_hash: String,
     ) {
         Self::assert_not_paused(&env);
-        
+
         // Issue #20: Proof hash format validation (before require_auth for fail-fast)
         if proof_hash.len() == 0 {
             panic!("InvalidProofHash");
         }
-        
+
         if proof_hash.len() > MAX_PROOF_HASH_LENGTH {
             panic!("ProofHashTooLong");
         }
-        
+
         recruiter.require_auth();
 
         let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
@@ -836,8 +933,15 @@ impl HireSettleContract {
 
         if all_done {
             env.events().publish(
-                (Symbol::new(&env, "engagement_completed"), engagement_id.clone()),
-                (engagement_id.clone(), engagement.released_amount, env.ledger().sequence()),
+                (
+                    Symbol::new(&env, "engagement_completed"),
+                    engagement_id.clone(),
+                ),
+                (
+                    engagement_id.clone(),
+                    engagement.released_amount,
+                    env.ledger().sequence(),
+                ),
             );
         }
     }
@@ -932,8 +1036,8 @@ impl HireSettleContract {
             panic!("engagement is not active");
         }
 
-        let is_arbiter = (0..engagement.arbiters.len())
-            .any(|i| engagement.arbiters.get(i).unwrap() == arbiter);
+        let is_arbiter =
+            (0..engagement.arbiters.len()).any(|i| engagement.arbiters.get(i).unwrap() == arbiter);
         if !is_arbiter {
             panic!("unauthorized");
         }
@@ -945,15 +1049,15 @@ impl HireSettleContract {
         }
 
         let vote_key = DataKey::ArbiterVotes(engagement_id.clone(), milestone_index);
-        let mut record: ArbiterVoteRecord = env
-            .storage()
-            .persistent()
-            .get(&vote_key)
-            .unwrap_or(ArbiterVoteRecord {
-                approve_votes: 0,
-                reject_votes: 0,
-                voted: Vec::new(&env),
-            });
+        let mut record: ArbiterVoteRecord =
+            env.storage()
+                .persistent()
+                .get(&vote_key)
+                .unwrap_or(ArbiterVoteRecord {
+                    approve_votes: 0,
+                    reject_votes: 0,
+                    voted: Vec::new(&env),
+                });
 
         // Reject duplicate votes.
         for i in 0..record.voted.len() {
@@ -1000,7 +1104,10 @@ impl HireSettleContract {
             }
 
             env.storage().persistent().remove(&vote_key);
-            env.storage().persistent().remove(&DataKey::DisputeReason(engagement_id.clone(), milestone_index));
+            env.storage().persistent().remove(&DataKey::DisputeReason(
+                engagement_id.clone(),
+                milestone_index,
+            ));
 
             env.events().publish(
                 (Symbol::new(&env, "dispute_resolved"), engagement_id.clone()),
@@ -1012,7 +1119,10 @@ impl HireSettleContract {
             engagement.milestones.set(milestone_index, milestone);
 
             env.storage().persistent().remove(&vote_key);
-            env.storage().persistent().remove(&DataKey::DisputeReason(engagement_id.clone(), milestone_index));
+            env.storage().persistent().remove(&DataKey::DisputeReason(
+                engagement_id.clone(),
+                milestone_index,
+            ));
 
             env.events().publish(
                 (Symbol::new(&env, "dispute_resolved"), engagement_id.clone()),
@@ -1080,9 +1190,10 @@ impl HireSettleContract {
                     if m.status != MilestoneStatus::Confirmed
                         && m.status != MilestoneStatus::Resolved
                     {
-                        let original_days =
-                            (m.valid_after_ledger - engagement.created_at_ledger) / Self::get_ledgers_per_day_internal(&env);
-                        m.valid_after_ledger = current_ledger + (original_days * Self::get_ledgers_per_day_internal(&env));
+                        let original_days = (m.valid_after_ledger - engagement.created_at_ledger)
+                            / Self::get_ledgers_per_day_internal(&env);
+                        m.valid_after_ledger = current_ledger
+                            + (original_days * Self::get_ledgers_per_day_internal(&env));
                         m.status = MilestoneStatus::Locked;
                         m.proof_hash = String::from_str(&env, "");
                         env.storage()
@@ -1247,11 +1358,7 @@ impl HireSettleContract {
         engagement.total_amount - engagement.released_amount
     }
 
-    pub fn is_milestone_unlockable(
-        env: Env,
-        engagement_id: String,
-        milestone_index: u32,
-    ) -> bool {
+    pub fn is_milestone_unlockable(env: Env, engagement_id: String, milestone_index: u32) -> bool {
         let engagement = Self::get_engagement_internal(&env, &engagement_id);
         let milestone = engagement
             .milestones
@@ -1262,11 +1369,7 @@ impl HireSettleContract {
             && env.ledger().sequence() >= milestone.valid_after_ledger
     }
 
-    pub fn ledgers_until_unlock(
-        env: Env,
-        engagement_id: String,
-        milestone_index: u32,
-    ) -> u32 {
+    pub fn ledgers_until_unlock(env: Env, engagement_id: String, milestone_index: u32) -> u32 {
         let engagement = Self::get_engagement_internal(&env, &engagement_id);
         let milestone = engagement
             .milestones
@@ -1322,15 +1425,15 @@ impl HireSettleContract {
         milestone_index: u32,
     ) -> ArbiterVoteCounts {
         let vote_key = DataKey::ArbiterVotes(engagement_id, milestone_index);
-        let record: ArbiterVoteRecord = env
-            .storage()
-            .persistent()
-            .get(&vote_key)
-            .unwrap_or(ArbiterVoteRecord {
-                approve_votes: 0,
-                reject_votes: 0,
-                voted: Vec::new(&env),
-            });
+        let record: ArbiterVoteRecord =
+            env.storage()
+                .persistent()
+                .get(&vote_key)
+                .unwrap_or(ArbiterVoteRecord {
+                    approve_votes: 0,
+                    reject_votes: 0,
+                    voted: Vec::new(&env),
+                });
         ArbiterVoteCounts {
             approve_votes: record.approve_votes,
             reject_votes: record.reject_votes,
@@ -1341,6 +1444,14 @@ impl HireSettleContract {
         Self::get_engagement_internal(&env, &engagement_id).released_amount
     }
 
+    /// Return a lightweight summary of an engagement, suitable for list/dashboard views.
+    ///
+    /// Prefer this over `get_engagement` when you only need top-level fields and not
+    /// the full milestone list, as it avoids deserializing the milestone vector.
+    ///
+    /// # Panics
+    ///
+    /// - `"EngagementNotFound"` — no engagement with the given `engagement_id` exists.
     pub fn get_engagement_summary(env: Env, engagement_id: String) -> EngagementSummary {
         let engagement = Self::get_engagement_internal(&env, &engagement_id);
         EngagementSummary {
@@ -1373,8 +1484,8 @@ impl HireSettleContract {
 
         let engagement = Self::get_engagement_internal(&env, &engagement_id);
 
-        let is_arbiter = (0..engagement.arbiters.len())
-            .any(|i| engagement.arbiters.get(i).unwrap() == arbiter);
+        let is_arbiter =
+            (0..engagement.arbiters.len()).any(|i| engagement.arbiters.get(i).unwrap() == arbiter);
         if !is_arbiter {
             panic!("unauthorized");
         }
@@ -1530,12 +1641,10 @@ impl HireSettleContract {
             expires_at_ledger: current_ledger + ttl,
         };
 
-        env.storage()
-            .persistent()
-            .set(
-                &DataKey::AmendmentProposal(engagement_id.clone(), milestone_index),
-                &proposal,
-            );
+        env.storage().persistent().set(
+            &DataKey::AmendmentProposal(engagement_id.clone(), milestone_index),
+            &proposal,
+        );
 
         env.storage().persistent().extend_ttl(
             &DataKey::AmendmentProposal(engagement_id.clone(), milestone_index),
@@ -1583,7 +1692,10 @@ impl HireSettleContract {
         let proposal: AmendmentProposal = env
             .storage()
             .persistent()
-            .get(&DataKey::AmendmentProposal(engagement_id.clone(), milestone_index))
+            .get(&DataKey::AmendmentProposal(
+                engagement_id.clone(),
+                milestone_index,
+            ))
             .unwrap_or_else(|| panic!("no pending amendment proposal"));
 
         if acceptor == proposal.proposer {
@@ -1595,7 +1707,10 @@ impl HireSettleContract {
         if current_ledger > proposal.expires_at_ledger {
             env.storage()
                 .persistent()
-                .remove(&DataKey::AmendmentProposal(engagement_id.clone(), milestone_index));
+                .remove(&DataKey::AmendmentProposal(
+                    engagement_id.clone(),
+                    milestone_index,
+                ));
 
             env.events().publish(
                 (
@@ -1627,7 +1742,10 @@ impl HireSettleContract {
         let mut log: Vec<AmendmentEntry> = env
             .storage()
             .persistent()
-            .get(&DataKey::AmendmentLog(engagement_id.clone(), milestone_index))
+            .get(&DataKey::AmendmentLog(
+                engagement_id.clone(),
+                milestone_index,
+            ))
             .unwrap_or_else(|| Vec::new(&env));
 
         log.push_back(amendment_entry);
@@ -1636,12 +1754,10 @@ impl HireSettleContract {
             log.remove(0);
         }
 
-        env.storage()
-            .persistent()
-            .set(
-                &DataKey::AmendmentLog(engagement_id.clone(), milestone_index),
-                &log,
-            );
+        env.storage().persistent().set(
+            &DataKey::AmendmentLog(engagement_id.clone(), milestone_index),
+            &log,
+        );
 
         env.storage().persistent().extend_ttl(
             &DataKey::AmendmentLog(engagement_id.clone(), milestone_index),
@@ -1651,7 +1767,10 @@ impl HireSettleContract {
 
         env.storage()
             .persistent()
-            .remove(&DataKey::AmendmentProposal(engagement_id.clone(), milestone_index));
+            .remove(&DataKey::AmendmentProposal(
+                engagement_id.clone(),
+                milestone_index,
+            ));
 
         env.storage()
             .persistent()
@@ -1662,7 +1781,12 @@ impl HireSettleContract {
                 Symbol::new(&env, "amendment_accepted"),
                 engagement_id.clone(),
             ),
-            (milestone_index, acceptor, old_payment_percent, proposal.new_payment_percent),
+            (
+                milestone_index,
+                acceptor,
+                old_payment_percent,
+                proposal.new_payment_percent,
+            ),
         );
     }
 
@@ -1691,7 +1815,10 @@ impl HireSettleContract {
         let proposal: AmendmentProposal = env
             .storage()
             .persistent()
-            .get(&DataKey::AmendmentProposal(engagement_id.clone(), milestone_index))
+            .get(&DataKey::AmendmentProposal(
+                engagement_id.clone(),
+                milestone_index,
+            ))
             .unwrap_or_else(|| panic!("no pending amendment proposal"));
 
         if rejector == proposal.proposer {
@@ -1700,18 +1827,17 @@ impl HireSettleContract {
 
         env.storage()
             .persistent()
-            .remove(&DataKey::AmendmentProposal(engagement_id.clone(), milestone_index));
+            .remove(&DataKey::AmendmentProposal(
+                engagement_id.clone(),
+                milestone_index,
+            ));
 
         env.events().publish(
             (
                 Symbol::new(&env, "amendment_rejected"),
                 engagement_id.clone(),
             ),
-            (
-                milestone_index,
-                rejector,
-                Symbol::new(&env, "declined"),
-            ),
+            (milestone_index, rejector, Symbol::new(&env, "declined")),
         );
     }
 
@@ -1843,7 +1969,10 @@ impl HireSettleContract {
         Self::extend_engagement_ttl(&env, &engagement_id);
 
         env.events().publish(
-            (Symbol::new(&env, "early_exit_requested"), engagement_id.clone()),
+            (
+                Symbol::new(&env, "early_exit_requested"),
+                engagement_id.clone(),
+            ),
             recruiter,
         );
     }
@@ -1881,7 +2010,10 @@ impl HireSettleContract {
         Self::extend_engagement_ttl(&env, &engagement_id);
 
         env.events().publish(
-            (Symbol::new(&env, "early_exit_accepted"), engagement_id.clone()),
+            (
+                Symbol::new(&env, "early_exit_accepted"),
+                engagement_id.clone(),
+            ),
             refund,
         );
     }
@@ -1909,7 +2041,10 @@ impl HireSettleContract {
         Self::extend_engagement_ttl(&env, &engagement_id);
 
         env.events().publish(
-            (Symbol::new(&env, "early_exit_rejected"), engagement_id.clone()),
+            (
+                Symbol::new(&env, "early_exit_rejected"),
+                engagement_id.clone(),
+            ),
             company,
         );
     }
@@ -1977,7 +2112,9 @@ impl HireSettleContract {
         if value < 1 || value > 25_920 {
             panic!("InvalidLedgersPerDay");
         }
-        env.storage().instance().set(&DataKey::LedgersPerDay, &value);
+        env.storage()
+            .instance()
+            .set(&DataKey::LedgersPerDay, &value);
         env.events()
             .publish((Symbol::new(&env, "ledgers_per_day_set"),), value);
     }
@@ -1994,7 +2131,9 @@ impl HireSettleContract {
     /// Admin sets the maximum retention days cap.
     pub fn set_max_retention_days(env: Env, admin: Address, days: u32) {
         Self::assert_admin(&env, &admin);
-        env.storage().instance().set(&DataKey::MaxRetentionDays, &days);
+        env.storage()
+            .instance()
+            .set(&DataKey::MaxRetentionDays, &days);
         env.events()
             .publish((Symbol::new(&env, "max_retention_days_set"),), days);
     }
@@ -2014,7 +2153,9 @@ impl HireSettleContract {
     /// Admin sets the inactivity timeout in ledgers.
     pub fn set_inactivity_timeout_ledgers(env: Env, admin: Address, ledgers: u32) {
         Self::assert_admin(&env, &admin);
-        env.storage().instance().set(&DataKey::InactivityTimeoutLedgers, &ledgers);
+        env.storage()
+            .instance()
+            .set(&DataKey::InactivityTimeoutLedgers, &ledgers);
         env.events()
             .publish((Symbol::new(&env, "inactivity_timeout_set"),), ledgers);
     }
@@ -2059,7 +2200,10 @@ impl HireSettleContract {
             .set(&DataKey::Engagement(engagement_id.clone()), &engagement);
 
         env.events().publish(
-            (Symbol::new(&env, "engagement_expired"), engagement_id.clone()),
+            (
+                Symbol::new(&env, "engagement_expired"),
+                engagement_id.clone(),
+            ),
             refund,
         );
     }
@@ -2071,7 +2215,9 @@ impl HireSettleContract {
     /// Admin sets the storage TTL extension value in ledgers.
     pub fn set_storage_ttl_extend_to(env: Env, admin: Address, ledgers: u32) {
         Self::assert_admin(&env, &admin);
-        env.storage().instance().set(&DataKey::StorageTtlExtendTo, &ledgers);
+        env.storage()
+            .instance()
+            .set(&DataKey::StorageTtlExtendTo, &ledgers);
         env.events()
             .publish((Symbol::new(&env, "storage_ttl_extend_to_set"),), ledgers);
     }
@@ -2098,8 +2244,36 @@ impl HireSettleContract {
     // ISSUE #39 — BATCH CONFIRM MILESTONES
     // ----------------------------------------------------------
 
-    /// Company confirms multiple consecutive milestones in one transaction.
-    /// Atomically rejected if any milestone is invalid.
+    /// Confirm multiple milestones in a single transaction, releasing payment for each.
+    ///
+    /// # Caller
+    /// `company` — must match the engagement's company address and sign the transaction.
+    ///
+    /// # Atomicity
+    /// All milestones in `milestone_indices` are validated **before** any payment is processed.
+    /// If any milestone fails validation (e.g. proof not submitted, retention window not elapsed),
+    /// the entire call panics and no funds are transferred.
+    ///
+    /// # Behaviour
+    /// - For each index, releases `(total_amount * payment_percent / 100)` to the recruiter,
+    ///   deducting the platform fee first.
+    /// - Each confirmed milestone emits a `milestone_confirmed` event.
+    /// - If all milestones across the engagement are now `Confirmed` or `Resolved`,
+    ///   the engagement transitions to `Completed` and an `engagement_completed` event is emitted.
+    ///
+    /// # Panics
+    /// - `"EmptyIndices"` — `milestone_indices` is empty.
+    /// - `"engagement is not active"` — engagement status is not `Active`.
+    /// - `"unauthorized"` — caller is not the engagement's company.
+    /// - `"invalid milestone index"` — an index is out of bounds.
+    /// - `"milestone proof not yet submitted"` — milestone is not in `ProofSubmitted` status.
+    /// - `"retention window has not elapsed — cannot confirm yet"` — for `Retention` milestones
+    ///   confirmed before their `valid_after_ledger`.
+    ///
+    /// # Events
+    /// - `(\"milestone_confirmed\", engagement_id)` with `(index, payment)` — one per milestone.
+    /// - `(\"platform_fee_collected\", engagement_id)` with `(index, fee_amount, treasury)` — when fee > 0.
+    /// - `(\"engagement_completed\", engagement_id)` — emitted once if all milestones are done.
     pub fn batch_confirm_milestones(
         env: Env,
         company: Address,
@@ -2126,11 +2300,15 @@ impl HireSettleContract {
         // Validate all milestones first (atomic rejection)
         for i in 0..milestone_indices.len() {
             let idx = milestone_indices.get(i).unwrap();
-            let m = engagement.milestones.get(idx).unwrap_or_else(|| panic!("invalid milestone index"));
+            let m = engagement
+                .milestones
+                .get(idx)
+                .unwrap_or_else(|| panic!("invalid milestone index"));
             if m.status != MilestoneStatus::ProofSubmitted {
                 panic!("milestone proof not yet submitted");
             }
-            if m.kind == MilestoneKind::Retention && env.ledger().sequence() < m.valid_after_ledger {
+            if m.kind == MilestoneKind::Retention && env.ledger().sequence() < m.valid_after_ledger
+            {
                 panic!("retention window has not elapsed — cannot confirm yet");
             }
         }
@@ -2154,7 +2332,10 @@ impl HireSettleContract {
                     &fee_amount,
                 );
                 env.events().publish(
-                    (Symbol::new(&env, "platform_fee_collected"), engagement_id.clone()),
+                    (
+                        Symbol::new(&env, "platform_fee_collected"),
+                        engagement_id.clone(),
+                    ),
                     (idx, fee_amount, platform_fee.treasury.clone()),
                 );
             }
@@ -2168,7 +2349,10 @@ impl HireSettleContract {
             engagement.milestones.set(idx, m);
 
             env.events().publish(
-                (Symbol::new(&env, "milestone_confirmed"), engagement_id.clone()),
+                (
+                    Symbol::new(&env, "milestone_confirmed"),
+                    engagement_id.clone(),
+                ),
                 (idx, payment),
             );
         }
@@ -2190,8 +2374,15 @@ impl HireSettleContract {
 
         if all_done {
             env.events().publish(
-                (Symbol::new(&env, "engagement_completed"), engagement_id.clone()),
-                (engagement_id.clone(), engagement.released_amount, env.ledger().sequence()),
+                (
+                    Symbol::new(&env, "engagement_completed"),
+                    engagement_id.clone(),
+                ),
+                (
+                    engagement_id.clone(),
+                    engagement.released_amount,
+                    env.ledger().sequence(),
+                ),
             );
         }
     }
@@ -2201,7 +2392,11 @@ impl HireSettleContract {
     // ----------------------------------------------------------
 
     /// Return the stored dispute reason for a milestone, if any.
-    pub fn get_dispute_reason(env: Env, engagement_id: String, milestone_index: u32) -> Option<String> {
+    pub fn get_dispute_reason(
+        env: Env,
+        engagement_id: String,
+        milestone_index: u32,
+    ) -> Option<String> {
         env.storage()
             .persistent()
             .get(&DataKey::DisputeReason(engagement_id, milestone_index))
