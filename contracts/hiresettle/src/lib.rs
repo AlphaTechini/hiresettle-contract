@@ -299,6 +299,12 @@ pub enum DataKey {
     LedgersPerDay,
     /// Dispute reason string stored per (engagement_id, milestone_index) (issue #50).
     DisputeReason(String, u32),
+    /// Structured reason code stored per (engagement_id, replacement_index)
+    /// when a company calls `request_replacement` (issue #51). Indexed from 0.
+    ReplacementReason(String, u32),
+    /// Number of replacements ever requested for an engagement (issue #51).
+    /// Acts as the next replacement_index when incremented.
+    ReplacementCount(String),
     /// Admin-configurable max retention days cap (issue #18).
     MaxRetentionDays,
     /// Admin-configurable inactivity timeout in ledgers (issue #38).
@@ -334,9 +340,12 @@ const DEFAULT_MAX_RETENTION_DAYS: u32 = 365;
 const DEFAULT_INACTIVITY_TIMEOUT_LEDGERS: u32 = 1_036_800; // ~60 days
 const DEFAULT_STORAGE_TTL_EXTEND_TO: u32 = 1_036_800; // ~60 days
 const DEFAULT_VERSION: &str = "0.2.0";
-const DEFAULT_MIN_ENGAGEMENT_AMOUNT: i128 = 100_000;  // 0.01 USDC
-const DEFAULT_CONFIRM_WINDOW_LEDGERS: u32 = 86_400;   // ~5 days
-const DEFAULT_DISPUTE_WINDOW_LEDGERS: u32 = 51_840;   // ~3 days
+/// Maximum length (in characters) of a `request_replacement` reason string
+/// (issue #51). Mirrors the dispute-reason cap to keep storage bounded.
+const MAX_REPLACEMENT_REASON_LEN: u32 = 128;
+const DEFAULT_MIN_ENGAGEMENT_AMOUNT: i128 = 100_000; // 0.01 USDC
+const DEFAULT_CONFIRM_WINDOW_LEDGERS: u32 = 86_400; // ~5 days
+const DEFAULT_DISPUTE_WINDOW_LEDGERS: u32 = 51_840; // ~3 days
 const MAX_VERSION_LENGTH: u32 = 32;
 const MAX_PROOF_HASH_LENGTH: u32 = 200;
 const MAX_ENGAGEMENT_ID_LENGTH: u32 = 64;
@@ -753,21 +762,28 @@ impl HireSettleContract {
             panic!("retention window has not elapsed yet");
         }
 
+        // Capture for the event before mutating the milestone.
+        let valid_after_ledger = milestone.valid_after_ledger;
+        let unlocked_at_ledger = current_ledger;
+
         milestone.status = MilestoneStatus::Pending;
         engagement.milestones.set(milestone_index, milestone);
-        engagement.last_activity_ledger = env.ledger().sequence();
+        engagement.last_activity_ledger = unlocked_at_ledger;
 
         env.storage()
             .persistent()
             .set(&DataKey::Engagement(engagement_id.clone()), &engagement);
         Self::extend_engagement_ttl(&env, &engagement_id);
 
+        // Event body carries the time-gate evidence so off-chain consumers can
+        // confirm the unlock was legitimate without a follow-up `get_milestone`
+        // query. See issue #54.
         env.events().publish(
             (
                 Symbol::new(&env, "milestone_unlocked"),
                 engagement_id.clone(),
             ),
-            milestone_index,
+            (milestone_index, valid_after_ledger, unlocked_at_ledger),
         );
     }
 
@@ -1188,9 +1204,15 @@ impl HireSettleContract {
     // REQUEST REPLACEMENT
     // ----------------------------------------------------------
 
-    pub fn request_replacement(env: Env, company: Address, engagement_id: String) {
+    pub fn request_replacement(env: Env, company: Address, engagement_id: String, reason: String) {
         Self::assert_not_paused(&env);
         company.require_auth();
+
+        // Bound reason length so a single engagement cannot accumulate
+        // unbounded replacement metadata. See issue #51.
+        if reason.len() > MAX_REPLACEMENT_REASON_LEN {
+            panic!("replacement reason too long");
+        }
 
         let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
 
@@ -1253,6 +1275,23 @@ impl HireSettleContract {
         env.storage()
             .persistent()
             .set(&DataKey::Engagement(engagement_id.clone()), &engagement);
+
+        // Record the reason under a monotonic per-engagement index so the
+        // full replacement history is auditable. See issue #51.
+        let replacement_index: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ReplacementCount(engagement_id.clone()))
+            .unwrap_or(0u32);
+        env.storage().persistent().set(
+            &DataKey::ReplacementReason(engagement_id.clone(), replacement_index),
+            &reason,
+        );
+        env.storage().persistent().set(
+            &DataKey::ReplacementCount(engagement_id.clone()),
+            &(replacement_index + 1),
+        );
+
         Self::extend_engagement_ttl(&env, &engagement_id);
 
         env.events().publish(
@@ -1260,8 +1299,31 @@ impl HireSettleContract {
                 Symbol::new(&env, "replacement_requested"),
                 engagement_id.clone(),
             ),
-            engagement_id.clone(),
+            (replacement_index, reason),
         );
+    }
+
+    /// Returns the structured replacement reason recorded for an engagement at
+    /// a given replacement index, or `None` if no such replacement exists.
+    /// See issue #51.
+    pub fn get_replacement_reason(
+        env: Env,
+        engagement_id: String,
+        replacement_index: u32,
+    ) -> Option<String> {
+        env.storage().persistent().get(&DataKey::ReplacementReason(
+            engagement_id,
+            replacement_index,
+        ))
+    }
+
+    /// Returns the number of replacements ever requested for an engagement.
+    /// Useful for paging through `get_replacement_reason`. See issue #51.
+    pub fn get_replacement_count(env: Env, engagement_id: String) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ReplacementCount(engagement_id))
+            .unwrap_or(0u32)
     }
 
     // ----------------------------------------------------------
@@ -2646,8 +2708,15 @@ impl HireSettleContract {
 
         if all_done {
             env.events().publish(
-                (Symbol::new(&env, "engagement_completed"), engagement_id.clone()),
-                (engagement_id.clone(), engagement.released_amount, env.ledger().sequence()),
+                (
+                    Symbol::new(&env, "engagement_completed"),
+                    engagement_id.clone(),
+                ),
+                (
+                    engagement_id.clone(),
+                    engagement.released_amount,
+                    env.ledger().sequence(),
+                ),
             );
         }
     }

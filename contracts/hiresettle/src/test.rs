@@ -390,7 +390,7 @@ fn test_request_replacement() {
     client.confirm_milestone(&company, &eng_id, &0);
     assert_eq!(token_client.balance(&recruiter), 300_000_000);
 
-    client.request_replacement(&company, &eng_id);
+    client.request_replacement(&company, &eng_id, &String::from_str(&env, "candidate_resigned"));
 
     let eng = client.get_engagement(&eng_id);
     assert_eq!(eng.status, EngagementStatus::ReplacementRequested);
@@ -426,7 +426,7 @@ fn test_request_replacement_before_placement() {
         "ENG-EARLY",
     );
 
-    client.request_replacement(&company, &eng_id);
+    client.request_replacement(&company, &eng_id, &String::from_str(&env, "performance"));
 }
 
 #[test]
@@ -2977,4 +2977,200 @@ fn test_engagement_id_dot_rejected() {
     let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
     let client = HireSettleContractClient::new(&env, &contract_id);
     create_engagement_with_id(&env, &client, &token_id, &company, &recruiter, &arbiter, "ENG.001");
+}
+
+// ============================================================
+// ISSUE #51 — REPLACEMENT REASON CODE
+// ============================================================
+
+/// Helper: walk the placement milestone to `Confirmed` so `request_replacement`
+/// is accepted by the contract's precondition.
+fn confirm_placement(
+    env: &Env,
+    client: &HireSettleContractClient,
+    eng_id: &String,
+    company: &Address,
+    recruiter: &Address,
+) {
+    client.submit_proof(recruiter, eng_id, &0, &String::from_str(env, "ipfs://offer"));
+    client.confirm_milestone(company, eng_id, &0);
+}
+
+#[test]
+fn test_replacement_reason_stored_and_retrievable() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let eng_id = String::from_str(&env, "ENG-REASON-1");
+    create_standard_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-REASON-1",
+    );
+    confirm_placement(&env, &client, &eng_id, &company, &recruiter);
+
+    let reason = String::from_str(&env, "candidate_resigned");
+    client.request_replacement(&company, &eng_id, &reason);
+
+    assert_eq!(client.get_replacement_count(&eng_id), 1);
+    let stored = client.get_replacement_reason(&eng_id, &0);
+    assert_eq!(stored, Some(reason));
+    // Out-of-range index returns None instead of panicking.
+    assert_eq!(client.get_replacement_reason(&eng_id, &1), None);
+}
+
+#[test]
+fn test_replacement_reason_empty_string_accepted() {
+    // Empty reason is allowed — the issue says "max 128 chars", not "non-empty".
+    // Auditors can still see the entry exists even with no code attached.
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let eng_id = String::from_str(&env, "ENG-REASON-EMPTY");
+    create_standard_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-REASON-EMPTY",
+    );
+    confirm_placement(&env, &client, &eng_id, &company, &recruiter);
+
+    let empty = String::from_str(&env, "");
+    client.request_replacement(&company, &eng_id, &empty);
+
+    assert_eq!(client.get_replacement_reason(&eng_id, &0), Some(empty));
+}
+
+#[test]
+#[should_panic(expected = "replacement reason too long")]
+fn test_replacement_reason_too_long_rejected() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let eng_id = String::from_str(&env, "ENG-REASON-LONG");
+    create_standard_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-REASON-LONG",
+    );
+    confirm_placement(&env, &client, &eng_id, &company, &recruiter);
+
+    // 129-char reason — one past the 128 cap.
+    let too_long = String::from_str(
+        &env,
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    );
+    client.request_replacement(&company, &eng_id, &too_long);
+}
+
+#[test]
+fn test_replacement_reason_multi_replacement() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let eng_id = String::from_str(&env, "ENG-REASON-MULTI");
+    create_standard_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-REASON-MULTI",
+    );
+    confirm_placement(&env, &client, &eng_id, &company, &recruiter);
+
+    // First replacement
+    let r1 = String::from_str(&env, "candidate_resigned");
+    client.request_replacement(&company, &eng_id, &r1);
+
+    // Bring engagement back to Active by submitting replacement proof + confirm.
+    client.submit_proof(
+        &recruiter,
+        &eng_id,
+        &0,
+        &String::from_str(&env, "ipfs://replacement-1"),
+    );
+    client.confirm_milestone(&company, &eng_id, &0);
+
+    // Second replacement
+    let r2 = String::from_str(&env, "performance");
+    client.request_replacement(&company, &eng_id, &r2);
+
+    assert_eq!(client.get_replacement_count(&eng_id), 2);
+    assert_eq!(client.get_replacement_reason(&eng_id, &0), Some(r1));
+    assert_eq!(client.get_replacement_reason(&eng_id, &1), Some(r2));
+}
+
+#[test]
+fn test_replacement_reason_event_payload_includes_reason() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let eng_id = String::from_str(&env, "ENG-REASON-EVT");
+    create_standard_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-REASON-EVT",
+    );
+    confirm_placement(&env, &client, &eng_id, &company, &recruiter);
+
+    let reason = String::from_str(&env, "performance");
+    client.request_replacement(&company, &eng_id, &reason);
+
+    let expected = Symbol::new(&env, "replacement_requested");
+    let mut found = false;
+    for (_, topics, data) in env.events().all().iter() {
+        let topic: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+        if topic == expected {
+            let (idx, r): (u32, String) = data.try_into_val(&env).unwrap();
+            assert_eq!(idx, 0);
+            assert_eq!(r, reason);
+            found = true;
+        }
+    }
+    assert!(found, "replacement_requested event was not emitted");
+}
+
+// ============================================================
+// ISSUE #54 — MILESTONE UNLOCK EVENT PAYLOAD
+// ============================================================
+
+#[test]
+fn test_milestone_unlock_event_carries_ledger_evidence() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let eng_id = String::from_str(&env, "ENG-UNLOCK-EVT");
+    create_standard_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-UNLOCK-EVT",
+    );
+
+    // Capture the retention window boundary BEFORE the unlock mutates state.
+    let m1_before = client.get_milestone(&eng_id, &1);
+    let valid_after_ledger = m1_before.valid_after_ledger;
+
+    // Advance past the retention window so unlock_milestone succeeds.
+    advance_ledger(&env, 30 * 17_280 + 1);
+    let unlocked_at_ledger = env.ledger().sequence();
+
+    client.unlock_milestone(&eng_id, &1);
+
+    let expected = Symbol::new(&env, "milestone_unlocked");
+    let mut found = false;
+    for (_, topics, data) in env.events().all().iter() {
+        let topic: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+        if topic == expected {
+            let (idx, vafter, uat): (u32, u32, u32) = data.try_into_val(&env).unwrap();
+            assert_eq!(idx, 1);
+            assert_eq!(vafter, valid_after_ledger);
+            assert_eq!(uat, unlocked_at_ledger);
+            // The unlocked_at_ledger must equal the current ledger at the call site.
+            assert_eq!(uat, env.ledger().sequence());
+            found = true;
+        }
+    }
+    assert!(found, "milestone_unlocked event was not emitted");
+}
+
+#[test]
+fn test_no_milestone_unlock_event_when_call_fails() {
+    // unlock_milestone called before the retention window must panic AND must
+    // not emit a milestone_unlocked event. Soroban panics revert state and
+    // discard buffered events, so this is verified by the absence of the
+    // event after the panic is caught.
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let eng_id = String::from_str(&env, "ENG-UNLOCK-FAIL");
+    create_standard_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-UNLOCK-FAIL",
+    );
+
+    // Premature call — retention window has not elapsed yet.
+    let result = client.try_unlock_milestone(&eng_id, &1);
+    assert!(result.is_err(), "expected unlock_milestone to fail");
+
+    assert!(
+        !has_event(&env, "milestone_unlocked"),
+        "milestone_unlocked event must not be emitted on failed unlock"
+    );
 }
