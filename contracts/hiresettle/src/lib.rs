@@ -153,17 +153,31 @@ pub struct Engagement {
     pub status: EngagementStatus,
 }
 
+/// A lightweight read-only view of an engagement, suitable for list/dashboard APIs.
+///
+/// For full milestone detail, use `get_engagement`.
 #[contracttype]
 #[derive(Clone)]
 pub struct EngagementSummary {
+    /// Unique engagement identifier.
     pub id: String,
+    /// Free-text job title stored at creation time.
     pub job_title: String,
+    /// The hiring company address.
     pub company: Address,
+    /// The recruiter address receiving milestone payments.
     pub recruiter: Address,
+    /// Total fee locked in escrow at creation, in the token's smallest unit.
     pub total_amount: i128,
+    /// Cumulative amount paid out across all confirmed/resolved milestones so far.
+    ///
+    /// Remaining escrow = `total_amount - released_amount`.
     pub released_amount: i128,
+    /// Current lifecycle status of the engagement.
     pub status: EngagementStatus,
+    /// Total number of milestones in the engagement (does not change after creation).
     pub milestone_count: u32,
+    /// Ledger sequence number at which the engagement was created.
     pub created_at_ledger: u32,
 }
 
@@ -1390,6 +1404,14 @@ impl HireSettleContract {
         Self::get_engagement_internal(&env, &engagement_id).released_amount
     }
 
+    /// Return a lightweight summary of an engagement, suitable for list/dashboard views.
+    ///
+    /// Prefer this over `get_engagement` when you only need top-level fields and not
+    /// the full milestone list, as it avoids deserializing the milestone vector.
+    ///
+    /// # Panics
+    ///
+    /// - `"EngagementNotFound"` — no engagement with the given `engagement_id` exists.
     pub fn get_engagement_summary(env: Env, engagement_id: String) -> EngagementSummary {
         let engagement = Self::get_engagement_internal(&env, &engagement_id);
         EngagementSummary {
