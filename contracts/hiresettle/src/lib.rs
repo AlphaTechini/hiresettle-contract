@@ -1,6 +1,6 @@
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, String, Symbol, Vec};
+use soroban_sdk::{contract, contractimpl, contracttype, token, Address, BytesN, Env, String, Symbol, Vec};
 
 const MAX_PLATFORM_FEE_BPS: u32 = 500;
 
@@ -245,6 +245,16 @@ pub struct ArbiterNomination {
     pub nominee: Address,
 }
 
+/// Pending contract WASM upgrade proposal stored until execution (issue #69).
+#[contracttype]
+#[derive(Clone)]
+pub struct UpgradeProposal {
+    /// The new WASM hash to apply on execute_upgrade.
+    pub new_wasm_hash: BytesN<32>,
+    /// Ledger sequence at or after which execute_upgrade may be called.
+    pub execute_after_ledger: u32,
+}
+
 /// Platform fee configuration deducted from each milestone payment.
 #[contracttype]
 #[derive(Clone)]
@@ -303,6 +313,12 @@ pub enum DataKey {
     Version,
     /// Minimum engagement amount in stroops to prevent dust engagements (issue #17).
     MinEngagementAmount,
+    /// Pending contract WASM upgrade proposal (issue #69).
+    PendingUpgrade,
+    /// Admin-configurable upgrade time-lock duration in ledgers (issue #69, default 17_280).
+    UpgradeLockDuration,
+    /// Admin-configurable max proof hash length in characters (issue #68, default 200).
+    MaxProofHashLength,
 }
 
 // ============================================================
@@ -795,7 +811,7 @@ impl HireSettleContract {
             panic!("InvalidProofHash");
         }
 
-        if proof_hash.len() > MAX_PROOF_HASH_LENGTH {
+        if proof_hash.len() > Self::get_max_proof_hash_length_internal(&env) {
             panic!("ProofHashTooLong");
         }
 
@@ -883,6 +899,15 @@ impl HireSettleContract {
 
         if milestone.status != MilestoneStatus::ProofSubmitted {
             panic!("milestone proof not yet submitted");
+        }
+
+        // Issue #67: enforce sequential confirmation — all prior milestones must be done.
+        for i in 0..milestone_index {
+            let prev = engagement.milestones.get(i).unwrap();
+            if prev.status != MilestoneStatus::Confirmed && prev.status != MilestoneStatus::Resolved
+            {
+                panic!("PreviousMilestoneNotComplete");
+            }
         }
 
         if milestone.kind == MilestoneKind::Retention {
@@ -2628,6 +2653,127 @@ impl HireSettleContract {
     }
 
     // ----------------------------------------------------------
+    // ISSUE #70 — ACTIVE DISPUTE COUNT
+    // ----------------------------------------------------------
+
+    /// Return the number of milestones currently in `Disputed` status.
+    /// Read-only and permissionless. Returns 0 when no disputes are active.
+    pub fn get_active_dispute_count(env: Env, engagement_id: String) -> u32 {
+        let engagement = Self::get_engagement_internal(&env, &engagement_id);
+        let mut count: u32 = 0;
+        for i in 0..engagement.milestones.len() {
+            if engagement.milestones.get(i).unwrap().status == MilestoneStatus::Disputed {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    // ----------------------------------------------------------
+    // ISSUE #69 — CONTRACT UPGRADE MECHANISM
+    // ----------------------------------------------------------
+
+    /// Admin proposes a WASM upgrade with a mandatory time-lock (issue #69).
+    /// The pending upgrade is stored and becomes executable after `lock_duration` ledgers.
+    /// Default time-lock is 17,280 ledgers (~1 day); use `set_upgrade_lock_duration` to change it.
+    /// Emits `upgrade_proposed` with `(new_wasm_hash, execute_after_ledger)`.
+    pub fn propose_upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) {
+        Self::assert_admin(&env, &admin);
+
+        let lock_duration: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::UpgradeLockDuration)
+            .unwrap_or(LEDGERS_PER_DAY);
+
+        let execute_after_ledger = env.ledger().sequence() + lock_duration;
+
+        let proposal = UpgradeProposal {
+            new_wasm_hash: new_wasm_hash.clone(),
+            execute_after_ledger,
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingUpgrade, &proposal);
+
+        env.events().publish(
+            (Symbol::new(&env, "upgrade_proposed"),),
+            (new_wasm_hash, execute_after_ledger),
+        );
+    }
+
+    /// Execute a pending upgrade after the time-lock has elapsed (issue #69).
+    /// Permissionless — anyone may call this once `execute_after_ledger` is reached.
+    /// Panics with `"no pending upgrade"` if no proposal exists.
+    /// Panics with `"UpgradeLockNotElapsed"` if called before the time-lock expires.
+    /// Emits `upgrade_executed` before applying the WASM swap.
+    pub fn execute_upgrade(env: Env) {
+        let proposal: UpgradeProposal = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingUpgrade)
+            .unwrap_or_else(|| panic!("no pending upgrade"));
+
+        if env.ledger().sequence() < proposal.execute_after_ledger {
+            panic!("UpgradeLockNotElapsed");
+        }
+
+        env.storage().instance().remove(&DataKey::PendingUpgrade);
+
+        env.events().publish(
+            (Symbol::new(&env, "upgrade_executed"),),
+            proposal.new_wasm_hash.clone(),
+        );
+
+        env.deployer()
+            .update_current_contract_wasm(proposal.new_wasm_hash);
+    }
+
+    /// Admin sets the upgrade time-lock duration in ledgers (issue #69).
+    pub fn set_upgrade_lock_duration(env: Env, admin: Address, ledgers: u32) {
+        Self::assert_admin(&env, &admin);
+        env.storage()
+            .instance()
+            .set(&DataKey::UpgradeLockDuration, &ledgers);
+        env.events()
+            .publish((Symbol::new(&env, "upgrade_lock_duration_set"),), ledgers);
+    }
+
+    /// Return the current upgrade time-lock duration in ledgers (issue #69).
+    /// Defaults to 17,280 (~1 day).
+    pub fn get_upgrade_lock_duration(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::UpgradeLockDuration)
+            .unwrap_or(LEDGERS_PER_DAY)
+    }
+
+    // ----------------------------------------------------------
+    // ISSUE #68 — ADMIN-CONFIGURABLE MAX PROOF HASH LENGTH
+    // ----------------------------------------------------------
+
+    /// Admin sets the maximum proof hash length in characters (issue #68).
+    /// `len` must be in the range 1–500. Panics with `"InvalidMaxProofHashLength"` otherwise.
+    pub fn set_max_proof_hash_length(env: Env, admin: Address, len: u32) {
+        Self::assert_admin(&env, &admin);
+        if len < 1 || len > 500 {
+            panic!("InvalidMaxProofHashLength");
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::MaxProofHashLength, &len);
+        env.events()
+            .publish((Symbol::new(&env, "max_proof_hash_length_set"),), len);
+    }
+
+    /// Return the current max proof hash length (issue #68).
+    /// Defaults to 200 when not configured.
+    pub fn get_max_proof_hash_length(env: Env) -> u32 {
+        Self::get_max_proof_hash_length_internal(&env)
+    }
+
+    // ----------------------------------------------------------
     // INTERNAL HELPERS
     // ----------------------------------------------------------
 
@@ -2680,6 +2826,13 @@ impl HireSettleContract {
             .instance()
             .get(&DataKey::LedgersPerDay)
             .unwrap_or(LEDGERS_PER_DAY)
+    }
+
+    fn get_max_proof_hash_length_internal(env: &Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MaxProofHashLength)
+            .unwrap_or(MAX_PROOF_HASH_LENGTH)
     }
 }
 
