@@ -3,6 +3,7 @@
 use soroban_sdk::{contract, contractimpl, contracttype, token, Address, BytesN, Env, String, Symbol, Vec};
 
 const MAX_PLATFORM_FEE_BPS: u32 = 500;
+const MAX_ARBITER_FEE_BPS: u32 = 200;
 
 // ============================================================
 // DATA TYPES
@@ -327,6 +328,10 @@ pub enum DataKey {
     MaxProofHashLength,
     /// Admin-configurable max milestone count (issue #21, default 10).
     MaxMilestones,
+    /// Arbiter fee in basis points (0–200, max 2%) deducted from payout on dispute approval (issue #52).
+    ArbiterFee,
+    /// Set to true once admin has permanently renounced their role (issue #59).
+    AdminRenounced,
 }
 
 // ============================================================
@@ -913,7 +918,10 @@ impl HireSettleContract {
             .persistent()
             .extend_ttl(&last_key, 100_000, 6_300_000);
 
-        milestone.proof_hash = proof_hash;
+        let is_resubmission = milestone.proof_hash.len() > 0;
+        let old_hash = milestone.proof_hash.clone();
+
+        milestone.proof_hash = proof_hash.clone();
         milestone.status = MilestoneStatus::ProofSubmitted;
         milestone.proof_submitted_at = current_ledger;
         engagement.milestones.set(milestone_index, milestone);
@@ -928,10 +936,20 @@ impl HireSettleContract {
             .set(&DataKey::Engagement(engagement_id.clone()), &engagement);
         Self::extend_engagement_ttl(&env, &engagement_id);
 
-        env.events().publish(
-            (Symbol::new(&env, "proof_submitted"), engagement_id.clone()),
-            milestone_index,
-        );
+        if is_resubmission {
+            env.events().publish(
+                (
+                    Symbol::new(&env, "proof_resubmitted"),
+                    engagement_id.clone(),
+                ),
+                (milestone_index, old_hash, proof_hash),
+            );
+        } else {
+            env.events().publish(
+                (Symbol::new(&env, "proof_submitted"), engagement_id.clone()),
+                milestone_index,
+            );
+        }
     }
 
     // ----------------------------------------------------------
@@ -1189,11 +1207,26 @@ impl HireSettleContract {
             let payment = (engagement.total_amount * milestone.payment_percent as i128) / 100;
             engagement.released_amount += payment;
 
+            let arbiter_fee_bps: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::ArbiterFee)
+                .unwrap_or(0u32);
+            let arbiter_fee_amount = (payment * arbiter_fee_bps as i128) / 10_000;
+            let recruiter_payment = payment - arbiter_fee_amount;
+
             let token_client = token::Client::new(&env, &engagement.token);
+            if arbiter_fee_amount > 0 {
+                token_client.transfer(
+                    &env.current_contract_address(),
+                    &arbiter,
+                    &arbiter_fee_amount,
+                );
+            }
             token_client.transfer(
                 &env.current_contract_address(),
                 &engagement.recruiter,
-                &payment,
+                &recruiter_payment,
             );
 
             milestone.status = MilestoneStatus::Resolved;
@@ -2396,8 +2429,29 @@ impl HireSettleContract {
             .unwrap_or(DEFAULT_INACTIVITY_TIMEOUT_LEDGERS)
     }
 
-    /// Expire an engagement after inactivity timeout.
-    /// Permissionless after timeout.
+    /// Mark an engagement as `Expired` and refund the remaining escrow to the company.
+    /// This is a **permissionless keeper function** — any address may call it; no signature
+    /// is required. It is designed to be triggered by off-chain bots or backend pollers.
+    ///
+    /// # Expiry Condition
+    /// The engagement is eligible for expiry when:
+    /// `env.ledger().sequence() - last_activity_ledger >= inactivity_timeout_ledgers`
+    ///
+    /// The default `inactivity_timeout_ledgers` is set at contract initialisation and can be
+    /// updated by the admin via `set_inactivity_timeout_ledgers`.
+    ///
+    /// # Behaviour
+    /// - The engagement must not be `Completed`.
+    /// - Any escrow balance not yet released (`total_amount - released_amount`) is transferred
+    ///   back to the company address.
+    /// - The engagement status is set to `Expired`.
+    ///
+    /// # Panics
+    /// - `"Cannot expire completed engagement"` — engagement is already `Completed`.
+    /// - `"Inactivity timeout not reached"` — the inactivity threshold has not yet been reached.
+    ///
+    /// # Events
+    /// Emits `("engagement_expired", engagement_id)` with the refund amount.
     pub fn expire_engagement(env: Env, engagement_id: String) {
         let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
 
@@ -2911,6 +2965,62 @@ impl HireSettleContract {
     }
 
     // ----------------------------------------------------------
+    // ISSUE #52 — ARBITER FEE
+    // ----------------------------------------------------------
+
+    /// Admin sets the arbiter fee in basis points (0–200, max 2%) (issue #52).
+    /// Panics with "ArbiterFeeTooHigh" if bps > 200.
+    pub fn set_arbiter_fee(env: Env, admin: Address, bps: u32) {
+        Self::assert_admin(&env, &admin);
+        if bps > MAX_ARBITER_FEE_BPS {
+            panic!("ArbiterFeeTooHigh");
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::ArbiterFee, &bps);
+        env.events()
+            .publish((Symbol::new(&env, "arbiter_fee_set"),), bps);
+    }
+
+    /// Return the current arbiter fee in basis points (issue #52).
+    /// Defaults to 0 when not configured.
+    pub fn get_arbiter_fee(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::ArbiterFee)
+            .unwrap_or(0u32)
+    }
+
+    // ----------------------------------------------------------
+    // ISSUE #55 — ENGAGEMENT COMPLETION QUERY
+    // ----------------------------------------------------------
+
+    /// Returns true if the engagement status is Completed, false for all other statuses.
+    /// Read-only and permissionless (issue #55).
+    pub fn get_is_engagement_complete(env: Env, engagement_id: String) -> bool {
+        let engagement = Self::get_engagement_internal(&env, &engagement_id);
+        engagement.status == EngagementStatus::Completed
+    }
+
+    // ----------------------------------------------------------
+    // ISSUE #59 — ADMIN ROLE RENOUNCEMENT
+    // ----------------------------------------------------------
+
+    /// Permanently renounce admin privileges (issue #59).
+    /// Sets the AdminRenounced flag so all admin-gated functions fail with "NoAdmin".
+    /// Irreversible — once renounced, admin cannot be restored.
+    /// Emits `admin_renounced` with `final_ledger`.
+    pub fn renounce_admin(env: Env, admin: Address) {
+        Self::assert_admin(&env, &admin);
+        env.storage()
+            .instance()
+            .set(&DataKey::AdminRenounced, &true);
+        let final_ledger = env.ledger().sequence();
+        env.events()
+            .publish((Symbol::new(&env, "admin_renounced"),), final_ledger);
+    }
+
+    // ----------------------------------------------------------
     // INTERNAL HELPERS
     // ----------------------------------------------------------
 
@@ -2929,6 +3039,14 @@ impl HireSettleContract {
     }
 
     fn assert_admin(env: &Env, admin: &Address) {
+        let renounced: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::AdminRenounced)
+            .unwrap_or(false);
+        if renounced {
+            panic!("NoAdmin");
+        }
         admin.require_auth();
         if *admin != Self::get_admin(env) {
             panic!("unauthorized");
