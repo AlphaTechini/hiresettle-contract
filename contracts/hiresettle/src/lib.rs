@@ -326,6 +326,8 @@ pub enum DataKey {
     UpgradeLockDuration,
     /// Admin-configurable max proof hash length in characters (issue #68, default 200).
     MaxProofHashLength,
+    /// Admin-configurable max milestone count (issue #21, default 10).
+    MaxMilestones,
     /// Arbiter fee in basis points (0–200, max 2%) deducted from payout on dispute approval (issue #52).
     ArbiterFee,
     /// Set to true once admin has permanently renounced their role (issue #59).
@@ -342,6 +344,7 @@ pub struct HireSettleContract;
 const LEDGERS_PER_DAY: u32 = 17_280; // 86 400s ÷ 5s per ledger
 const DEFAULT_PROOF_COOLDOWN: u32 = 2_880; // ~4 hours
 const DEFAULT_MAX_RETENTION_DAYS: u32 = 365;
+const DEFAULT_MAX_MILESTONES: u32 = 10;
 const DEFAULT_INACTIVITY_TIMEOUT_LEDGERS: u32 = 1_036_800; // ~60 days
 const DEFAULT_STORAGE_TTL_EXTEND_TO: u32 = 1_036_800; // ~60 days
 const DEFAULT_VERSION: &str = "0.2.0";
@@ -580,6 +583,49 @@ impl HireSettleContract {
                 || b == b'-';
             if !valid {
                 panic!("InvalidEngagementId");
+            }
+        }
+
+        // Issue #24: Job title validation
+        if job_title.len() == 0 {
+            panic!("JobTitleEmpty");
+        }
+        if job_title.len() > 64 {
+            panic!("JobTitleTooLong");
+        }
+
+        // Issue #21: Max milestone count cap validation
+        if milestones.len() == 0 {
+            panic!("ZeroMilestones");
+        }
+        let max_milestones = Self::get_max_milestones(env.clone());
+        if milestones.len() > max_milestones {
+            panic!("TooManyMilestones");
+        }
+
+        // Issue #22: Milestone name max length validation
+        for i in 0..milestones.len() {
+            let m = milestones.get(i).unwrap();
+            if m.name.len() == 0 {
+                panic!("MilestoneNameEmpty: index {}", i);
+            }
+            if m.name.len() > 64 {
+                panic!("MilestoneNameTooLong: index {}", i);
+            }
+        }
+
+        // Issue #23: Milestone name uniqueness validation
+        for i in 0..milestones.len() {
+            let m_i = milestones.get(i).unwrap();
+            for j in (i + 1)..milestones.len() {
+                let m_j = milestones.get(j).unwrap();
+                if m_i.name == m_j.name {
+                    let mut name_buf = [0u8; 64];
+                    let name_len = m_i.name.len() as usize;
+                    m_i.name.copy_into_slice(&mut name_buf[..name_len]);
+                    let name_str = core::str::from_utf8(&name_buf[..name_len]).unwrap_or("");
+                    panic!("DuplicateMilestoneName: {}", name_str);
+                }
             }
         }
 
@@ -2337,6 +2383,28 @@ impl HireSettleContract {
             .instance()
             .get(&DataKey::MaxRetentionDays)
             .unwrap_or(DEFAULT_MAX_RETENTION_DAYS)
+    }
+
+    // ----------------------------------------------------------
+    // ISSUE #21 — MAX MILESTONES CAP
+    // ----------------------------------------------------------
+
+    /// Admin sets the maximum milestone count cap.
+    pub fn set_max_milestones(env: Env, admin: Address, count: u32) {
+        Self::assert_admin(&env, &admin);
+        env.storage()
+            .instance()
+            .set(&DataKey::MaxMilestones, &count);
+        env.events()
+            .publish((Symbol::new(&env, "max_milestones_set"),), count);
+    }
+
+    /// Return the current maximum milestone count cap.
+    pub fn get_max_milestones(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MaxMilestones)
+            .unwrap_or(DEFAULT_MAX_MILESTONES)
     }
 
     // ----------------------------------------------------------

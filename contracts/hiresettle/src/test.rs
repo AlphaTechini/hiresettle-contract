@@ -3174,3 +3174,535 @@ fn test_no_milestone_unlock_event_when_call_fails() {
         "milestone_unlocked event must not be emitted on failed unlock"
     );
 }
+
+// ============================================================
+// ISSUE #21 — MAX MILESTONES CAP
+// ============================================================
+
+#[test]
+fn test_milestone_cap_at_cap() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    let mut milestones = Vec::new(&env);
+    for i in 0..10 {
+        let name_str = match i {
+            0 => "m01", 1 => "m02", 2 => "m03", 3 => "m04", 4 => "m05",
+            5 => "m06", 6 => "m07", 7 => "m08", 8 => "m09", 9 => "m10",
+            _ => "m",
+        };
+        milestones.push_back(Milestone {
+            name: String::from_str(&env, name_str),
+            payment_percent: 10,
+            kind: MilestoneKind::Placement,
+            valid_after_ledger: 0,
+            proof_hash: String::from_str(&env, ""),
+            status: MilestoneStatus::Pending,
+            proof_submitted_at: 0,
+        });
+    }
+
+    client.create_engagement(
+        &String::from_str(&env, "ENG-10-MILESTONES"),
+        &company,
+        &recruiter,
+        &ArbiterSetup {
+            arbiters: vec![&env, arbiter.clone()],
+            quorum: 1,
+        },
+        &token_id,
+        &1_000_000_000,
+        &String::from_str(&env, "Job Title"),
+        &milestones,
+        &Vec::new(&env),
+        &None,
+    );
+
+    let eng = client.get_engagement(&String::from_str(&env, "ENG-10-MILESTONES"));
+    assert_eq!(eng.milestones.len(), 10);
+}
+
+#[test]
+#[should_panic(expected = "TooManyMilestones")]
+fn test_milestone_cap_over_cap() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    let mut milestones = Vec::new(&env);
+    for i in 0..11 {
+        let name_str = match i {
+            0 => "m01", 1 => "m02", 2 => "m03", 3 => "m04", 4 => "m05",
+            5 => "m06", 6 => "m07", 7 => "m08", 8 => "m09", 9 => "m10",
+            10 => "m11",
+            _ => "m",
+        };
+        let pct = if i == 10 { 10 } else { 9 };
+        milestones.push_back(Milestone {
+            name: String::from_str(&env, name_str),
+            payment_percent: pct,
+            kind: MilestoneKind::Placement,
+            valid_after_ledger: 0,
+            proof_hash: String::from_str(&env, ""),
+            status: MilestoneStatus::Pending,
+            proof_submitted_at: 0,
+        });
+    }
+
+    client.create_engagement(
+        &String::from_str(&env, "ENG-11-MILESTONES"),
+        &company,
+        &recruiter,
+        &ArbiterSetup {
+            arbiters: vec![&env, arbiter.clone()],
+            quorum: 1,
+        },
+        &token_id,
+        &1_000_000_000,
+        &String::from_str(&env, "Job Title"),
+        &milestones,
+        &Vec::new(&env),
+        &None,
+    );
+}
+
+#[test]
+#[should_panic(expected = "ZeroMilestones")]
+fn test_milestone_cap_zero_milestones() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    client.create_engagement(
+        &String::from_str(&env, "ENG-0-MILESTONES"),
+        &company,
+        &recruiter,
+        &ArbiterSetup {
+            arbiters: vec![&env, arbiter.clone()],
+            quorum: 1,
+        },
+        &token_id,
+        &1_000_000_000,
+        &String::from_str(&env, "Job Title"),
+        &Vec::new(&env),
+        &Vec::new(&env),
+        &None,
+    );
+}
+
+#[test]
+fn test_milestone_cap_admin_update() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    assert_eq!(client.get_max_milestones(), 10);
+
+    client.set_max_milestones(&company, &5);
+    assert_eq!(client.get_max_milestones(), 5);
+
+    let mut milestones = Vec::new(&env);
+    for i in 0..6 {
+        let name_str = match i {
+            0 => "m01", 1 => "m02", 2 => "m03", 3 => "m04", 4 => "m05",
+            5 => "m06",
+            _ => "m",
+        };
+        let pct = if i == 5 { 20 } else { 16 };
+        milestones.push_back(Milestone {
+            name: String::from_str(&env, name_str),
+            payment_percent: pct,
+            kind: MilestoneKind::Placement,
+            valid_after_ledger: 0,
+            proof_hash: String::from_str(&env, ""),
+            status: MilestoneStatus::Pending,
+            proof_submitted_at: 0,
+        });
+    }
+
+    let result = client.try_create_engagement(
+        &String::from_str(&env, "ENG-6-MILESTONES"),
+        &company,
+        &recruiter,
+        &ArbiterSetup {
+            arbiters: vec![&env, arbiter.clone()],
+            quorum: 1,
+        },
+        &token_id,
+        &1_000_000_000,
+        &String::from_str(&env, "Job Title"),
+        &milestones,
+        &Vec::new(&env),
+        &None,
+    );
+    assert!(result.is_err());
+}
+
+// ============================================================
+// ISSUE #22 — MILESTONE NAME MAX LENGTH ENFORCEMENT
+// ============================================================
+
+#[test]
+fn test_milestone_name_64_char_accepted() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    let name_64 = String::from_str(&env, "1234567890123456789012345678901234567890123456789012345678901234");
+    let milestones = vec![
+        &env,
+        Milestone {
+            name: name_64,
+            payment_percent: 100,
+            kind: MilestoneKind::Placement,
+            valid_after_ledger: 0,
+            proof_hash: String::from_str(&env, ""),
+            status: MilestoneStatus::Pending,
+            proof_submitted_at: 0,
+        }
+    ];
+
+    client.create_engagement(
+        &String::from_str(&env, "ENG-64-CHAR"),
+        &company,
+        &recruiter,
+        &ArbiterSetup {
+            arbiters: vec![&env, arbiter.clone()],
+            quorum: 1,
+        },
+        &token_id,
+        &1_000_000_000,
+        &String::from_str(&env, "Job Title"),
+        &milestones,
+        &Vec::new(&env),
+        &None,
+    );
+}
+
+#[test]
+#[should_panic(expected = "MilestoneNameTooLong: index 0")]
+fn test_milestone_name_65_char_rejected() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    let name_65 = String::from_str(&env, "12345678901234567890123456789012345678901234567890123456789012345");
+    let milestones = vec![
+        &env,
+        Milestone {
+            name: name_65,
+            payment_percent: 100,
+            kind: MilestoneKind::Placement,
+            valid_after_ledger: 0,
+            proof_hash: String::from_str(&env, ""),
+            status: MilestoneStatus::Pending,
+            proof_submitted_at: 0,
+        }
+    ];
+
+    client.create_engagement(
+        &String::from_str(&env, "ENG-65-CHAR"),
+        &company,
+        &recruiter,
+        &ArbiterSetup {
+            arbiters: vec![&env, arbiter.clone()],
+            quorum: 1,
+        },
+        &token_id,
+        &1_000_000_000,
+        &String::from_str(&env, "Job Title"),
+        &milestones,
+        &Vec::new(&env),
+        &None,
+    );
+}
+
+#[test]
+#[should_panic(expected = "MilestoneNameEmpty: index 0")]
+fn test_milestone_name_empty_rejected() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    let milestones = vec![
+        &env,
+        Milestone {
+            name: String::from_str(&env, ""),
+            payment_percent: 100,
+            kind: MilestoneKind::Placement,
+            valid_after_ledger: 0,
+            proof_hash: String::from_str(&env, ""),
+            status: MilestoneStatus::Pending,
+            proof_submitted_at: 0,
+        }
+    ];
+
+    client.create_engagement(
+        &String::from_str(&env, "ENG-EMPTY-NAME"),
+        &company,
+        &recruiter,
+        &ArbiterSetup {
+            arbiters: vec![&env, arbiter.clone()],
+            quorum: 1,
+        },
+        &token_id,
+        &1_000_000_000,
+        &String::from_str(&env, "Job Title"),
+        &milestones,
+        &Vec::new(&env),
+        &None,
+    );
+}
+
+#[test]
+#[should_panic(expected = "MilestoneNameTooLong: index 1")]
+fn test_milestone_name_multi_milestone_partial_failure() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    let name_65 = String::from_str(&env, "12345678901234567890123456789012345678901234567890123456789012345");
+    let milestones = vec![
+        &env,
+        Milestone {
+            name: String::from_str(&env, "Valid Milestone"),
+            payment_percent: 50,
+            kind: MilestoneKind::Placement,
+            valid_after_ledger: 0,
+            proof_hash: String::from_str(&env, ""),
+            status: MilestoneStatus::Pending,
+            proof_submitted_at: 0,
+        },
+        Milestone {
+            name: name_65,
+            payment_percent: 50,
+            kind: MilestoneKind::Placement,
+            valid_after_ledger: 0,
+            proof_hash: String::from_str(&env, ""),
+            status: MilestoneStatus::Pending,
+            proof_submitted_at: 0,
+        }
+    ];
+
+    client.create_engagement(
+        &String::from_str(&env, "ENG-PARTIAL-FAIL"),
+        &company,
+        &recruiter,
+        &ArbiterSetup {
+            arbiters: vec![&env, arbiter.clone()],
+            quorum: 1,
+        },
+        &token_id,
+        &1_000_000_000,
+        &String::from_str(&env, "Job Title"),
+        &milestones,
+        &Vec::new(&env),
+        &None,
+    );
+}
+
+// ============================================================
+// ISSUE #23 — MILESTONE NAME UNIQUENESS
+// ============================================================
+
+#[test]
+fn test_milestone_name_uniqueness_happy_path() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    let milestones = vec![
+        &env,
+        Milestone {
+            name: String::from_str(&env, "First Milestone"),
+            payment_percent: 50,
+            kind: MilestoneKind::Placement,
+            valid_after_ledger: 0,
+            proof_hash: String::from_str(&env, ""),
+            status: MilestoneStatus::Pending,
+            proof_submitted_at: 0,
+        },
+        Milestone {
+            name: String::from_str(&env, "Second Milestone"),
+            payment_percent: 50,
+            kind: MilestoneKind::Placement,
+            valid_after_ledger: 0,
+            proof_hash: String::from_str(&env, ""),
+            status: MilestoneStatus::Pending,
+            proof_submitted_at: 0,
+        }
+    ];
+
+    client.create_engagement(
+        &String::from_str(&env, "ENG-UNIQUE"),
+        &company,
+        &recruiter,
+        &ArbiterSetup {
+            arbiters: vec![&env, arbiter.clone()],
+            quorum: 1,
+        },
+        &token_id,
+        &1_000_000_000,
+        &String::from_str(&env, "Job Title"),
+        &milestones,
+        &Vec::new(&env),
+        &None,
+    );
+}
+
+#[test]
+#[should_panic(expected = "DuplicateMilestoneName: Duplicate Milestone")]
+fn test_milestone_name_uniqueness_duplicate_detection() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    let milestones = vec![
+        &env,
+        Milestone {
+            name: String::from_str(&env, "Duplicate Milestone"),
+            payment_percent: 50,
+            kind: MilestoneKind::Placement,
+            valid_after_ledger: 0,
+            proof_hash: String::from_str(&env, ""),
+            status: MilestoneStatus::Pending,
+            proof_submitted_at: 0,
+        },
+        Milestone {
+            name: String::from_str(&env, "Duplicate Milestone"),
+            payment_percent: 50,
+            kind: MilestoneKind::Placement,
+            valid_after_ledger: 0,
+            proof_hash: String::from_str(&env, ""),
+            status: MilestoneStatus::Pending,
+            proof_submitted_at: 0,
+        }
+    ];
+
+    client.create_engagement(
+        &String::from_str(&env, "ENG-DUPLICATE"),
+        &company,
+        &recruiter,
+        &ArbiterSetup {
+            arbiters: vec![&env, arbiter.clone()],
+            quorum: 1,
+        },
+        &token_id,
+        &1_000_000_000,
+        &String::from_str(&env, "Job Title"),
+        &milestones,
+        &Vec::new(&env),
+        &None,
+    );
+}
+
+#[test]
+fn test_milestone_name_uniqueness_case_sensitivity() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    let milestones = vec![
+        &env,
+        Milestone {
+            name: String::from_str(&env, "Placement"),
+            payment_percent: 50,
+            kind: MilestoneKind::Placement,
+            valid_after_ledger: 0,
+            proof_hash: String::from_str(&env, ""),
+            status: MilestoneStatus::Pending,
+            proof_submitted_at: 0,
+        },
+        Milestone {
+            name: String::from_str(&env, "placement"),
+            payment_percent: 50,
+            kind: MilestoneKind::Placement,
+            valid_after_ledger: 0,
+            proof_hash: String::from_str(&env, ""),
+            status: MilestoneStatus::Pending,
+            proof_submitted_at: 0,
+        }
+    ];
+
+    client.create_engagement(
+        &String::from_str(&env, "ENG-CASE-SENSITIVE"),
+        &company,
+        &recruiter,
+        &ArbiterSetup {
+            arbiters: vec![&env, arbiter.clone()],
+            quorum: 1,
+        },
+        &token_id,
+        &1_000_000_000,
+        &String::from_str(&env, "Job Title"),
+        &milestones,
+        &Vec::new(&env),
+        &None,
+    );
+}
+
+// ============================================================
+// ISSUE #24 — JOB TITLE VALIDATION
+// ============================================================
+
+#[test]
+#[should_panic(expected = "JobTitleEmpty")]
+fn test_job_title_empty_rejected() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    client.create_engagement(
+        &String::from_str(&env, "ENG-TITLE-EMPTY"),
+        &company,
+        &recruiter,
+        &ArbiterSetup {
+            arbiters: vec![&env, arbiter.clone()],
+            quorum: 1,
+        },
+        &token_id,
+        &1_000_000_000,
+        &String::from_str(&env, ""),
+        &build_milestones(&env),
+        &vec![&env, 30u32, 90u32],
+        &None,
+    );
+}
+
+#[test]
+fn test_job_title_64_char_accepted() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    let title_64 = String::from_str(&env, "1234567890123456789012345678901234567890123456789012345678901234");
+
+    client.create_engagement(
+        &String::from_str(&env, "ENG-TITLE-64"),
+        &company,
+        &recruiter,
+        &ArbiterSetup {
+            arbiters: vec![&env, arbiter.clone()],
+            quorum: 1,
+        },
+        &token_id,
+        &1_000_000_000,
+        &title_64,
+        &build_milestones(&env),
+        &vec![&env, 30u32, 90u32],
+        &None,
+    );
+}
+
+#[test]
+#[should_panic(expected = "JobTitleTooLong")]
+fn test_job_title_65_char_rejected() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    let title_65 = String::from_str(&env, "12345678901234567890123456789012345678901234567890123456789012345");
+
+    client.create_engagement(
+        &String::from_str(&env, "ENG-TITLE-65"),
+        &company,
+        &recruiter,
+        &ArbiterSetup {
+            arbiters: vec![&env, arbiter.clone()],
+            quorum: 1,
+        },
+        &token_id,
+        &1_000_000_000,
+        &title_65,
+        &build_milestones(&env),
+        &vec![&env, 30u32, 90u32],
+        &None,
+    );
+}
