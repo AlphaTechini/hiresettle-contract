@@ -4,6 +4,7 @@ use soroban_sdk::{contract, contractimpl, contracttype, token, Address, BytesN, 
 
 const MAX_PLATFORM_FEE_BPS: u32 = 500;
 const MAX_ARBITER_FEE_BPS: u32 = 200;
+const FULL_SPLIT_BPS: u32 = 10_000;
 
 // ============================================================
 // DATA TYPES
@@ -172,6 +173,13 @@ pub struct Engagement {
     /// Ordered list of milestones; indices are stable and used throughout the contract API.
     pub milestones: Vec<Milestone>,
     pub status: EngagementStatus,
+    /// Optional co-recruiter address for split-fee engagements (issue #56).
+    /// When `Some`, the milestone payout is split between `recruiter` and `co_recruiter`
+    /// according to `recruiter_split_bps`.
+    pub co_recruiter: Option<Address>,
+    /// Primary recruiter's share of the net payout in basis points (issue #56).
+    /// Default is 10 000 (100 % to recruiter). Must be ≤ 10 000.
+    pub recruiter_split_bps: u32,
 }
 
 /// A lightweight read-only view of an engagement, suitable for list/dashboard APIs.
@@ -200,6 +208,10 @@ pub struct EngagementSummary {
     pub milestone_count: u32,
     /// Ledger sequence number at which the engagement was created.
     pub created_at_ledger: u32,
+    /// Optional co-recruiter address for split-fee engagements (issue #56).
+    pub co_recruiter: Option<Address>,
+    /// Primary recruiter's share of the net payout in basis points (issue #56).
+    pub recruiter_split_bps: u32,
 }
 
 /// Per-dispute, per-milestone vote tally stored on-chain until the dispute resolves.
@@ -264,6 +276,22 @@ pub struct PlatformFee {
     pub bps: u32,
     /// Address that receives accumulated platform fees.
     pub treasury: Address,
+}
+
+/// Bundled optional configuration passed as the last argument of `create_engagement`.
+/// Combines `metadata_hash` with the new co-recruiter split fields (issue #56)
+/// to stay within Soroban's 10-parameter limit.
+#[contracttype]
+#[derive(Clone)]
+pub struct EngagementConfig {
+    /// Optional IPFS CID linking to full job description / contract terms off-chain.
+    pub metadata_hash: Option<String>,
+    /// Optional co-recruiter address that shares the milestone payout.
+    pub co_recruiter: Option<Address>,
+    /// Primary recruiter's share in basis points (10 000 = 100 %).
+    /// If `co_recruiter` is `None` this field is ignored and the full payout goes to `recruiter`.
+    /// Must be ≤ 10 000.
+    pub recruiter_split_bps: u32,
 }
 
 // ============================================================
@@ -551,7 +579,7 @@ impl HireSettleContract {
     /// - `job_title`       — short job title string
     /// - `milestones`      — ordered milestone list
     /// - `retention_days`  — Vec of retention windows in days (one per Retention milestone)
-    /// - `metadata_hash`   — optional IPFS CID for off-chain job description; empty string rejected
+    /// - `config`          — bundled optional config: metadata_hash, co_recruiter, recruiter_split_bps
     pub fn create_engagement(
         env: Env,
         engagement_id: String,
@@ -563,7 +591,7 @@ impl HireSettleContract {
         job_title: String,
         milestones: Vec<Milestone>,
         retention_days: Vec<u32>,
-        metadata_hash: Option<String>,
+        config: EngagementConfig,
     ) -> String {
         Self::assert_not_paused(&env);
         company.require_auth();
@@ -669,10 +697,15 @@ impl HireSettleContract {
         }
 
         // Reject empty metadata hash — caller must either omit or provide a real CID.
-        if let Some(ref hash) = metadata_hash {
+        if let Some(ref hash) = config.metadata_hash {
             if hash.len() == 0 {
                 panic!("InvalidMetadataHash");
             }
+        }
+
+        // Issue #56: validate co-recruiter split basis points.
+        if config.recruiter_split_bps > FULL_SPLIT_BPS {
+            panic!("InvalidSplitBps");
         }
 
         let mut total_percent: u32 = 0;
@@ -736,11 +769,13 @@ impl HireSettleContract {
             total_amount,
             released_amount: 0,
             job_title,
-            metadata_hash,
+            metadata_hash: config.metadata_hash,
             created_at_ledger: current_ledger,
             last_activity_ledger: current_ledger,
             milestones: resolved_milestones,
             status: EngagementStatus::Active,
+            co_recruiter: config.co_recruiter,
+            recruiter_split_bps: config.recruiter_split_bps,
         };
 
         env.storage()
@@ -1001,7 +1036,7 @@ impl HireSettleContract {
         let payment = (engagement.total_amount * milestone.payment_percent as i128) / 100;
         let platform_fee = Self::get_platform_fee_internal(&env);
         let fee_amount = (payment * platform_fee.bps as i128) / 10_000;
-        let recruiter_payment = payment - fee_amount;
+        let net_payment = payment - fee_amount;
         engagement.released_amount += payment;
 
         let token_client = token::Client::new(&env, &engagement.token);
@@ -1019,11 +1054,7 @@ impl HireSettleContract {
                 (milestone_index, fee_amount, platform_fee.treasury),
             );
         }
-        token_client.transfer(
-            &env.current_contract_address(),
-            &engagement.recruiter,
-            &recruiter_payment,
-        );
+        Self::distribute_recruiter_payout(&env, &engagement, net_payment, &token_client);
 
         milestone.status = MilestoneStatus::Confirmed;
         engagement
@@ -1213,7 +1244,7 @@ impl HireSettleContract {
                 .get(&DataKey::ArbiterFee)
                 .unwrap_or(0u32);
             let arbiter_fee_amount = (payment * arbiter_fee_bps as i128) / 10_000;
-            let recruiter_payment = payment - arbiter_fee_amount;
+            let net_payment = payment - arbiter_fee_amount;
 
             let token_client = token::Client::new(&env, &engagement.token);
             if arbiter_fee_amount > 0 {
@@ -1223,11 +1254,7 @@ impl HireSettleContract {
                     &arbiter_fee_amount,
                 );
             }
-            token_client.transfer(
-                &env.current_contract_address(),
-                &engagement.recruiter,
-                &recruiter_payment,
-            );
+            Self::distribute_recruiter_payout(&env, &engagement, net_payment, &token_client);
 
             milestone.status = MilestoneStatus::Resolved;
             engagement.milestones.set(milestone_index, milestone);
@@ -1647,6 +1674,8 @@ impl HireSettleContract {
             status: engagement.status,
             milestone_count: engagement.milestones.len(),
             created_at_ledger: engagement.created_at_ledger,
+            co_recruiter: engagement.co_recruiter,
+            recruiter_split_bps: engagement.recruiter_split_bps,
         }
     }
 
@@ -2604,7 +2633,7 @@ impl HireSettleContract {
 
             let payment = (engagement.total_amount * m.payment_percent as i128) / 100;
             let fee_amount = (payment * platform_fee.bps as i128) / 10_000;
-            let recruiter_payment = payment - fee_amount;
+            let net_payment = payment - fee_amount;
             engagement.released_amount += payment;
 
             if fee_amount > 0 {
@@ -2621,11 +2650,7 @@ impl HireSettleContract {
                     (idx, fee_amount, platform_fee.treasury.clone()),
                 );
             }
-            token_client.transfer(
-                &env.current_contract_address(),
-                &engagement.recruiter,
-                &recruiter_payment,
-            );
+            Self::distribute_recruiter_payout(&env, &engagement, net_payment, &token_client);
 
             m.status = MilestoneStatus::Confirmed;
             engagement.milestones.set(idx, m);
@@ -2778,7 +2803,7 @@ impl HireSettleContract {
         let payment = (engagement.total_amount * milestone.payment_percent as i128) / 100;
         let platform_fee = Self::get_platform_fee_internal(&env);
         let fee_amount = (payment * platform_fee.bps as i128) / 10_000;
-        let recruiter_payment = payment - fee_amount;
+        let net_payment = payment - fee_amount;
         engagement.released_amount += payment;
 
         let token_client = token::Client::new(&env, &engagement.token);
@@ -2796,11 +2821,7 @@ impl HireSettleContract {
                 (milestone_index, fee_amount, platform_fee.treasury),
             );
         }
-        token_client.transfer(
-            &env.current_contract_address(),
-            &engagement.recruiter,
-            &recruiter_payment,
-        );
+        Self::distribute_recruiter_payout(&env, &engagement, net_payment, &token_client);
 
         milestone.status = MilestoneStatus::Confirmed;
         engagement.milestones.set(milestone_index, milestone);
@@ -3088,6 +3109,48 @@ impl HireSettleContract {
             .instance()
             .get(&DataKey::MaxProofHashLength)
             .unwrap_or(MAX_PROOF_HASH_LENGTH)
+    }
+
+    // ----------------------------------------------------------
+    // ISSUE #56 — CO-RECRUITER SPLIT PAYOUT
+    // ----------------------------------------------------------
+
+    /// Distribute the net payment (after platform / arbiter fee) between the
+    /// primary recruiter and the optional co-recruiter.
+    ///
+    /// When `co_recruiter` is `Some`, the primary receives
+    /// `net * split_bps / 10_000` and the co-recruiter receives the remainder.
+    /// When `co_recruiter` is `None` the full net amount goes to the recruiter.
+    fn distribute_recruiter_payout(
+        env: &Env,
+        engagement: &Engagement,
+        net_payment: i128,
+        token_client: &token::Client,
+    ) {
+        match &engagement.co_recruiter {
+            Some(co_recruiter) => {
+                let split = engagement.recruiter_split_bps as i128;
+                let primary_payment = (net_payment * split) / (FULL_SPLIT_BPS as i128);
+                let co_payment = net_payment - primary_payment;
+                token_client.transfer(
+                    &env.current_contract_address(),
+                    &engagement.recruiter,
+                    &primary_payment,
+                );
+                token_client.transfer(
+                    &env.current_contract_address(),
+                    co_recruiter,
+                    &co_payment,
+                );
+            }
+            None => {
+                token_client.transfer(
+                    &env.current_contract_address(),
+                    &engagement.recruiter,
+                    &net_payment,
+                );
+            }
+        }
     }
 }
 

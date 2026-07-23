@@ -100,7 +100,7 @@ fn create_standard_engagement(
         &String::from_str(env, "Senior Engineer"),
         &build_milestones(env),
         &vec![env, 30u32, 90u32],
-        &None,
+        &default_config(),
     );
 }
 
@@ -127,6 +127,14 @@ fn advance_ledger(env: &Env, extra: u32) {
         min_persistent_entry_ttl: 100_000,
         max_entry_ttl: 6_300_000,
     });
+}
+
+fn default_config() -> EngagementConfig {
+    EngagementConfig {
+        metadata_hash: None,
+        co_recruiter: None,
+        recruiter_split_bps: 10_000,
+    }
 }
 
 // ============================================================
@@ -205,7 +213,7 @@ fn test_create_engagement_invalid_percentages() {
         &String::from_str(&env, "Dev"),
         &bad_milestones,
         &vec![&env, 30u32],
-        &None,
+        &default_config(),
     );
 }
 
@@ -565,7 +573,7 @@ fn test_two_milestone_engagement_50_50() {
         &String::from_str(&env, "CTO"),
         &milestones,
         &vec![&env, 30u32],
-        &None,
+        &default_config(),
     );
 
     client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://offer"));
@@ -918,7 +926,7 @@ fn test_metadata_hash_present() {
         &String::from_str(&env, "Engineer"),
         &build_milestones(&env),
         &vec![&env, 30u32, 90u32],
-        &Some(cid.clone()),
+        &EngagementConfig { metadata_hash: Some(cid.clone()), co_recruiter: None, recruiter_split_bps: 10_000 },
     );
 
     let result = client.get_metadata_hash(&String::from_str(&env, "ENG-META"));
@@ -952,8 +960,227 @@ fn test_metadata_hash_empty_string_rejected() {
         &String::from_str(&env, "Engineer"),
         &build_milestones(&env),
         &vec![&env, 30u32, 90u32],
-        &Some(String::from_str(&env, "")),
+        &EngagementConfig { metadata_hash: Some(String::from_str(&env, "")), co_recruiter: None, recruiter_split_bps: 10_000 },
     );
+}
+
+// ============================================================
+// ISSUE #56 — CO-RECRUITER FEE SPLIT
+// ============================================================
+
+#[test]
+fn test_co_recruiter_60_40_split() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_id);
+    let co_recruiter = Address::generate(&env);
+
+    let config = EngagementConfig {
+        metadata_hash: None,
+        co_recruiter: Some(co_recruiter.clone()),
+        recruiter_split_bps: 6_000,
+    };
+
+    client.create_engagement(
+        &String::from_str(&env, "ENG-SPLIT-60-40"),
+        &company,
+        &recruiter,
+        &ArbiterSetup {
+            arbiters: vec![&env, arbiter.clone()],
+            quorum: 1,
+        },
+        &token_id,
+        &1_000_000_000,
+        &String::from_str(&env, "Engineer"),
+        &build_milestones(&env),
+        &vec![&env, 30u32, 90u32],
+        &config,
+    );
+
+    let eng = client.get_engagement(&String::from_str(&env, "ENG-SPLIT-60-40"));
+    assert_eq!(eng.co_recruiter, Some(co_recruiter.clone()));
+    assert_eq!(eng.recruiter_split_bps, 6_000);
+
+    // Confirm the placement milestone (30% of 1_000_000_000 = 300_000_000)
+    let eng_id = String::from_str(&env, "ENG-SPLIT-60-40");
+    client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://proof"));
+    client.confirm_milestone(&company, &eng_id, &0);
+
+    // 300_000_000 goes to escrow→recruiters. No platform fee (default 0 bps).
+    // Primary: 300_000_000 * 6000 / 10000 = 180_000_000
+    // Co:      300_000_000 * 4000 / 10000 = 120_000_000
+    let recruiter_balance = token_client.balance(&recruiter);
+    assert_eq!(recruiter_balance, 180_000_000);
+
+    let co_balance = token_client.balance(&co_recruiter);
+    assert_eq!(co_balance, 120_000_000);
+}
+
+#[test]
+fn test_no_co_recruiter_full_payout() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_id);
+
+    create_standard_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-NO-CO",
+    );
+
+    let eng_id = String::from_str(&env, "ENG-NO-CO");
+    client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://proof"));
+    client.confirm_milestone(&company, &eng_id, &0);
+
+    // 30% of 1_000_000_000 = 300_000_000 — all goes to recruiter (backward-compat).
+    let recruiter_balance = token_client.balance(&recruiter);
+    assert_eq!(recruiter_balance, 300_000_000);
+}
+
+#[test]
+#[should_panic(expected = "InvalidSplitBps")]
+fn test_split_bps_over_10000_rejected() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let co_recruiter = Address::generate(&env);
+
+    let config = EngagementConfig {
+        metadata_hash: None,
+        co_recruiter: Some(co_recruiter),
+        recruiter_split_bps: 10_001,
+    };
+
+    client.create_engagement(
+        &String::from_str(&env, "ENG-BAD-SPLIT"),
+        &company,
+        &recruiter,
+        &ArbiterSetup {
+            arbiters: vec![&env, arbiter.clone()],
+            quorum: 1,
+        },
+        &token_id,
+        &1_000_000_000,
+        &String::from_str(&env, "Engineer"),
+        &build_milestones(&env),
+        &vec![&env, 30u32, 90u32],
+        &config,
+    );
+}
+
+#[test]
+fn test_co_recruiter_gets_remainder() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_id);
+    let co_recruiter = Address::generate(&env);
+
+    // Use 3333 bps (33.33%) — primary gets floor, co gets remainder
+    let config = EngagementConfig {
+        metadata_hash: None,
+        co_recruiter: Some(co_recruiter.clone()),
+        recruiter_split_bps: 3_333,
+    };
+
+    client.create_engagement(
+        &String::from_str(&env, "ENG-SPLIT-REM"),
+        &company,
+        &recruiter,
+        &ArbiterSetup {
+            arbiters: vec![&env, arbiter.clone()],
+            quorum: 1,
+        },
+        &token_id,
+        &1_000_000_000,
+        &String::from_str(&env, "Engineer"),
+        &build_milestones(&env),
+        &vec![&env, 30u32, 90u32],
+        &config,
+    );
+
+    let eng_id = String::from_str(&env, "ENG-SPLIT-REM");
+    client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://proof"));
+    client.confirm_milestone(&company, &eng_id, &0);
+
+    // 300_000_000 * 3333 / 10000 = 99_990_000 (primary)
+    // 300_000_000 - 99_990_000 = 200_010_000 (co — remainder)
+    let recruiter_balance = token_client.balance(&recruiter);
+    assert_eq!(recruiter_balance, 99_990_000);
+
+    let co_balance = token_client.balance(&co_recruiter);
+    assert_eq!(co_balance, 200_010_000);
+}
+
+#[test]
+fn test_co_recruiter_summary_fields() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let co_recruiter = Address::generate(&env);
+
+    let config = EngagementConfig {
+        metadata_hash: None,
+        co_recruiter: Some(co_recruiter.clone()),
+        recruiter_split_bps: 7_000,
+    };
+
+    client.create_engagement(
+        &String::from_str(&env, "ENG-SUM-SPLIT"),
+        &company,
+        &recruiter,
+        &ArbiterSetup {
+            arbiters: vec![&env, arbiter.clone()],
+            quorum: 1,
+        },
+        &token_id,
+        &1_000_000_000,
+        &String::from_str(&env, "Engineer"),
+        &build_milestones(&env),
+        &vec![&env, 30u32, 90u32],
+        &config,
+    );
+
+    let summary = client.get_engagement_summary(&String::from_str(&env, "ENG-SUM-SPLIT"));
+    assert_eq!(summary.co_recruiter, Some(co_recruiter));
+    assert_eq!(summary.recruiter_split_bps, 7_000);
+}
+
+#[test]
+fn test_split_bps_10000_accepted() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_id);
+    let co_recruiter = Address::generate(&env);
+
+    // 10_000 bps = 100% to primary — co_recruiter gets 0
+    let config = EngagementConfig {
+        metadata_hash: None,
+        co_recruiter: Some(co_recruiter.clone()),
+        recruiter_split_bps: 10_000,
+    };
+
+    client.create_engagement(
+        &String::from_str(&env, "ENG-SPLIT-100"),
+        &company,
+        &recruiter,
+        &ArbiterSetup {
+            arbiters: vec![&env, arbiter.clone()],
+            quorum: 1,
+        },
+        &token_id,
+        &1_000_000_000,
+        &String::from_str(&env, "Engineer"),
+        &build_milestones(&env),
+        &vec![&env, 30u32, 90u32],
+        &config,
+    );
+
+    let eng_id = String::from_str(&env, "ENG-SPLIT-100");
+    client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://proof"));
+    client.confirm_milestone(&company, &eng_id, &0);
+
+    // All 300_000_000 goes to primary recruiter.
+    let recruiter_balance = token_client.balance(&recruiter);
+    assert_eq!(recruiter_balance, 300_000_000);
+
+    let co_balance = token_client.balance(&co_recruiter);
+    assert_eq!(co_balance, 0);
 }
 
 // ============================================================
@@ -1060,7 +1287,7 @@ fn test_quorum_2_of_3_approve() {
         &String::from_str(&env, "Engineer"),
         &build_milestones(&env),
         &vec![&env, 30u32, 90u32],
-        &None,
+        &default_config(),
     );
 
     client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://proof"));
@@ -1099,7 +1326,7 @@ fn test_quorum_2_of_3_reject() {
         &String::from_str(&env, "Engineer"),
         &build_milestones(&env),
         &vec![&env, 30u32, 90u32],
-        &None,
+        &default_config(),
     );
 
     client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://proof"));
@@ -1138,7 +1365,7 @@ fn test_duplicate_vote_rejected() {
         &String::from_str(&env, "Engineer"),
         &build_milestones(&env),
         &vec![&env, 30u32, 90u32],
-        &None,
+        &default_config(),
     );
 
     client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://proof"));
@@ -1928,7 +2155,7 @@ fn test_get_engagements_by_company_insertion_order() {
             &String::from_str(&env, "Engineer"),
             &build_milestones(&env),
             &vec![&env, 30u32, 90u32],
-            &None,
+            &default_config(),
         );
     }
 
@@ -1982,7 +2209,7 @@ fn test_get_engagements_first_page_ten() {
             &String::from_str(&env, "Engineer"),
             &build_milestones(&env),
             &vec![&env, 30u32, 90u32],
-            &None,
+            &default_config(),
         );
     }
 
@@ -2321,7 +2548,7 @@ fn test_batch_confirm_atomic_rejection() {
         &ArbiterSetup { arbiters: vec![&env, arbiter.clone()], quorum: 1 },
         &token_id, &1_000_000_000,
         &String::from_str(&env, "Job"), &milestones,
-        &vec![&env], &None,
+        &vec![&env], &default_config(),
     );
 
     // Only submit proof for index 0, not 1 → batch must reject atomically
@@ -2374,7 +2601,7 @@ fn test_batch_confirm_emits_event_per_milestone() {
         &ArbiterSetup { arbiters: vec![&env, arbiter.clone()], quorum: 1 },
         &token_id, &1_000_000_000,
         &String::from_str(&env, "Job"), &milestones,
-        &vec![&env], &None,
+        &vec![&env], &default_config(),
     );
 
     client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://a"));
@@ -2693,7 +2920,7 @@ fn test_force_confirm_last_milestone_completes_engagement() {
         &String::from_str(&env, "CTO"),
         &milestones,
         &vec![&env],
-        &None,
+        &default_config(),
     );
 
     client.submit_proof(
@@ -2887,7 +3114,7 @@ fn create_engagement_with_id(
         &String::from_str(env, "Engineer"),
         &build_milestones(env),
         &vec![env, 30u32, 90u32],
-        &None,
+        &default_config(),
     );
 }
 
@@ -3215,7 +3442,7 @@ fn test_milestone_cap_at_cap() {
         &String::from_str(&env, "Job Title"),
         &milestones,
         &Vec::new(&env),
-        &None,
+        &default_config(),
     );
 
     let eng = client.get_engagement(&String::from_str(&env, "ENG-10-MILESTONES"));
@@ -3261,7 +3488,7 @@ fn test_milestone_cap_over_cap() {
         &String::from_str(&env, "Job Title"),
         &milestones,
         &Vec::new(&env),
-        &None,
+        &default_config(),
     );
 }
 
@@ -3284,7 +3511,7 @@ fn test_milestone_cap_zero_milestones() {
         &String::from_str(&env, "Job Title"),
         &Vec::new(&env),
         &Vec::new(&env),
-        &None,
+        &default_config(),
     );
 }
 
@@ -3330,7 +3557,7 @@ fn test_milestone_cap_admin_update() {
         &String::from_str(&env, "Job Title"),
         &milestones,
         &Vec::new(&env),
-        &None,
+        &default_config(),
     );
     assert!(result.is_err());
 }
@@ -3371,7 +3598,7 @@ fn test_milestone_name_64_char_accepted() {
         &String::from_str(&env, "Job Title"),
         &milestones,
         &Vec::new(&env),
-        &None,
+        &default_config(),
     );
 }
 
@@ -3408,7 +3635,7 @@ fn test_milestone_name_65_char_rejected() {
         &String::from_str(&env, "Job Title"),
         &milestones,
         &Vec::new(&env),
-        &None,
+        &default_config(),
     );
 }
 
@@ -3444,7 +3671,7 @@ fn test_milestone_name_empty_rejected() {
         &String::from_str(&env, "Job Title"),
         &milestones,
         &Vec::new(&env),
-        &None,
+        &default_config(),
     );
 }
 
@@ -3490,7 +3717,7 @@ fn test_milestone_name_multi_milestone_partial_failure() {
         &String::from_str(&env, "Job Title"),
         &milestones,
         &Vec::new(&env),
-        &None,
+        &default_config(),
     );
 }
 
@@ -3538,7 +3765,7 @@ fn test_milestone_name_uniqueness_happy_path() {
         &String::from_str(&env, "Job Title"),
         &milestones,
         &Vec::new(&env),
-        &None,
+        &default_config(),
     );
 }
 
@@ -3583,7 +3810,7 @@ fn test_milestone_name_uniqueness_duplicate_detection() {
         &String::from_str(&env, "Job Title"),
         &milestones,
         &Vec::new(&env),
-        &None,
+        &default_config(),
     );
 }
 
@@ -3627,7 +3854,7 @@ fn test_milestone_name_uniqueness_case_sensitivity() {
         &String::from_str(&env, "Job Title"),
         &milestones,
         &Vec::new(&env),
-        &None,
+        &default_config(),
     );
 }
 
@@ -3654,7 +3881,7 @@ fn test_job_title_empty_rejected() {
         &String::from_str(&env, ""),
         &build_milestones(&env),
         &vec![&env, 30u32, 90u32],
-        &None,
+        &default_config(),
     );
 }
 
@@ -3678,7 +3905,7 @@ fn test_job_title_64_char_accepted() {
         &title_64,
         &build_milestones(&env),
         &vec![&env, 30u32, 90u32],
-        &None,
+        &default_config(),
     );
 }
 
@@ -3703,6 +3930,6 @@ fn test_job_title_65_char_rejected() {
         &title_65,
         &build_milestones(&env),
         &vec![&env, 30u32, 90u32],
-        &None,
+        &default_config(),
     );
 }
