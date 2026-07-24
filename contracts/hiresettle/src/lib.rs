@@ -2562,6 +2562,18 @@ impl HireSettleContract {
             .unwrap_or(0u32)
     }
 
+    fn decrement_company_active_count(env: &Env, company: &Address) {
+        let current: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CompanyActiveCount(company.clone()))
+            .unwrap_or(0u32);
+        let new_count = current.saturating_sub(1);
+        env.storage()
+            .persistent()
+            .set(&DataKey::CompanyActiveCount(company.clone()), &new_count);
+    }
+
     // ----------------------------------------------------------
     // ISSUE #38 — INACTIVITY TIMEOUT
     // ----------------------------------------------------------
