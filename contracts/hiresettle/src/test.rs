@@ -135,6 +135,7 @@ fn default_config() -> EngagementConfig {
         metadata_hash: None,
         co_recruiter: None,
         recruiter_split_bps: 10_000,
+        contract_pdf_hash: None,
     }
 }
 
@@ -927,7 +928,7 @@ fn test_metadata_hash_present() {
         &String::from_str(&env, "Engineer"),
         &build_milestones(&env),
         &vec![&env, 30u32, 90u32],
-        &EngagementConfig { metadata_hash: Some(cid.clone()), co_recruiter: None, recruiter_split_bps: 10_000 },
+        &EngagementConfig { metadata_hash: Some(cid.clone()), co_recruiter: None, recruiter_split_bps: 10_000, contract_pdf_hash: None },
     );
 
     let result = client.get_metadata_hash(&String::from_str(&env, "ENG-META"));
@@ -961,7 +962,7 @@ fn test_metadata_hash_empty_string_rejected() {
         &String::from_str(&env, "Engineer"),
         &build_milestones(&env),
         &vec![&env, 30u32, 90u32],
-        &EngagementConfig { metadata_hash: Some(String::from_str(&env, "")), co_recruiter: None, recruiter_split_bps: 10_000 },
+        &EngagementConfig { metadata_hash: Some(String::from_str(&env, "")), co_recruiter: None, recruiter_split_bps: 10_000, contract_pdf_hash: None },
     );
 }
 
@@ -980,6 +981,7 @@ fn test_co_recruiter_60_40_split() {
         metadata_hash: None,
         co_recruiter: Some(co_recruiter.clone()),
         recruiter_split_bps: 6_000,
+        contract_pdf_hash: None,
     };
 
     client.create_engagement(
@@ -1047,6 +1049,7 @@ fn test_split_bps_over_10000_rejected() {
         metadata_hash: None,
         co_recruiter: Some(co_recruiter),
         recruiter_split_bps: 10_001,
+        contract_pdf_hash: None,
     };
 
     client.create_engagement(
@@ -1078,6 +1081,7 @@ fn test_co_recruiter_gets_remainder() {
         metadata_hash: None,
         co_recruiter: Some(co_recruiter.clone()),
         recruiter_split_bps: 3_333,
+        contract_pdf_hash: None,
     };
 
     client.create_engagement(
@@ -1119,6 +1123,7 @@ fn test_co_recruiter_summary_fields() {
         metadata_hash: None,
         co_recruiter: Some(co_recruiter.clone()),
         recruiter_split_bps: 7_000,
+        contract_pdf_hash: None,
     };
 
     client.create_engagement(
@@ -1154,6 +1159,7 @@ fn test_split_bps_10000_accepted() {
         metadata_hash: None,
         co_recruiter: Some(co_recruiter.clone()),
         recruiter_split_bps: 10_000,
+        contract_pdf_hash: None,
     };
 
     client.create_engagement(
@@ -4548,7 +4554,7 @@ fn test_cap_is_per_company_isolated() {
         &String::from_str(&env, "CTO"),
         &build_milestones(&env),
         &vec![&env, 30u32, 90u32],
-        &None,
+        &default_config(),
     );
 
     assert_eq!(client.get_company_active_count(&company), 1);
@@ -4589,7 +4595,7 @@ fn test_completion_frees_slot() {
         &String::from_str(&env, "Engineer"),
         &single_milestone,
         &vec![&env],
-        &None,
+        &default_config(),
     );
 
     // At cap now — a second create would fail.
@@ -4627,7 +4633,7 @@ fn test_completion_frees_slot() {
             },
         ],
         &vec![&env],
-        &None,
+        &default_config(),
     );
     assert_eq!(client.get_company_active_count(&company), 1);
 }
@@ -4698,7 +4704,7 @@ fn test_admin_decreasing_cap_blocks_new_while_over() {
         &String::from_str(&env, "Engineer"),
         &build_milestones(&env),
         &vec![&env, 30u32, 90u32],
-        &None,
+        &default_config(),
     );
     assert!(result.is_err());
 }
@@ -4710,4 +4716,361 @@ fn test_active_count_default_zero_for_new_company() {
     let client = HireSettleContractClient::new(&env, &contract_id);
     let new_company = Address::generate(&env);
     assert_eq!(client.get_company_active_count(&new_company), 0);
+}
+
+// ============================================================
+// ISSUE #31 — REPLACEMENT COUNT LIMIT
+// ============================================================
+
+/// Cycle a placement through a replacement round and re-confirm it so the
+/// engagement returns to `Active` and another replacement can be requested.
+fn cycle_replacement(
+    env: &Env,
+    client: &HireSettleContractClient,
+    eng_id: &String,
+    company: &Address,
+    recruiter: &Address,
+    reason: &str,
+) {
+    client.request_replacement(company, eng_id, &String::from_str(env, reason));
+    // Each replacement re-pays the placement percentage on reconfirmation, so
+    // top up escrow to keep the fixed test amount from being fully drained
+    // after a handful of cycles.
+    client.top_up_escrow(company, eng_id, &1_000_000_000);
+    client.submit_proof(recruiter, eng_id, &0, &String::from_str(env, "ipfs://replacement"));
+    client.confirm_milestone(company, eng_id, &0);
+}
+
+#[test]
+fn test_get_max_replacements_default() {
+    let (env, contract_id, ..) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    assert_eq!(client.get_max_replacements(), 3);
+}
+
+#[test]
+fn test_third_replacement_accepted_at_default_cap() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let eng_id = String::from_str(&env, "ENG-CAP-3");
+    create_standard_engagement(&env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-CAP-3");
+    confirm_placement(&env, &client, &eng_id, &company, &recruiter);
+
+    // Two replacements already used up.
+    cycle_replacement(&env, &client, &eng_id, &company, &recruiter, "r1");
+    cycle_replacement(&env, &client, &eng_id, &company, &recruiter, "r2");
+
+    // Third replacement (index 2) is within the default cap of 3 and must succeed.
+    client.request_replacement(&company, &eng_id, &String::from_str(&env, "r3"));
+
+    assert_eq!(client.get_replacement_count(&eng_id), 3);
+}
+
+#[test]
+#[should_panic(expected = "ReplacementLimitReached")]
+fn test_fourth_replacement_rejected_over_cap() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let eng_id = String::from_str(&env, "ENG-CAP-4");
+    create_standard_engagement(&env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-CAP-4");
+    confirm_placement(&env, &client, &eng_id, &company, &recruiter);
+
+    cycle_replacement(&env, &client, &eng_id, &company, &recruiter, "r1");
+    cycle_replacement(&env, &client, &eng_id, &company, &recruiter, "r2");
+    cycle_replacement(&env, &client, &eng_id, &company, &recruiter, "r3");
+
+    // Fourth replacement (index 3) exceeds the default cap of 3 — must be rejected.
+    client.request_replacement(&company, &eng_id, &String::from_str(&env, "r4"));
+}
+
+#[test]
+fn test_replacement_count_tracking() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let eng_id = String::from_str(&env, "ENG-CAP-COUNT");
+    create_standard_engagement(&env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-CAP-COUNT");
+    confirm_placement(&env, &client, &eng_id, &company, &recruiter);
+
+    assert_eq!(client.get_replacement_count(&eng_id), 0);
+    cycle_replacement(&env, &client, &eng_id, &company, &recruiter, "r1");
+    assert_eq!(client.get_replacement_count(&eng_id), 1);
+    cycle_replacement(&env, &client, &eng_id, &company, &recruiter, "r2");
+    assert_eq!(client.get_replacement_count(&eng_id), 2);
+}
+
+#[test]
+fn test_admin_can_raise_replacement_cap() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let eng_id = String::from_str(&env, "ENG-CAP-RAISE");
+    create_standard_engagement(&env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-CAP-RAISE");
+    confirm_placement(&env, &client, &eng_id, &company, &recruiter);
+
+    client.set_max_replacements(&company, &5u32);
+    assert_eq!(client.get_max_replacements(), 5);
+
+    cycle_replacement(&env, &client, &eng_id, &company, &recruiter, "r1");
+    cycle_replacement(&env, &client, &eng_id, &company, &recruiter, "r2");
+    cycle_replacement(&env, &client, &eng_id, &company, &recruiter, "r3");
+    // A fourth replacement now succeeds under the raised cap of 5.
+    client.request_replacement(&company, &eng_id, &String::from_str(&env, "r4"));
+
+    assert_eq!(client.get_replacement_count(&eng_id), 4);
+}
+
+#[test]
+#[should_panic(expected = "ReplacementLimitReached")]
+fn test_admin_can_lower_replacement_cap() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let eng_id = String::from_str(&env, "ENG-CAP-LOWER");
+    create_standard_engagement(&env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-CAP-LOWER");
+    confirm_placement(&env, &client, &eng_id, &company, &recruiter);
+
+    client.set_max_replacements(&company, &1u32);
+    assert_eq!(client.get_max_replacements(), 1);
+
+    cycle_replacement(&env, &client, &eng_id, &company, &recruiter, "r1");
+    // Second replacement now exceeds the lowered cap of 1.
+    client.request_replacement(&company, &eng_id, &String::from_str(&env, "r2"));
+}
+
+#[test]
+#[should_panic(expected = "unauthorized")]
+fn test_set_max_replacements_non_admin_rejected() {
+    let (env, contract_id, _token_id, _company, recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    client.set_max_replacements(&recruiter, &5u32);
+}
+
+// ============================================================
+// ISSUE #37 — BULK MILESTONE STATUS QUERY
+// ============================================================
+
+#[test]
+fn test_get_all_milestone_statuses_initial() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let eng_id = String::from_str(&env, "ENG-STATUSES-INIT");
+    create_standard_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-STATUSES-INIT",
+    );
+
+    let statuses = client.get_all_milestone_statuses(&eng_id);
+    assert_eq!(statuses.len(), 3);
+    assert_eq!(statuses.get(0).unwrap(), MilestoneStatus::Pending);
+    assert_eq!(statuses.get(1).unwrap(), MilestoneStatus::Locked);
+    assert_eq!(statuses.get(2).unwrap(), MilestoneStatus::Locked);
+}
+
+#[test]
+fn test_get_all_milestone_statuses_length_matches_milestone_count() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let eng_id = String::from_str(&env, "ENG-STATUSES-LEN");
+    create_standard_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-STATUSES-LEN",
+    );
+
+    let engagement = client.get_engagement(&eng_id);
+    let statuses = client.get_all_milestone_statuses(&eng_id);
+    assert_eq!(statuses.len(), engagement.milestones.len());
+}
+
+#[test]
+fn test_get_all_milestone_statuses_after_partial_confirmation() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let eng_id = String::from_str(&env, "ENG-STATUSES-PARTIAL");
+    create_standard_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-STATUSES-PARTIAL",
+    );
+
+    confirm_placement(&env, &client, &eng_id, &company, &recruiter);
+
+    let statuses = client.get_all_milestone_statuses(&eng_id);
+    assert_eq!(statuses.get(0).unwrap(), MilestoneStatus::Confirmed);
+    assert_eq!(statuses.get(1).unwrap(), MilestoneStatus::Locked);
+    assert_eq!(statuses.get(2).unwrap(), MilestoneStatus::Locked);
+}
+
+#[test]
+fn test_get_all_milestone_statuses_after_dispute() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let eng_id = String::from_str(&env, "ENG-STATUSES-DISPUTE");
+    create_standard_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-STATUSES-DISPUTE",
+    );
+
+    client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://proof"));
+    client.raise_dispute(&company, &eng_id, &0, &String::from_str(&env, "not a good fit"));
+
+    let statuses = client.get_all_milestone_statuses(&eng_id);
+    assert_eq!(statuses.get(0).unwrap(), MilestoneStatus::Disputed);
+    assert_eq!(statuses.get(1).unwrap(), MilestoneStatus::Locked);
+    assert_eq!(statuses.get(2).unwrap(), MilestoneStatus::Locked);
+}
+
+// ============================================================
+// ISSUE #43 — COMPANY TRANSFER
+// ============================================================
+
+#[test]
+fn test_transfer_company_new_company_can_call_company_functions() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let new_company = Address::generate(&env);
+    let eng_id = String::from_str(&env, "ENG-TRANSFER-ACCESS");
+    create_standard_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-TRANSFER-ACCESS",
+    );
+
+    client.transfer_company(&company, &eng_id, &new_company);
+    assert_eq!(client.get_engagement(&eng_id).company, new_company);
+
+    // New company can now confirm milestones as the engagement's company.
+    client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://proof"));
+    client.confirm_milestone(&new_company, &eng_id, &0);
+
+    let statuses = client.get_all_milestone_statuses(&eng_id);
+    assert_eq!(statuses.get(0).unwrap(), MilestoneStatus::Confirmed);
+}
+
+#[test]
+#[should_panic(expected = "unauthorized")]
+fn test_transfer_company_old_company_access_revoked() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let new_company = Address::generate(&env);
+    let eng_id = String::from_str(&env, "ENG-TRANSFER-REVOKE");
+    create_standard_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-TRANSFER-REVOKE",
+    );
+
+    client.transfer_company(&company, &eng_id, &new_company);
+
+    // The old company address can no longer act as the engagement's company.
+    client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://proof"));
+    client.confirm_milestone(&company, &eng_id, &0);
+}
+
+#[test]
+#[should_panic(expected = "engagement is not active")]
+fn test_transfer_company_rejected_on_completed() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let new_company = Address::generate(&env);
+    let eng_id = String::from_str(&env, "ENG-TRANSFER-COMPLETED");
+
+    let single_milestone = vec![
+        &env,
+        Milestone {
+            name: String::from_str(&env, "Placement"),
+            payment_percent: 100,
+            kind: MilestoneKind::Placement,
+            valid_after_ledger: 0,
+            proof_hash: String::from_str(&env, ""),
+            status: MilestoneStatus::Pending,
+            proof_submitted_at: 0,
+        },
+    ];
+    client.create_engagement(
+        &eng_id,
+        &company,
+        &recruiter,
+        &ArbiterSetup { arbiters: vec![&env, arbiter.clone()], quorum: 1 },
+        &token_id,
+        &1_000_000_000,
+        &String::from_str(&env, "Engineer"),
+        &single_milestone,
+        &vec![&env],
+        &default_config(),
+    );
+
+    confirm_placement(&env, &client, &eng_id, &company, &recruiter);
+    assert_eq!(client.get_engagement(&eng_id).status, EngagementStatus::Completed);
+
+    client.transfer_company(&company, &eng_id, &new_company);
+}
+
+#[test]
+#[should_panic(expected = "engagement is not active")]
+fn test_transfer_company_rejected_on_cancelled() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let new_company = Address::generate(&env);
+    let eng_id = String::from_str(&env, "ENG-TRANSFER-CANCELLED");
+    create_standard_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-TRANSFER-CANCELLED",
+    );
+
+    client.cancel_engagement(&company, &recruiter, &eng_id);
+    assert_eq!(client.get_engagement(&eng_id).status, EngagementStatus::Cancelled);
+
+    client.transfer_company(&company, &eng_id, &new_company);
+}
+
+#[test]
+fn test_transfer_company_allowed_during_replacement_requested() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let new_company = Address::generate(&env);
+    let eng_id = String::from_str(&env, "ENG-TRANSFER-REPLACEMENT");
+    create_standard_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-TRANSFER-REPLACEMENT",
+    );
+    confirm_placement(&env, &client, &eng_id, &company, &recruiter);
+    client.request_replacement(&company, &eng_id, &String::from_str(&env, "candidate declined"));
+    assert_eq!(
+        client.get_engagement(&eng_id).status,
+        EngagementStatus::ReplacementRequested
+    );
+
+    client.transfer_company(&company, &eng_id, &new_company);
+    assert_eq!(client.get_engagement(&eng_id).company, new_company);
+}
+
+#[test]
+#[should_panic(expected = "unauthorized")]
+fn test_transfer_company_only_current_company_can_call() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let impostor = Address::generate(&env);
+    let new_company = Address::generate(&env);
+    let eng_id = String::from_str(&env, "ENG-TRANSFER-IMPOSTOR");
+    create_standard_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-TRANSFER-IMPOSTOR",
+    );
+
+    client.transfer_company(&impostor, &eng_id, &new_company);
+}
+
+#[test]
+fn test_transfer_company_emits_event() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let new_company = Address::generate(&env);
+    let eng_id = String::from_str(&env, "ENG-TRANSFER-EVENT");
+    create_standard_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-TRANSFER-EVENT",
+    );
+
+    client.transfer_company(&company, &eng_id, &new_company);
+
+    let expected = Symbol::new(&env, "company_transferred");
+    let mut found = false;
+    for (_, topics, data) in env.events().all().iter() {
+        let topic: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+        if topic == expected {
+            let event_eng_id: String = topics.get(1).unwrap().try_into_val(&env).unwrap();
+            assert_eq!(event_eng_id, eng_id);
+            let (old_company, evt_new_company): (Address, Address) =
+                data.try_into_val(&env).unwrap();
+            assert_eq!(old_company, company);
+            assert_eq!(evt_new_company, new_company);
+            found = true;
+        }
+    }
+    assert!(found, "company_transferred event not found");
 }

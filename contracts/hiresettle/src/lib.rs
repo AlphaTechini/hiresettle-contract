@@ -386,6 +386,8 @@ pub enum DataKey {
     MaxActivePerCompany,
     /// Per-company count of currently active (non-terminal) engagements.
     CompanyActiveCount(Address),
+    /// Admin-configurable maximum number of replacements allowed per engagement (issue #31, default 3).
+    MaxReplacements,
 }
 
 // ============================================================
@@ -412,6 +414,8 @@ const MAX_VERSION_LENGTH: u32 = 32;
 const MAX_PROOF_HASH_LENGTH: u32 = 200;
 const MAX_ENGAGEMENT_ID_LENGTH: u32 = 64;
 const DEFAULT_MAX_ACTIVE_PER_COMPANY: u32 = 50;
+/// Default maximum number of replacements allowed per engagement (issue #31).
+const DEFAULT_MAX_REPLACEMENTS: u32 = 3;
 
 #[contractimpl]
 impl HireSettleContract {
@@ -1421,6 +1425,16 @@ impl HireSettleContract {
             panic!("placement not yet confirmed — use cancel_engagement instead");
         }
 
+        let replacement_index: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ReplacementCount(engagement_id.clone()))
+            .unwrap_or(0u32);
+
+        if replacement_index >= Self::get_max_replacements_internal(&env) {
+            panic!("ReplacementLimitReached");
+        }
+
         let current_ledger = env.ledger().sequence();
 
         for i in 0..engagement.milestones.len() {
@@ -1466,11 +1480,6 @@ impl HireSettleContract {
 
         // Record the reason under a monotonic per-engagement index so the
         // full replacement history is auditable. See issue #51.
-        let replacement_index: u32 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::ReplacementCount(engagement_id.clone()))
-            .unwrap_or(0u32);
         env.storage().persistent().set(
             &DataKey::ReplacementReason(engagement_id.clone(), replacement_index),
             &reason,
@@ -1512,6 +1521,83 @@ impl HireSettleContract {
             .persistent()
             .get(&DataKey::ReplacementCount(engagement_id))
             .unwrap_or(0u32)
+    }
+
+    // ----------------------------------------------------------
+    // ISSUE #31 — REPLACEMENT COUNT LIMIT
+    // ----------------------------------------------------------
+
+    /// Admin sets the maximum number of replacements allowed per engagement.
+    /// Defaults to 3 when not explicitly configured.
+    pub fn set_max_replacements(env: Env, admin: Address, count: u32) {
+        Self::assert_admin(&env, &admin);
+        env.storage()
+            .instance()
+            .set(&DataKey::MaxReplacements, &count);
+        env.events()
+            .publish((Symbol::new(&env, "max_replacements_set"),), count);
+    }
+
+    /// Return the current maximum replacement count cap.
+    /// Returns `DEFAULT_MAX_REPLACEMENTS` (3) when not configured.
+    pub fn get_max_replacements(env: Env) -> u32 {
+        Self::get_max_replacements_internal(&env)
+    }
+
+    // ----------------------------------------------------------
+    // ISSUE #43 — COMPANY TRANSFER
+    // ----------------------------------------------------------
+
+    /// Transfer the company role on an engagement to a new address, effective
+    /// immediately (e.g. the company was acquired or restructured).
+    ///
+    /// # Caller
+    /// `current_company` — must match `engagement.company` and sign the transaction.
+    ///
+    /// # Panics
+    /// - `"unauthorized"` — caller is not the engagement's current company.
+    /// - `"engagement is not active"` — engagement status is not `Active` or
+    ///   `ReplacementRequested`.
+    ///
+    /// # Events
+    /// - `("company_transferred", engagement_id)` with `(old_company, new_company)`.
+    pub fn transfer_company(
+        env: Env,
+        current_company: Address,
+        engagement_id: String,
+        new_company: Address,
+    ) {
+        Self::assert_not_paused(&env);
+        current_company.require_auth();
+
+        let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
+
+        if current_company != engagement.company {
+            panic!("unauthorized");
+        }
+
+        if engagement.status != EngagementStatus::Active
+            && engagement.status != EngagementStatus::ReplacementRequested
+        {
+            panic!("engagement is not active");
+        }
+
+        let old_company = engagement.company.clone();
+        engagement.company = new_company.clone();
+        engagement.last_activity_ledger = env.ledger().sequence();
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Engagement(engagement_id.clone()), &engagement);
+        Self::extend_engagement_ttl(&env, &engagement_id);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "company_transferred"),
+                engagement_id.clone(),
+            ),
+            (old_company, new_company),
+        );
     }
 
     // ----------------------------------------------------------
@@ -1645,6 +1731,17 @@ impl HireSettleContract {
             .milestones
             .get(milestone_index)
             .unwrap_or_else(|| panic!("invalid milestone index"))
+    }
+
+    /// Returns the status of every milestone in the engagement, ordered by
+    /// milestone index, in a single call (issue #37). Read-only, permissionless.
+    pub fn get_all_milestone_statuses(env: Env, engagement_id: String) -> Vec<MilestoneStatus> {
+        let engagement = Self::get_engagement_internal(&env, &engagement_id);
+        let mut statuses = Vec::new(&env);
+        for i in 0..engagement.milestones.len() {
+            statuses.push_back(engagement.milestones.get(i).unwrap().status);
+        }
+        statuses
     }
 
     pub fn get_escrow_balance(env: Env, engagement_id: String) -> i128 {
@@ -3286,6 +3383,28 @@ impl HireSettleContract {
             .instance()
             .get(&DataKey::MaxProofHashLength)
             .unwrap_or(MAX_PROOF_HASH_LENGTH)
+    }
+
+    fn get_max_replacements_internal(env: &Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MaxReplacements)
+            .unwrap_or(DEFAULT_MAX_REPLACEMENTS)
+    }
+
+    /// Decrement the per-company active engagement count, saturating at 0.
+    /// Called whenever an engagement leaves the active pool (completed,
+    /// cancelled, expired, etc).
+    fn decrement_company_active_count(env: &Env, company: &Address) {
+        let active_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CompanyActiveCount(company.clone()))
+            .unwrap_or(0u32);
+        env.storage().persistent().set(
+            &DataKey::CompanyActiveCount(company.clone()),
+            &active_count.saturating_sub(1),
+        );
     }
 
     // ----------------------------------------------------------
