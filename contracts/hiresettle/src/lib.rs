@@ -580,6 +580,11 @@ impl HireSettleContract {
         env.storage().persistent().get(&DataKey::PendingAdmin)
     }
 
+    /// Return the current contract admin.
+    pub fn get_admin(env: Env) -> Address {
+        Self::get_admin_internal(&env)
+    }
+
     // ----------------------------------------------------------
     // ADMIN CONFIG
     // ----------------------------------------------------------
@@ -1911,6 +1916,11 @@ impl HireSettleContract {
 
     /// Current arbiter nominates a successor. The successor must call `claim_arbiter`.
     /// Any arbiter in the engagement's arbiter list may initiate succession for their slot.
+    ///
+    /// # Panics
+    /// - `"engagement is in a terminal state"` — the engagement is `Completed`,
+    ///   `Cancelled`, or `Expired`. Arbiter succession has no practical function
+    ///   once an engagement can no longer be disputed.
     pub fn nominate_arbiter_successor(
         env: Env,
         arbiter: Address,
@@ -1921,6 +1931,10 @@ impl HireSettleContract {
         arbiter.require_auth();
 
         let engagement = Self::get_engagement_internal(&env, &engagement_id);
+
+        if Self::is_terminal_status(&engagement.status) {
+            panic!("engagement is in a terminal state");
+        }
 
         let is_arbiter =
             (0..engagement.arbiters.len()).any(|i| engagement.arbiters.get(i).unwrap() == arbiter);
@@ -1953,6 +1967,11 @@ impl HireSettleContract {
     }
 
     /// Nominated successor claims the arbiter slot, replacing the nominating arbiter.
+    ///
+    /// # Panics
+    /// - `"engagement is in a terminal state"` — the engagement reached `Completed`,
+    ///   `Cancelled`, or `Expired` after the nomination was made; the seat can no
+    ///   longer be claimed.
     pub fn claim_arbiter(env: Env, nominee: Address, engagement_id: String) {
         Self::assert_not_paused(&env);
         nominee.require_auth();
@@ -1968,6 +1987,10 @@ impl HireSettleContract {
         }
 
         let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
+
+        if Self::is_terminal_status(&engagement.status) {
+            panic!("engagement is in a terminal state");
+        }
 
         // Replace the nominating arbiter's slot with the nominee.
         for i in 0..engagement.arbiters.len() {
@@ -2652,6 +2675,12 @@ impl HireSettleContract {
     // ----------------------------------------------------------
 
     /// Admin sets the maximum retention days cap.
+    ///
+    /// This cap is enforced only at `create_engagement` time. Lowering it has
+    /// no effect on existing engagements whose retention windows already
+    /// exceed the new cap — their lifecycle (`unlock_milestone`,
+    /// `propose_amendment`, etc.) re-reads stored per-engagement values, not
+    /// this config.
     pub fn set_max_retention_days(env: Env, admin: Address, days: u32) {
         Self::assert_admin(&env, &admin);
         env.storage()
@@ -2674,6 +2703,12 @@ impl HireSettleContract {
     // ----------------------------------------------------------
 
     /// Admin sets the maximum milestone count cap.
+    ///
+    /// This cap is enforced only at `create_engagement` time. Lowering it has
+    /// no effect on existing engagements that already have more milestones
+    /// than the new cap — their lifecycle (`unlock_milestone`,
+    /// `propose_amendment`, etc.) operates on the stored milestone list, not
+    /// this config.
     pub fn set_max_milestones(env: Env, admin: Address, count: u32) {
         Self::assert_admin(&env, &admin);
         env.storage()
@@ -3440,7 +3475,7 @@ impl HireSettleContract {
             .unwrap_or_else(|| panic!("engagement not found"))
     }
 
-    fn get_admin(env: &Env) -> Address {
+    fn get_admin_internal(env: &Env) -> Address {
         env.storage()
             .instance()
             .get(&DataKey::Admin)
@@ -3457,7 +3492,7 @@ impl HireSettleContract {
             panic!("NoAdmin");
         }
         admin.require_auth();
-        if *admin != Self::get_admin(env) {
+        if *admin != Self::get_admin_internal(env) {
             panic!("unauthorized");
         }
     }
@@ -3475,13 +3510,21 @@ impl HireSettleContract {
         }
     }
 
+    /// Terminal engagement states — no further state transitions are possible.
+    fn is_terminal_status(status: &EngagementStatus) -> bool {
+        matches!(
+            status,
+            EngagementStatus::Completed | EngagementStatus::Cancelled | EngagementStatus::Expired
+        )
+    }
+
     fn get_platform_fee_internal(env: &Env) -> PlatformFee {
         env.storage()
             .persistent()
             .get(&DataKey::PlatformFee)
             .unwrap_or_else(|| PlatformFee {
                 bps: 0,
-                treasury: Self::get_admin(env),
+                treasury: Self::get_admin_internal(env),
             })
     }
 
