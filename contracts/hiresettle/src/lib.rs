@@ -2507,6 +2507,12 @@ impl HireSettleContract {
     // ----------------------------------------------------------
 
     /// Admin sets the maximum retention days cap.
+    ///
+    /// This cap is enforced only at `create_engagement` time. Lowering it has
+    /// no effect on existing engagements whose retention windows already
+    /// exceed the new cap — their lifecycle (`unlock_milestone`,
+    /// `propose_amendment`, etc.) re-reads stored per-engagement values, not
+    /// this config.
     pub fn set_max_retention_days(env: Env, admin: Address, days: u32) {
         Self::assert_admin(&env, &admin);
         env.storage()
@@ -2529,6 +2535,12 @@ impl HireSettleContract {
     // ----------------------------------------------------------
 
     /// Admin sets the maximum milestone count cap.
+    ///
+    /// This cap is enforced only at `create_engagement` time. Lowering it has
+    /// no effect on existing engagements that already have more milestones
+    /// than the new cap — their lifecycle (`unlock_milestone`,
+    /// `propose_amendment`, etc.) operates on the stored milestone list, not
+    /// this config.
     pub fn set_max_milestones(env: Env, admin: Address, count: u32) {
         Self::assert_admin(&env, &admin);
         env.storage()

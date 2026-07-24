@@ -4291,3 +4291,82 @@ fn test_claim_arbiter_after_completion_rejected() {
 
     client.claim_arbiter(&new_arbiter, &eng_id);
 }
+
+// ============================================================
+// #186 — lowering max_milestones / max_retention_days caps is
+// creation-time-only and doesn't affect existing engagements
+// ============================================================
+
+/// Create an engagement at the current milestone cap, lower the cap below that
+/// count, then exercise the full remaining lifecycle (unlock, propose/accept
+/// amendment, confirm) — nothing should panic or misbehave from now being
+/// "over" the new cap.
+#[test]
+fn test_lowering_max_milestones_does_not_break_existing_engagement() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_id);
+
+    // build_milestones() creates a 3-milestone engagement; set the cap to exactly 3.
+    client.set_max_milestones(&company, &3u32);
+    let eng_id = String::from_str(&env, "ENG-CAP-MS");
+    create_standard_engagement(&env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-CAP-MS");
+
+    // Admin lowers the cap below the existing engagement's milestone count.
+    client.set_max_milestones(&company, &1u32);
+    assert_eq!(client.get_max_milestones(), 1);
+
+    // Full lifecycle still works: unlock, amend, confirm.
+    client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://offer-letter"));
+    client.confirm_milestone(&company, &eng_id, &0);
+    assert_eq!(token_client.balance(&recruiter), 300_000_000);
+
+    advance_ledger(&env, 31 * 17_280);
+    client.unlock_milestone(&eng_id, &1);
+
+    client.propose_amendment(&company, &eng_id, &1, &50u32);
+    client.accept_amendment(&recruiter, &eng_id, &1);
+    assert_eq!(client.get_milestone(&eng_id, &1).payment_percent, 50);
+
+    client.submit_proof(&recruiter, &eng_id, &1, &String::from_str(&env, "ipfs://30-day"));
+    client.confirm_milestone(&company, &eng_id, &1);
+
+    let eng = client.get_engagement(&eng_id);
+    assert_eq!(eng.status, EngagementStatus::Active);
+    assert_eq!(eng.milestones.len(), 3);
+}
+
+/// Create an engagement with a retention window at the current cap, lower the
+/// cap below that window, then confirm the milestone still unlocks and
+/// confirms normally once its original `valid_after_ledger` is reached.
+#[test]
+fn test_lowering_max_retention_days_does_not_break_existing_engagement() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_id);
+
+    client.set_max_retention_days(&company, &90u32);
+    let eng_id = String::from_str(&env, "ENG-CAP-RET");
+    create_standard_engagement(&env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-CAP-RET");
+
+    // Admin lowers the cap below the 90-day retention milestone already stored.
+    client.set_max_retention_days(&company, &10u32);
+    assert_eq!(client.get_max_retention_days(), 10);
+
+    // Existing engagement's lifecycle is unaffected by the new, lower cap.
+    client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://offer-letter"));
+    client.confirm_milestone(&company, &eng_id, &0);
+
+    advance_ledger(&env, 31 * 17_280);
+    client.unlock_milestone(&eng_id, &1);
+    client.submit_proof(&recruiter, &eng_id, &1, &String::from_str(&env, "ipfs://30-day"));
+    client.confirm_milestone(&company, &eng_id, &1);
+
+    advance_ledger(&env, 60 * 17_280);
+    client.unlock_milestone(&eng_id, &2);
+    client.submit_proof(&recruiter, &eng_id, &2, &String::from_str(&env, "ipfs://90-day"));
+    client.confirm_milestone(&company, &eng_id, &2);
+
+    assert_eq!(token_client.balance(&recruiter), 1_000_000_000);
+    assert_eq!(client.get_engagement(&eng_id).status, EngagementStatus::Completed);
+}
