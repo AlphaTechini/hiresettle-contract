@@ -932,6 +932,7 @@ impl HireSettleContract {
         let valid_after_ledger = milestone.valid_after_ledger;
         let unlocked_at_ledger = current_ledger;
 
+        let old_status = milestone.status.clone();
         milestone.status = MilestoneStatus::Pending;
         engagement.milestones.set(milestone_index, milestone);
         engagement.last_activity_ledger = unlocked_at_ledger;
@@ -940,6 +941,13 @@ impl HireSettleContract {
             .persistent()
             .set(&DataKey::Engagement(engagement_id.clone()), &engagement);
         Self::extend_engagement_ttl(&env, &engagement_id);
+        Self::emit_milestone_status_changed(
+            &env,
+            &engagement_id,
+            milestone_index,
+            old_status,
+            MilestoneStatus::Pending,
+        );
 
         // Event body carries the time-gate evidence so off-chain consumers can
         // confirm the unlock was legitimate without a follow-up `get_milestone`
@@ -976,6 +984,8 @@ impl HireSettleContract {
     /// - `"milestone not pending"` — milestone is not in `Pending` status.
     /// - `"proof cooldown active"` — resubmitting too soon after a previous proof.
     /// - `"proof hash cannot be empty"` — empty string passed as `proof_hash`.
+    /// - `"DuplicateProofHash"` — the proof hash is already used by another milestone
+    ///   in this engagement.
     ///
     /// # Events
     /// Emits `("proof_submitted", engagement_id)` with `(milestone_index, proof_hash)`.
@@ -1027,6 +1037,20 @@ impl HireSettleContract {
             }
         }
 
+        // A proof hash identifies the evidence for a milestone and must not be
+        // reused by another milestone in the same engagement. Exclude the
+        // target milestone so a valid resubmission can replace its own proof.
+        for i in 0..engagement.milestones.len() {
+            if i != milestone_index {
+                let existing_milestone = engagement.milestones.get(i).unwrap();
+                if existing_milestone.proof_hash.len() > 0
+                    && existing_milestone.proof_hash == proof_hash
+                {
+                    panic!("DuplicateProofHash");
+                }
+            }
+        }
+
         // Record this submission ledger for future cooldown checks.
         env.storage().persistent().set(&last_key, &current_ledger);
         env.storage()
@@ -1037,10 +1061,12 @@ impl HireSettleContract {
         let old_hash = milestone.proof_hash.clone();
 
         milestone.proof_hash = proof_hash.clone();
+        let old_status = milestone.status.clone();
         milestone.status = MilestoneStatus::ProofSubmitted;
         milestone.proof_submitted_at = current_ledger;
         engagement.milestones.set(milestone_index, milestone);
 
+        let old_engagement_status = engagement.status.clone();
         if engagement.status == EngagementStatus::ReplacementRequested {
             engagement.status = EngagementStatus::Active;
         }
@@ -1050,6 +1076,19 @@ impl HireSettleContract {
             .persistent()
             .set(&DataKey::Engagement(engagement_id.clone()), &engagement);
         Self::extend_engagement_ttl(&env, &engagement_id);
+        Self::emit_milestone_status_changed(
+            &env,
+            &engagement_id,
+            milestone_index,
+            old_status,
+            MilestoneStatus::ProofSubmitted,
+        );
+        Self::emit_engagement_status_changed(
+            &env,
+            &engagement_id,
+            old_engagement_status,
+            engagement.status.clone(),
+        );
 
         if is_resubmission {
             env.events().publish(
@@ -1136,6 +1175,7 @@ impl HireSettleContract {
         }
         Self::distribute_recruiter_payout(&env, &engagement, net_payment, &token_client);
 
+        let old_status = milestone.status.clone();
         milestone.status = MilestoneStatus::Confirmed;
         engagement
             .milestones
@@ -1146,6 +1186,7 @@ impl HireSettleContract {
             s == MilestoneStatus::Confirmed || s == MilestoneStatus::Resolved
         });
 
+        let old_engagement_status = engagement.status.clone();
         if all_done {
             engagement.status = EngagementStatus::Completed;
             Self::decrement_company_active_count(&env, &engagement.company);
@@ -1156,6 +1197,20 @@ impl HireSettleContract {
             .persistent()
             .set(&DataKey::Engagement(engagement_id.clone()), &engagement);
         Self::extend_engagement_ttl(&env, &engagement_id);
+
+        Self::emit_milestone_status_changed(
+            &env,
+            &engagement_id,
+            milestone_index,
+            old_status,
+            MilestoneStatus::Confirmed,
+        );
+        Self::emit_engagement_status_changed(
+            &env,
+            &engagement_id,
+            old_engagement_status,
+            engagement.status.clone(),
+        );
 
         env.events().publish(
             (
@@ -1224,6 +1279,7 @@ impl HireSettleContract {
             panic!("DisputeWindowClosed");
         }
 
+        let old_status = milestone.status.clone();
         milestone.status = MilestoneStatus::Disputed;
         engagement.milestones.set(milestone_index, milestone);
         engagement.last_activity_ledger = env.ledger().sequence();
@@ -1237,6 +1293,14 @@ impl HireSettleContract {
             .persistent()
             .set(&DataKey::Engagement(engagement_id.clone()), &engagement);
         Self::extend_engagement_ttl(&env, &engagement_id);
+
+        Self::emit_milestone_status_changed(
+            &env,
+            &engagement_id,
+            milestone_index,
+            old_status,
+            MilestoneStatus::Disputed,
+        );
 
         env.events().publish(
             (Symbol::new(&env, "dispute_raised"), engagement_id.clone()),
@@ -1337,6 +1401,7 @@ impl HireSettleContract {
             }
             Self::distribute_recruiter_payout(&env, &engagement, net_payment, &token_client);
 
+            let old_status = milestone.status.clone();
             milestone.status = MilestoneStatus::Resolved;
             engagement.milestones.set(milestone_index, milestone);
 
@@ -1344,6 +1409,7 @@ impl HireSettleContract {
                 let s = engagement.milestones.get(i).unwrap().status;
                 s == MilestoneStatus::Confirmed || s == MilestoneStatus::Resolved
             });
+            let old_engagement_status = engagement.status.clone();
             if all_done {
                 engagement.status = EngagementStatus::Completed;
                 Self::decrement_company_active_count(&env, &engagement.company);
@@ -1359,7 +1425,21 @@ impl HireSettleContract {
                 (Symbol::new(&env, "dispute_resolved"), engagement_id.clone()),
                 (milestone_index, true),
             );
+            Self::emit_milestone_status_changed(
+                &env,
+                &engagement_id,
+                milestone_index,
+                old_status,
+                MilestoneStatus::Resolved,
+            );
+            Self::emit_engagement_status_changed(
+                &env,
+                &engagement_id,
+                old_engagement_status,
+                engagement.status.clone(),
+            );
         } else if record.reject_votes > total_arbiters - quorum {
+            let old_status = milestone.status.clone();
             milestone.status = MilestoneStatus::Pending;
             milestone.proof_hash = String::from_str(&env, "");
             engagement.milestones.set(milestone_index, milestone);
@@ -1373,6 +1453,13 @@ impl HireSettleContract {
             env.events().publish(
                 (Symbol::new(&env, "dispute_resolved"), engagement_id.clone()),
                 (milestone_index, false),
+            );
+            Self::emit_milestone_status_changed(
+                &env,
+                &engagement_id,
+                milestone_index,
+                old_status,
+                MilestoneStatus::Pending,
             );
         } else {
             env.storage().persistent().set(&vote_key, &record);
@@ -1430,8 +1517,16 @@ impl HireSettleContract {
                     if m.status == MilestoneStatus::Confirmed
                         || m.status == MilestoneStatus::Resolved
                     {
+                        let old_status = m.status.clone();
                         m.status = MilestoneStatus::Pending;
                         m.proof_hash = String::from_str(&env, "");
+                        Self::emit_milestone_status_changed(
+                            &env,
+                            &engagement_id,
+                            i,
+                            old_status,
+                            MilestoneStatus::Pending,
+                        );
                         // Clear cooldown so the replacement candidate can submit immediately.
                         env.storage()
                             .persistent()
@@ -1446,8 +1541,18 @@ impl HireSettleContract {
                             / Self::get_ledgers_per_day_internal(&env);
                         m.valid_after_ledger = current_ledger
                             + (original_days * Self::get_ledgers_per_day_internal(&env));
+                        let old_status = m.status.clone();
                         m.status = MilestoneStatus::Locked;
                         m.proof_hash = String::from_str(&env, "");
+                        if old_status != MilestoneStatus::Locked {
+                            Self::emit_milestone_status_changed(
+                                &env,
+                                &engagement_id,
+                                i,
+                                old_status,
+                                MilestoneStatus::Locked,
+                            );
+                        }
                         env.storage()
                             .persistent()
                             .remove(&DataKey::LastProofAt(engagement_id.clone(), i));
@@ -1457,6 +1562,7 @@ impl HireSettleContract {
             engagement.milestones.set(i, m);
         }
 
+        let old_engagement_status = engagement.status.clone();
         engagement.status = EngagementStatus::ReplacementRequested;
         engagement.last_activity_ledger = env.ledger().sequence();
 
@@ -1481,6 +1587,12 @@ impl HireSettleContract {
         );
 
         Self::extend_engagement_ttl(&env, &engagement_id);
+        Self::emit_engagement_status_changed(
+            &env,
+            &engagement_id,
+            old_engagement_status,
+            engagement.status.clone(),
+        );
 
         env.events().publish(
             (
@@ -1552,6 +1664,7 @@ impl HireSettleContract {
             &refund,
         );
 
+        let old_engagement_status = engagement.status.clone();
         engagement.status = EngagementStatus::Cancelled;
         engagement.last_activity_ledger = env.ledger().sequence();
 
@@ -1559,6 +1672,12 @@ impl HireSettleContract {
             .persistent()
             .set(&DataKey::Engagement(engagement_id.clone()), &engagement);
         Self::extend_engagement_ttl(&env, &engagement_id);
+        Self::emit_engagement_status_changed(
+            &env,
+            &engagement_id,
+            old_engagement_status,
+            engagement.status.clone(),
+        );
 
         Self::decrement_company_active_count(&env, &engagement.company);
 
@@ -2298,12 +2417,19 @@ impl HireSettleContract {
             panic!("unauthorized");
         }
 
+        let old_engagement_status = engagement.status.clone();
         engagement.status = EngagementStatus::ExitRequested;
         engagement.last_activity_ledger = env.ledger().sequence();
         env.storage()
             .persistent()
             .set(&DataKey::Engagement(engagement_id.clone()), &engagement);
         Self::extend_engagement_ttl(&env, &engagement_id);
+        Self::emit_engagement_status_changed(
+            &env,
+            &engagement_id,
+            old_engagement_status,
+            engagement.status.clone(),
+        );
 
         env.events().publish(
             (
@@ -2359,12 +2485,19 @@ impl HireSettleContract {
             );
         }
 
+        let old_engagement_status = engagement.status.clone();
         engagement.status = EngagementStatus::Cancelled;
         engagement.last_activity_ledger = env.ledger().sequence();
         env.storage()
             .persistent()
             .set(&DataKey::Engagement(engagement_id.clone()), &engagement);
         Self::extend_engagement_ttl(&env, &engagement_id);
+        Self::emit_engagement_status_changed(
+            &env,
+            &engagement_id,
+            old_engagement_status,
+            engagement.status.clone(),
+        );
 
         Self::decrement_company_active_count(&env, &engagement.company);
 
@@ -2410,12 +2543,19 @@ impl HireSettleContract {
             panic!("unauthorized");
         }
 
+        let old_engagement_status = engagement.status.clone();
         engagement.status = EngagementStatus::Active;
         engagement.last_activity_ledger = env.ledger().sequence();
         env.storage()
             .persistent()
             .set(&DataKey::Engagement(engagement_id.clone()), &engagement);
         Self::extend_engagement_ttl(&env, &engagement_id);
+        Self::emit_engagement_status_changed(
+            &env,
+            &engagement_id,
+            old_engagement_status,
+            engagement.status.clone(),
+        );
 
         env.events().publish(
             (
@@ -2659,10 +2799,17 @@ impl HireSettleContract {
             );
         }
 
+        let old_engagement_status = engagement.status.clone();
         engagement.status = EngagementStatus::Expired;
         env.storage()
             .persistent()
             .set(&DataKey::Engagement(engagement_id.clone()), &engagement);
+        Self::emit_engagement_status_changed(
+            &env,
+            &engagement_id,
+            old_engagement_status,
+            engagement.status.clone(),
+        );
 
         Self::decrement_company_active_count(&env, &engagement.company);
 
@@ -2705,6 +2852,38 @@ impl HireSettleContract {
             100_000,
             extend_to,
         );
+    }
+
+    fn emit_milestone_status_changed(
+        env: &Env,
+        engagement_id: &String,
+        milestone_index: u32,
+        old_status: MilestoneStatus,
+        new_status: MilestoneStatus,
+    ) {
+        if old_status != new_status {
+            env.events().publish(
+                (
+                    Symbol::new(env, "milestone_status_changed"),
+                    engagement_id.clone(),
+                ),
+                (milestone_index, old_status, new_status),
+            );
+        }
+    }
+
+    fn emit_engagement_status_changed(
+        env: &Env,
+        engagement_id: &String,
+        old_status: EngagementStatus,
+        new_status: EngagementStatus,
+    ) {
+        if old_status != new_status {
+            env.events().publish(
+                (Symbol::new(env, "status_changed"), engagement_id.clone()),
+                (old_status, new_status),
+            );
+        }
     }
 
     // ----------------------------------------------------------
@@ -2808,8 +2987,17 @@ impl HireSettleContract {
             }
             Self::distribute_recruiter_payout(&env, &engagement, net_payment, &token_client);
 
+            let old_status = m.status.clone();
             m.status = MilestoneStatus::Confirmed;
             engagement.milestones.set(idx, m);
+
+            Self::emit_milestone_status_changed(
+                &env,
+                &engagement_id,
+                idx,
+                old_status,
+                MilestoneStatus::Confirmed,
+            );
 
             env.events().publish(
                 (
@@ -2825,6 +3013,7 @@ impl HireSettleContract {
             s == MilestoneStatus::Confirmed || s == MilestoneStatus::Resolved
         });
 
+        let old_engagement_status = engagement.status.clone();
         if all_done {
             engagement.status = EngagementStatus::Completed;
             Self::decrement_company_active_count(&env, &engagement.company);
@@ -2835,6 +3024,12 @@ impl HireSettleContract {
             .persistent()
             .set(&DataKey::Engagement(engagement_id.clone()), &engagement);
         Self::extend_engagement_ttl(&env, &engagement_id);
+        Self::emit_engagement_status_changed(
+            &env,
+            &engagement_id,
+            old_engagement_status,
+            engagement.status.clone(),
+        );
 
         if all_done {
             env.events().publish(
@@ -2980,6 +3175,7 @@ impl HireSettleContract {
         }
         Self::distribute_recruiter_payout(&env, &engagement, net_payment, &token_client);
 
+        let old_status = milestone.status.clone();
         milestone.status = MilestoneStatus::Confirmed;
         engagement.milestones.set(milestone_index, milestone);
 
@@ -2988,6 +3184,7 @@ impl HireSettleContract {
             s == MilestoneStatus::Confirmed || s == MilestoneStatus::Resolved
         });
 
+        let old_engagement_status = engagement.status.clone();
         if all_done {
             engagement.status = EngagementStatus::Completed;
             Self::decrement_company_active_count(&env, &engagement.company);
@@ -2998,6 +3195,20 @@ impl HireSettleContract {
             .persistent()
             .set(&DataKey::Engagement(engagement_id.clone()), &engagement);
         Self::extend_engagement_ttl(&env, &engagement_id);
+        Self::emit_engagement_status_changed(
+            &env,
+            &engagement_id,
+            old_engagement_status,
+            engagement.status.clone(),
+        );
+
+        Self::emit_milestone_status_changed(
+            &env,
+            &engagement_id,
+            milestone_index,
+            old_status,
+            MilestoneStatus::Confirmed,
+        );
 
         env.events().publish(
             (

@@ -1231,6 +1231,58 @@ fn test_proof_cooldown_passes_after_wait() {
 }
 
 #[test]
+#[should_panic(expected = "DuplicateProofHash")]
+fn test_duplicate_proof_hash_rejected_across_milestones() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    let eng_id = String::from_str(&env, "ENG-DUP-PROOF");
+    create_standard_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-DUP-PROOF",
+    );
+
+    let proof_hash = String::from_str(&env, "ipfs://same-proof");
+    client.submit_proof(&recruiter, &eng_id, &0, &proof_hash);
+
+    advance_ledger(&env, 31 * 17_280);
+    client.unlock_milestone(&eng_id, &1);
+
+    client.submit_proof(&recruiter, &eng_id, &1, &proof_hash);
+}
+
+#[test]
+fn test_different_proof_hashes_allowed_across_milestones() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    let eng_id = String::from_str(&env, "ENG-DIFF-PROOF");
+    create_standard_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-DIFF-PROOF",
+    );
+
+    client.submit_proof(
+        &recruiter,
+        &eng_id,
+        &0,
+        &String::from_str(&env, "ipfs://placement-proof"),
+    );
+
+    advance_ledger(&env, 31 * 17_280);
+    client.unlock_milestone(&eng_id, &1);
+    client.submit_proof(
+        &recruiter,
+        &eng_id,
+        &1,
+        &String::from_str(&env, "ipfs://retention-proof"),
+    );
+
+    assert_eq!(
+        client.get_milestone(&eng_id, &1).status,
+        MilestoneStatus::ProofSubmitted
+    );
+}
+
+#[test]
 fn test_set_proof_cooldown_admin() {
     let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
     let client = HireSettleContractClient::new(&env, &contract_id);
@@ -2611,7 +2663,7 @@ fn test_engagement_count_does_not_decrement_on_cancel() {
 }
 
 #[test]
-#[should_panic]
+#[should_panic(expected = "engagement already exists")]
 fn test_engagement_count_no_increment_on_failed_create() {
     let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
     let client = HireSettleContractClient::new(&env, &contract_id);
