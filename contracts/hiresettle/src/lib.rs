@@ -1723,6 +1723,12 @@ impl HireSettleContract {
         }
     }
 
+    /// Total amount released for this engagement, represented by
+    /// `Engagement.released_amount`.
+    ///
+    /// This is not the escrow balance. To get remaining contract funds,
+    /// use `total_amount - released_amount`; `get_escrow_balance` provides
+    /// that derived value.
     pub fn get_total_released(env: Env, engagement_id: String) -> i128 {
         Self::get_engagement_internal(&env, &engagement_id).released_amount
     }
