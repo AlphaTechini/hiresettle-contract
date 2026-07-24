@@ -1632,6 +1632,9 @@ impl HireSettleContract {
         engagement.total_amount - engagement.released_amount
     }
 
+    /// Returns `true` if the milestone is `Locked` and the current ledger
+    /// sequence is greater than or equal to its `valid_after_ledger`, meaning
+    /// it can currently be unlocked via `unlock_milestone`.
     pub fn is_milestone_unlockable(env: Env, engagement_id: String, milestone_index: u32) -> bool {
         let engagement = Self::get_engagement_internal(&env, &engagement_id);
         let milestone = engagement
@@ -1643,6 +1646,12 @@ impl HireSettleContract {
             && env.ledger().sequence() >= milestone.valid_after_ledger
     }
 
+    /// Returns the number of ledgers remaining until the milestone becomes
+    /// unlockable, or `0` if it is already unlockable.
+    ///
+    /// When the result is `0`, `unlock_milestone` can be called immediately.
+    /// Otherwise, the caller must wait at least this many more ledgers before
+    /// `env.ledger().sequence() >= milestone.valid_after_ledger` holds.
     pub fn ledgers_until_unlock(env: Env, engagement_id: String, milestone_index: u32) -> u32 {
         let engagement = Self::get_engagement_internal(&env, &engagement_id);
         let milestone = engagement
