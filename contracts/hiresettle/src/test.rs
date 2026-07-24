@@ -135,6 +135,7 @@ fn default_config() -> EngagementConfig {
         metadata_hash: None,
         co_recruiter: None,
         recruiter_split_bps: 10_000,
+        contract_pdf_hash: None,
     }
 }
 
@@ -1015,7 +1016,7 @@ fn test_metadata_hash_present() {
         &String::from_str(&env, "Engineer"),
         &build_milestones(&env),
         &vec![&env, 30u32, 90u32],
-        &EngagementConfig { metadata_hash: Some(cid.clone()), co_recruiter: None, recruiter_split_bps: 10_000 },
+        &EngagementConfig { metadata_hash: Some(cid.clone()), co_recruiter: None, recruiter_split_bps: 10_000, contract_pdf_hash: None },
     );
 
     let result = client.get_metadata_hash(&String::from_str(&env, "ENG-META"));
@@ -1049,7 +1050,7 @@ fn test_metadata_hash_empty_string_rejected() {
         &String::from_str(&env, "Engineer"),
         &build_milestones(&env),
         &vec![&env, 30u32, 90u32],
-        &EngagementConfig { metadata_hash: Some(String::from_str(&env, "")), co_recruiter: None, recruiter_split_bps: 10_000 },
+        &EngagementConfig { metadata_hash: Some(String::from_str(&env, "")), co_recruiter: None, recruiter_split_bps: 10_000, contract_pdf_hash: None },
     );
 }
 
@@ -1068,6 +1069,7 @@ fn test_co_recruiter_60_40_split() {
         metadata_hash: None,
         co_recruiter: Some(co_recruiter.clone()),
         recruiter_split_bps: 6_000,
+        contract_pdf_hash: None,
     };
 
     client.create_engagement(
@@ -1135,6 +1137,7 @@ fn test_split_bps_over_10000_rejected() {
         metadata_hash: None,
         co_recruiter: Some(co_recruiter),
         recruiter_split_bps: 10_001,
+        contract_pdf_hash: None,
     };
 
     client.create_engagement(
@@ -1166,6 +1169,7 @@ fn test_co_recruiter_gets_remainder() {
         metadata_hash: None,
         co_recruiter: Some(co_recruiter.clone()),
         recruiter_split_bps: 3_333,
+        contract_pdf_hash: None,
     };
 
     client.create_engagement(
@@ -1207,6 +1211,7 @@ fn test_co_recruiter_summary_fields() {
         metadata_hash: None,
         co_recruiter: Some(co_recruiter.clone()),
         recruiter_split_bps: 7_000,
+        contract_pdf_hash: None,
     };
 
     client.create_engagement(
@@ -1242,6 +1247,7 @@ fn test_split_bps_10000_accepted() {
         metadata_hash: None,
         co_recruiter: Some(co_recruiter.clone()),
         recruiter_split_bps: 10_000,
+        contract_pdf_hash: None,
     };
 
     client.create_engagement(
@@ -1760,7 +1766,9 @@ fn test_quorum_unanimous_vote_record_cleared_after_reset() {
     let m0 = client.get_milestone(&eng_id, &0);
     assert_eq!(m0.status, MilestoneStatus::Pending);
 
-    // Resubmit proof and raise a second dispute round.
+    // Resubmit proof and raise a second dispute round (advance past the
+    // proof resubmission cooldown first).
+    advance_ledger(&env, 2_880);
     client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://proof2"));
     client.raise_dispute(&company, &eng_id, &0, &String::from_str(&env, "dispute2"));
 
@@ -4636,7 +4644,7 @@ fn test_cap_is_per_company_isolated() {
         &String::from_str(&env, "CTO"),
         &build_milestones(&env),
         &vec![&env, 30u32, 90u32],
-        &None,
+        &default_config(),
     );
 
     assert_eq!(client.get_company_active_count(&company), 1);
@@ -4677,7 +4685,7 @@ fn test_completion_frees_slot() {
         &String::from_str(&env, "Engineer"),
         &single_milestone,
         &vec![&env],
-        &None,
+        &default_config(),
     );
 
     // At cap now — a second create would fail.
@@ -4715,7 +4723,7 @@ fn test_completion_frees_slot() {
             },
         ],
         &vec![&env],
-        &None,
+        &default_config(),
     );
     assert_eq!(client.get_company_active_count(&company), 1);
 }
@@ -4786,7 +4794,7 @@ fn test_admin_decreasing_cap_blocks_new_while_over() {
         &String::from_str(&env, "Engineer"),
         &build_milestones(&env),
         &vec![&env, 30u32, 90u32],
-        &None,
+        &default_config(),
     );
     assert!(result.is_err());
 }
@@ -4798,4 +4806,71 @@ fn test_active_count_default_zero_for_new_company() {
     let client = HireSettleContractClient::new(&env, &contract_id);
     let new_company = Address::generate(&env);
     assert_eq!(client.get_company_active_count(&new_company), 0);
+}
+
+// ============================================================
+// Issue #180 — force_confirm_milestone during an active dispute
+// ============================================================
+
+/// A Disputed milestone must not be force-confirmable — the status guard in
+/// `force_confirm_milestone` requires `ProofSubmitted`, so raising a dispute
+/// (which moves the milestone to `Disputed`) must block force-confirmation
+/// and preserve arbiter dispute resolution.
+#[test]
+#[should_panic(expected = "milestone is not in ProofSubmitted status")]
+fn test_force_confirm_disputed_milestone_rejected() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    client.set_confirm_window(&company, &100u32);
+
+    let eng_id = String::from_str(&env, "ENG-FC-DISPUTED");
+    create_standard_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-FC-DISPUTED",
+    );
+
+    client.submit_proof(
+        &recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://proof"),
+    );
+    client.raise_dispute(&company, &eng_id, &0, &String::from_str(&env, "not good enough"));
+
+    let m0 = client.get_milestone(&eng_id, &0);
+    assert_eq!(m0.status, MilestoneStatus::Disputed);
+
+    // Advance well past the confirm window — force_confirm must still be rejected
+    // because the milestone is Disputed, not ProofSubmitted.
+    advance_ledger(&env, 200);
+    client.force_confirm_milestone(&recruiter, &eng_id, &0);
+}
+
+// ============================================================
+// Issue #179 — pending early-exit request vs. confirm_milestone
+// ============================================================
+
+/// Once `request_early_exit` moves the engagement to `ExitRequested`,
+/// `confirm_milestone` must be blocked (engagement-status guard requires
+/// `Active`) until the company calls `accept_early_exit` / `reject_early_exit`.
+/// This prevents the payout accounting from being changed mid-exit-decision.
+#[test]
+#[should_panic(expected = "engagement is not active")]
+fn test_confirm_milestone_blocked_during_pending_early_exit() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    let eng_id = String::from_str(&env, "ENG-EXIT-CONFIRM");
+    create_standard_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-EXIT-CONFIRM",
+    );
+
+    client.submit_proof(
+        &recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://proof"),
+    );
+
+    client.request_early_exit(&recruiter, &eng_id);
+    let eng = client.get_engagement(&eng_id);
+    assert_eq!(eng.status, EngagementStatus::ExitRequested);
+
+    // Company attempts to confirm the ProofSubmitted milestone before
+    // resolving the exit request — must be rejected.
+    client.confirm_milestone(&company, &eng_id, &0);
 }

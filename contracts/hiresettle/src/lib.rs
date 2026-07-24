@@ -2613,6 +2613,25 @@ impl HireSettleContract {
             .unwrap_or(0u32)
     }
 
+    /// Decrement a company's active engagement count when an engagement leaves
+    /// the `Active` state (completed, cancelled, or otherwise terminated).
+    fn decrement_company_active_count(env: &Env, company: &Address) {
+        let current: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CompanyActiveCount(company.clone()))
+            .unwrap_or(0u32);
+        let new_count = current.saturating_sub(1);
+        env.storage()
+            .persistent()
+            .set(&DataKey::CompanyActiveCount(company.clone()), &new_count);
+        env.storage().persistent().extend_ttl(
+            &DataKey::CompanyActiveCount(company.clone()),
+            100_000,
+            6_300_000,
+        );
+    }
+
     // ----------------------------------------------------------
     // ISSUE #38 — INACTIVITY TIMEOUT
     // ----------------------------------------------------------
