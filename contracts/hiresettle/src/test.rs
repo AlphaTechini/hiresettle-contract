@@ -4220,3 +4220,40 @@ fn test_active_count_default_zero_for_new_company() {
     let new_company = Address::generate(&env);
     assert_eq!(client.get_company_active_count(&new_company), 0);
 }
+
+// ============================================================
+// ISSUE #182 — renounce_admin clears pending nomination
+// ============================================================
+
+/// A pending admin nomination must be cleared when the current admin renounces,
+/// so a stale nominee cannot claim_admin after the role is permanently renounced.
+#[test]
+#[should_panic(expected = "no pending admin nomination")]
+fn test_renounce_admin_clears_pending_nomination() {
+    let (env, contract_id, _token_id, company, recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    client.nominate_admin(&company, &recruiter);
+    assert_eq!(client.get_pending_admin(), Some(recruiter.clone()));
+
+    client.renounce_admin(&company);
+    assert_eq!(client.get_pending_admin(), None);
+
+    // Stale nominee can no longer claim — nomination was cleared.
+    client.claim_admin(&recruiter);
+}
+
+/// After renounce_admin, both the nominee's claim and any admin-gated call fail —
+/// the role is permanently unusable, matching the documented "renounced" intent.
+#[test]
+#[should_panic(expected = "NoAdmin")]
+fn test_renounce_admin_blocks_further_admin_actions() {
+    let (env, contract_id, _token_id, company, recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let treasury = Address::generate(&env);
+
+    client.nominate_admin(&company, &recruiter);
+    client.renounce_admin(&company);
+
+    client.set_platform_fee(&company, &100, &treasury);
+}

@@ -3178,6 +3178,9 @@ impl HireSettleContract {
         env.storage()
             .instance()
             .set(&DataKey::AdminRenounced, &true);
+        // Clear any pending nomination so a stale nominee cannot claim_admin
+        // after the role was supposed to be permanently renounced. See issue #182.
+        env.storage().persistent().remove(&DataKey::PendingAdmin);
         let final_ledger = env.ledger().sequence();
         env.events()
             .publish((Symbol::new(&env, "admin_renounced"),), final_ledger);
