@@ -57,6 +57,7 @@ fn build_milestones(env: &Env) -> Vec<Milestone> {
             proof_hash: String::from_str(env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         },
         Milestone {
             name: String::from_str(env, "30-Day Retention"),
@@ -66,6 +67,7 @@ fn build_milestones(env: &Env) -> Vec<Milestone> {
             proof_hash: String::from_str(env, ""),
             status: MilestoneStatus::Locked,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         },
         Milestone {
             name: String::from_str(env, "90-Day Retention"),
@@ -75,6 +77,7 @@ fn build_milestones(env: &Env) -> Vec<Milestone> {
             proof_hash: String::from_str(env, ""),
             status: MilestoneStatus::Locked,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         },
     ]
 }
@@ -192,6 +195,7 @@ fn test_create_engagement_invalid_percentages() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         },
         Milestone {
             name: String::from_str(&env, "Retention"),
@@ -201,6 +205,7 @@ fn test_create_engagement_invalid_percentages() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Locked,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         },
     ];
 
@@ -552,6 +557,7 @@ fn test_two_milestone_engagement_50_50() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         },
         Milestone {
             name: String::from_str(&env, "30-Day Retention"),
@@ -561,6 +567,7 @@ fn test_two_milestone_engagement_50_50() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Locked,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         },
     ];
 
@@ -2531,6 +2538,7 @@ fn test_batch_confirm_atomic_rejection() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         },
         Milestone {
             name: String::from_str(&env, "Milestone B"),
@@ -2540,6 +2548,7 @@ fn test_batch_confirm_atomic_rejection() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         },
     ];
 
@@ -2584,6 +2593,7 @@ fn test_batch_confirm_emits_event_per_milestone() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         },
         Milestone {
             name: String::from_str(&env, "M2"),
@@ -2593,6 +2603,7 @@ fn test_batch_confirm_emits_event_per_milestone() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         },
     ];
 
@@ -2907,6 +2918,7 @@ fn test_force_confirm_last_milestone_completes_engagement() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         },
     ];
 
@@ -3427,6 +3439,7 @@ fn test_milestone_cap_at_cap() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         });
     }
 
@@ -3473,6 +3486,7 @@ fn test_milestone_cap_over_cap() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         });
     }
 
@@ -3542,6 +3556,7 @@ fn test_milestone_cap_admin_update() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         });
     }
 
@@ -3583,6 +3598,7 @@ fn test_milestone_name_64_char_accepted() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         }
     ];
 
@@ -3620,6 +3636,7 @@ fn test_milestone_name_65_char_rejected() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         }
     ];
 
@@ -3656,6 +3673,7 @@ fn test_milestone_name_empty_rejected() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         }
     ];
 
@@ -3693,6 +3711,7 @@ fn test_milestone_name_multi_milestone_partial_failure() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         },
         Milestone {
             name: name_65,
@@ -3702,6 +3721,7 @@ fn test_milestone_name_multi_milestone_partial_failure() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         }
     ];
 
@@ -3741,6 +3761,7 @@ fn test_milestone_name_uniqueness_happy_path() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         },
         Milestone {
             name: String::from_str(&env, "Second Milestone"),
@@ -3750,6 +3771,7 @@ fn test_milestone_name_uniqueness_happy_path() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         }
     ];
 
@@ -3786,6 +3808,7 @@ fn test_milestone_name_uniqueness_duplicate_detection() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         },
         Milestone {
             name: String::from_str(&env, "Duplicate Milestone"),
@@ -3795,6 +3818,7 @@ fn test_milestone_name_uniqueness_duplicate_detection() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         }
     ];
 
@@ -3830,6 +3854,7 @@ fn test_milestone_name_uniqueness_case_sensitivity() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         },
         Milestone {
             name: String::from_str(&env, "placement"),
@@ -3839,6 +3864,7 @@ fn test_milestone_name_uniqueness_case_sensitivity() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         }
     ];
 
@@ -4084,6 +4110,7 @@ fn test_completion_frees_slot() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         },
     ];
 
@@ -4133,6 +4160,7 @@ fn test_completion_frees_slot() {
                 proof_hash: String::from_str(&env, ""),
                 status: MilestoneStatus::Pending,
                 proof_submitted_at: 0,
+                replacement_paid_out: 0,
             },
         ],
         &vec![&env],
@@ -4283,6 +4311,7 @@ fn test_batch_confirm_rejects_out_of_order_milestones() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         },
         Milestone {
             name: String::from_str(&env, "M2"),
@@ -4292,6 +4321,7 @@ fn test_batch_confirm_rejects_out_of_order_milestones() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         },
     ];
     let eng_id2 = String::from_str(&env, "ENG-BATCH-ORDER-2");
@@ -4330,6 +4360,7 @@ fn test_batch_confirm_in_order_matches_single_confirm_semantics() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         },
         Milestone {
             name: String::from_str(&env, "M2"),
@@ -4339,6 +4370,7 @@ fn test_batch_confirm_in_order_matches_single_confirm_semantics() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         },
     ];
     let eng_id = String::from_str(&env, "ENG-BATCH-ORDER-OK");
@@ -4414,4 +4446,98 @@ fn test_repeated_propose_upgrade_overwrites_pending_hash() {
     // re-propose — the first proposal's window is over, but the second's is not.
     advance_ledger(&env, lock_duration / 2 + 1);
     client.execute_upgrade();
+}
+
+// ============================================================
+// ISSUE #183 — top_up_escrow after replacement requested
+// ============================================================
+
+/// Topping up escrow while ReplacementRequested must be reflected consistently
+/// in the balance, and a subsequent completion pays out against the topped-up total.
+#[test]
+fn test_top_up_during_replacement_then_complete() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_id);
+
+    let eng_id = String::from_str(&env, "ENG-TOPUP-REPL-COMPLETE");
+    create_standard_engagement(&env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-TOPUP-REPL-COMPLETE");
+
+    client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://offer"));
+    client.confirm_milestone(&company, &eng_id, &0);
+
+    client.request_replacement(&company, &eng_id, &String::from_str(&env, "candidate_resigned"));
+    let eng = client.get_engagement(&eng_id);
+    assert_eq!(eng.status, EngagementStatus::ReplacementRequested);
+
+    let balance_before_topup = client.get_escrow_balance(&eng_id);
+
+    client.top_up_escrow(&company, &eng_id, &100_000_000);
+
+    let eng = client.get_engagement(&eng_id);
+    assert_eq!(eng.total_amount, 1_000_000_000 + 100_000_000);
+    assert_eq!(
+        client.get_escrow_balance(&eng_id),
+        balance_before_topup + 100_000_000
+    );
+
+    // Resubmitting placement proof brings the engagement back to Active.
+    client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://replacement-offer"));
+    client.confirm_milestone(&company, &eng_id, &0);
+
+    let m1 = client.get_milestone(&eng_id, &1);
+    assert_eq!(m1.status, MilestoneStatus::Locked);
+    advance_ledger(&env, m1.valid_after_ledger.saturating_sub(env.ledger().sequence()) + 1);
+    client.unlock_milestone(&eng_id, &1);
+    client.submit_proof(&recruiter, &eng_id, &1, &String::from_str(&env, "ipfs://retention-30"));
+    client.confirm_milestone(&company, &eng_id, &1);
+
+    let m2 = client.get_milestone(&eng_id, &2);
+    advance_ledger(&env, m2.valid_after_ledger.saturating_sub(env.ledger().sequence()) + 1);
+    client.unlock_milestone(&eng_id, &2);
+    client.submit_proof(&recruiter, &eng_id, &2, &String::from_str(&env, "ipfs://retention-90"));
+    client.confirm_milestone(&company, &eng_id, &2);
+
+    let eng = client.get_engagement(&eng_id);
+    assert_eq!(eng.status, EngagementStatus::Completed);
+    assert_eq!(eng.released_amount, eng.total_amount);
+    assert_eq!(client.get_escrow_balance(&eng_id), 0);
+    let (fee_bps, _treasury) = client.get_platform_fee();
+    let fee_amount = (eng.total_amount * fee_bps as i128) / 10_000;
+    assert_eq!(token_client.balance(&recruiter), eng.total_amount - fee_amount);
+}
+
+/// Topping up escrow while ReplacementRequested, then cancelling, must refund
+/// the full topped-up balance (total_amount - released_amount) to the company.
+#[test]
+fn test_top_up_during_replacement_then_cancel_refunds_full_balance() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_id);
+
+    let eng_id = String::from_str(&env, "ENG-TOPUP-REPL-CANCEL");
+    create_standard_engagement(&env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-TOPUP-REPL-CANCEL");
+
+    client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://offer"));
+    client.confirm_milestone(&company, &eng_id, &0);
+    // released_amount is now 300_000_000 (30% of 1_000_000_000).
+
+    client.request_replacement(&company, &eng_id, &String::from_str(&env, "candidate_resigned"));
+    client.top_up_escrow(&company, &eng_id, &250_000_000);
+
+    let eng = client.get_engagement(&eng_id);
+    assert_eq!(eng.total_amount, 1_250_000_000);
+    let expected_refund = eng.total_amount - eng.released_amount;
+
+    let company_balance_before_cancel = token_client.balance(&company);
+
+    client.cancel_engagement(&company, &recruiter, &eng_id);
+
+    let eng = client.get_engagement(&eng_id);
+    assert_eq!(eng.status, EngagementStatus::Cancelled);
+    assert_eq!(
+        token_client.balance(&company),
+        company_balance_before_cancel + expected_refund
+    );
+    assert_eq!(expected_refund, 950_000_000);
 }
