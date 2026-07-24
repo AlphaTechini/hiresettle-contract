@@ -57,6 +57,7 @@ fn build_milestones(env: &Env) -> Vec<Milestone> {
             proof_hash: String::from_str(env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         },
         Milestone {
             name: String::from_str(env, "30-Day Retention"),
@@ -66,6 +67,7 @@ fn build_milestones(env: &Env) -> Vec<Milestone> {
             proof_hash: String::from_str(env, ""),
             status: MilestoneStatus::Locked,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         },
         Milestone {
             name: String::from_str(env, "90-Day Retention"),
@@ -75,6 +77,7 @@ fn build_milestones(env: &Env) -> Vec<Milestone> {
             proof_hash: String::from_str(env, ""),
             status: MilestoneStatus::Locked,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         },
     ]
 }
@@ -192,6 +195,7 @@ fn test_create_engagement_invalid_percentages() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         },
         Milestone {
             name: String::from_str(&env, "Retention"),
@@ -201,6 +205,7 @@ fn test_create_engagement_invalid_percentages() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Locked,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         },
     ];
 
@@ -552,6 +557,7 @@ fn test_two_milestone_engagement_50_50() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         },
         Milestone {
             name: String::from_str(&env, "30-Day Retention"),
@@ -561,6 +567,7 @@ fn test_two_milestone_engagement_50_50() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Locked,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         },
     ];
 
@@ -3074,6 +3081,7 @@ fn test_batch_confirm_atomic_rejection() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         },
         Milestone {
             name: String::from_str(&env, "Milestone B"),
@@ -3083,6 +3091,7 @@ fn test_batch_confirm_atomic_rejection() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         },
     ];
 
@@ -3127,6 +3136,7 @@ fn test_batch_confirm_emits_event_per_milestone() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         },
         Milestone {
             name: String::from_str(&env, "M2"),
@@ -3136,6 +3146,7 @@ fn test_batch_confirm_emits_event_per_milestone() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         },
     ];
 
@@ -3450,6 +3461,7 @@ fn test_force_confirm_last_milestone_completes_engagement() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         },
     ];
 
@@ -3970,6 +3982,7 @@ fn test_milestone_cap_at_cap() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         });
     }
 
@@ -4016,6 +4029,7 @@ fn test_milestone_cap_over_cap() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         });
     }
 
@@ -4085,6 +4099,7 @@ fn test_milestone_cap_admin_update() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         });
     }
 
@@ -4126,6 +4141,7 @@ fn test_milestone_name_64_char_accepted() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         }
     ];
 
@@ -4163,6 +4179,7 @@ fn test_milestone_name_65_char_rejected() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         }
     ];
 
@@ -4199,6 +4216,7 @@ fn test_milestone_name_empty_rejected() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         }
     ];
 
@@ -4236,6 +4254,7 @@ fn test_milestone_name_multi_milestone_partial_failure() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         },
         Milestone {
             name: name_65,
@@ -4245,6 +4264,7 @@ fn test_milestone_name_multi_milestone_partial_failure() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         }
     ];
 
@@ -4284,6 +4304,7 @@ fn test_milestone_name_uniqueness_happy_path() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         },
         Milestone {
             name: String::from_str(&env, "Second Milestone"),
@@ -4293,6 +4314,7 @@ fn test_milestone_name_uniqueness_happy_path() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         }
     ];
 
@@ -4329,6 +4351,7 @@ fn test_milestone_name_uniqueness_duplicate_detection() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         },
         Milestone {
             name: String::from_str(&env, "Duplicate Milestone"),
@@ -4338,6 +4361,7 @@ fn test_milestone_name_uniqueness_duplicate_detection() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         }
     ];
 
@@ -4373,6 +4397,7 @@ fn test_milestone_name_uniqueness_case_sensitivity() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         },
         Milestone {
             name: String::from_str(&env, "placement"),
@@ -4382,6 +4407,7 @@ fn test_milestone_name_uniqueness_case_sensitivity() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         }
     ];
 
@@ -4600,7 +4626,7 @@ fn test_cap_is_per_company_isolated() {
         &String::from_str(&env, "CTO"),
         &build_milestones(&env),
         &vec![&env, 30u32, 90u32],
-        &None,
+        &default_config(),
     );
 
     assert_eq!(client.get_company_active_count(&company), 1);
@@ -4627,6 +4653,7 @@ fn test_completion_frees_slot() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         },
     ];
 
@@ -4641,7 +4668,7 @@ fn test_completion_frees_slot() {
         &String::from_str(&env, "Engineer"),
         &single_milestone,
         &vec![&env],
-        &None,
+        &default_config(),
     );
 
     // At cap now — a second create would fail.
@@ -4676,10 +4703,11 @@ fn test_completion_frees_slot() {
                 proof_hash: String::from_str(&env, ""),
                 status: MilestoneStatus::Pending,
                 proof_submitted_at: 0,
+                replacement_paid_out: 0,
             },
         ],
         &vec![&env],
-        &None,
+        &default_config(),
     );
     assert_eq!(client.get_company_active_count(&company), 1);
 }
@@ -4750,7 +4778,7 @@ fn test_admin_decreasing_cap_blocks_new_while_over() {
         &String::from_str(&env, "Engineer"),
         &build_milestones(&env),
         &vec![&env, 30u32, 90u32],
-        &None,
+        &default_config(),
     );
     assert!(result.is_err());
 }

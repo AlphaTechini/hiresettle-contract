@@ -65,6 +65,14 @@ pub struct Milestone {
     pub status: MilestoneStatus,
     /// Ledger at which the most recent proof was submitted; 0 if never submitted.
     pub proof_submitted_at: u32,
+    /// Set by `request_replacement` to the gross amount already released for this
+    /// (Placement) milestone when it is reset to `Pending` for a replacement
+    /// candidate; `0` if never paid out. On re-confirmation, only the difference
+    /// between the milestone's current share (which may have grown via
+    /// `top_up_escrow`) and this already-paid amount is released, so escrow
+    /// added after a replacement is still paid out instead of getting stuck in
+    /// the contract. See issue #183.
+    pub replacement_paid_out: i128,
 }
 
 /// Top-level lifecycle state of an engagement.
@@ -1156,29 +1164,36 @@ impl HireSettleContract {
             }
         }
 
-        // Calculate and release payment, deducting the configured platform fee.
-        let payment = (engagement.total_amount * milestone.payment_percent as i128) / 100;
-        let platform_fee = Self::get_platform_fee_internal(&env);
-        let fee_amount = (payment * platform_fee.bps as i128) / 10_000;
-        let net_payment = payment - fee_amount;
-        engagement.released_amount += payment;
+        // Issue #183: if this milestone was already paid out before a replacement
+        // reset it to Pending, only release the difference between its current
+        // share (which may have grown via top_up_escrow) and what was already
+        // paid — this ensures escrow added after a replacement still reaches
+        // the recruiter instead of getting stuck in the contract.
+        let full_share = (engagement.total_amount * milestone.payment_percent as i128) / 100;
+        let payment = full_share - milestone.replacement_paid_out;
+        if payment > 0 {
+            let platform_fee = Self::get_platform_fee_internal(&env);
+            let fee_amount = (payment * platform_fee.bps as i128) / 10_000;
+            let net_payment = payment - fee_amount;
+            engagement.released_amount += payment;
 
-        let token_client = token::Client::new(&env, &engagement.token);
-        if fee_amount > 0 {
-            token_client.transfer(
-                &env.current_contract_address(),
-                &platform_fee.treasury,
-                &fee_amount,
-            );
-            env.events().publish(
-                (
-                    Symbol::new(&env, "platform_fee_collected"),
-                    engagement_id.clone(),
-                ),
-                (milestone_index, fee_amount, platform_fee.treasury),
-            );
+            let token_client = token::Client::new(&env, &engagement.token);
+            if fee_amount > 0 {
+                token_client.transfer(
+                    &env.current_contract_address(),
+                    &platform_fee.treasury,
+                    &fee_amount,
+                );
+                env.events().publish(
+                    (
+                        Symbol::new(&env, "platform_fee_collected"),
+                        engagement_id.clone(),
+                    ),
+                    (milestone_index, fee_amount, platform_fee.treasury),
+                );
+            }
+            Self::distribute_recruiter_payout(&env, &engagement, net_payment, &token_client);
         }
-        Self::distribute_recruiter_payout(&env, &engagement, net_payment, &token_client);
 
         let old_status = milestone.status.clone();
         milestone.status = MilestoneStatus::Confirmed;
@@ -2765,6 +2780,18 @@ impl HireSettleContract {
             .unwrap_or(0u32)
     }
 
+    fn decrement_company_active_count(env: &Env, company: &Address) {
+        let current: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CompanyActiveCount(company.clone()))
+            .unwrap_or(0u32);
+        let new_count = current.saturating_sub(1);
+        env.storage()
+            .persistent()
+            .set(&DataKey::CompanyActiveCount(company.clone()), &new_count);
+    }
+
     // ----------------------------------------------------------
     // ISSUE #38 — INACTIVITY TIMEOUT
     // ----------------------------------------------------------
@@ -2991,6 +3018,19 @@ impl HireSettleContract {
             if m.kind == MilestoneKind::Retention && env.ledger().sequence() < m.valid_after_ledger
             {
                 panic!("retention window has not elapsed — cannot confirm yet");
+            }
+            // Issue #67/#184: enforce the same sequential-confirmation rule as
+            // confirm_milestone — every prior milestone must already be done,
+            // either from an earlier call or earlier in this same batch.
+            for j in 0..idx {
+                let prev = engagement.milestones.get(j).unwrap();
+                let done_already = prev.status == MilestoneStatus::Confirmed
+                    || prev.status == MilestoneStatus::Resolved;
+                let done_in_batch = (0..milestone_indices.len())
+                    .any(|k| milestone_indices.get(k).unwrap() == j);
+                if !done_already && !done_in_batch {
+                    panic!("PreviousMilestoneNotComplete");
+                }
             }
         }
 
@@ -3293,6 +3333,17 @@ impl HireSettleContract {
     /// The pending upgrade is stored and becomes executable after `lock_duration` ledgers.
     /// Default time-lock is 17,280 ledgers (~1 day); use `set_upgrade_lock_duration` to change it.
     /// Emits `upgrade_proposed` with `(new_wasm_hash, execute_after_ledger)`.
+    ///
+    /// # Repeated calls (issue #185)
+    /// Calling `propose_upgrade` again while a previous proposal is still pending
+    /// **overwrites** it and **resets the timelock countdown** — the new
+    /// `execute_after_ledger` is computed from the current ledger, not the
+    /// original proposal's. This is intentional: it lets the admin correct or
+    /// retract a bad proposal (e.g. wrong wasm hash) without waiting out the
+    /// original lock. The tradeoff is that a compromised admin key can grief
+    /// legitimate upgrades by indefinitely re-proposing, or delay execution by
+    /// repeatedly re-proposing the same hash — this is accepted as inherent to
+    /// admin-key trust and is not separately mitigated here.
     pub fn propose_upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) {
         Self::assert_admin(&env, &admin);
 
@@ -3459,6 +3510,9 @@ impl HireSettleContract {
         env.storage()
             .instance()
             .set(&DataKey::AdminRenounced, &true);
+        // Clear any pending nomination so a stale nominee cannot claim_admin
+        // after the role was supposed to be permanently renounced. See issue #182.
+        env.storage().persistent().remove(&DataKey::PendingAdmin);
         let final_ledger = env.ledger().sequence();
         env.events()
             .publish((Symbol::new(&env, "admin_renounced"),), final_ledger);
