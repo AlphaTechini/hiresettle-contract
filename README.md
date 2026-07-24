@@ -243,6 +243,52 @@ Contract storage key space enumerating all persistent and instance-stored values
 
 ### Arbiter Succession
 `nominate_arbiter_successor`, `claim_arbiter`
+### Arbiter Voting & Succession
+
+#### Arbiter Voting
+
+HireSettle uses a **multi-arbiter M-of-N voting model** to resolve disputes. When a company raises a dispute on a milestone, each assigned arbiter may cast a single vote using `cast_arbiter_vote()`.
+
+Votes are tracked until one of the following conditions is met:
+
+- **Approval quorum reached** (`approve_votes >= quorum`)
+  - The dispute is resolved in favour of the recruiter.
+  - The milestone payment is released from escrow.
+- **Rejection quorum reached** (`reject_votes > arbiters.len() - quorum`)
+  - The submitted proof is rejected.
+  - The milestone returns to the `Pending` state, allowing the recruiter to submit new proof.
+
+Each arbiter may vote only once for a dispute. Duplicate votes are rejected by the contract.
+
+#### Viewing Vote Progress
+
+Applications can retrieve the current dispute vote tally using:
+
+```text
+get_arbiter_votes()
+```
+
+This read-only function returns the current approval and rejection vote counts without exposing the voter list, allowing dashboards to display dispute progress while preserving voter privacy.
+
+#### Arbiter Succession
+
+To support long-running engagements, HireSettle allows arbiters to transfer their responsibilities to a successor without modifying the engagement itself.
+
+The succession process consists of two steps:
+
+1. The current arbiter nominates a successor using:
+
+```text
+nominate_arbiter_successor()
+```
+
+2. The nominated address accepts the role by calling:
+
+```text
+claim_arbiter()
+```
+
+Only the nominated address can complete the claim. Once claimed, the successor assumes the arbiter's position for future dispute voting while preserving the integrity of the arbitration panel.
 
 ### Read-Only Queries
 `get_engagement`, `get_engagement_summary`, `get_milestone`, `get_escrow_balance`, `get_total_released`, `get_metadata_hash`, `get_contract_pdf_hash`, `get_version`, `get_min_amount`, `get_platform_fee`, `get_pending_admin`, `get_amendment_ttl`, `get_amendment_log`, `get_pending_amendment`, `get_arbiter_votes`, `get_dispute_reason`, `get_replacement_reason`, `get_replacement_count`, `get_engagement_count`, `get_company_engagement_count`, `get_engagements_by_company`, `is_milestone_unlockable`, `ledgers_until_unlock`, `get_estimated_unlock_seconds`, `get_active_dispute_count`, `get_is_engagement_complete`, `get_unlock_progress`, `is_paused`, `get_ledgers_per_day`, `get_max_retention_days`, `get_max_milestones`, `get_inactivity_timeout_ledgers`, `get_storage_ttl_extend_to`, `get_confirm_window`, `get_dispute_window`, `get_max_proof_hash_length`, `get_arbiter_fee`, `get_upgrade_lock_duration`, `get_allowed_tokens`
