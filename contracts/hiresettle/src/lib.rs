@@ -2429,11 +2429,17 @@ impl HireSettleContract {
             .unwrap_or_else(|| Vec::new(&env));
 
         let total = ids.len();
-        let start = page * page_size;
-        if start >= total || page_size == 0 {
+        if page_size == 0 {
             return Vec::new(&env);
         }
-        let end = (start + page_size).min(total);
+        // Use saturating arithmetic so a huge `page` / `page_size` combination
+        // clamps to an out-of-range start (caught below) instead of wrapping
+        // around via u32 overflow.
+        let start = page.saturating_mul(page_size);
+        if start >= total {
+            return Vec::new(&env);
+        }
+        let end = start.saturating_add(page_size).min(total);
         let mut result = Vec::new(&env);
         for i in start..end {
             result.push_back(ids.get(i).unwrap());
