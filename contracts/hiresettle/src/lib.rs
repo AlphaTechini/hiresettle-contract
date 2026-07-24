@@ -251,7 +251,11 @@ pub struct ArbiterSetup {
 #[contracttype]
 #[derive(Clone)]
 pub struct ArbiterVoteCounts {
+    /// Number of arbiters who voted to approve (release) the milestone payment.
+    /// Incremented in `cast_arbiter_vote` when `approve` is `true`.
     pub approve_votes: u32,
+    /// Number of arbiters who voted to reject (withhold) the milestone payment.
+    /// Incremented in `cast_arbiter_vote` when `approve` is `false`.
     pub reject_votes: u32,
 }
 
