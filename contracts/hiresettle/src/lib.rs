@@ -2762,6 +2762,19 @@ impl HireSettleContract {
             {
                 panic!("retention window has not elapsed — cannot confirm yet");
             }
+            // Issue #67/#184: enforce the same sequential-confirmation rule as
+            // confirm_milestone — every prior milestone must already be done,
+            // either from an earlier call or earlier in this same batch.
+            for j in 0..idx {
+                let prev = engagement.milestones.get(j).unwrap();
+                let done_already = prev.status == MilestoneStatus::Confirmed
+                    || prev.status == MilestoneStatus::Resolved;
+                let done_in_batch = (0..milestone_indices.len())
+                    .any(|k| milestone_indices.get(k).unwrap() == j);
+                if !done_already && !done_in_batch {
+                    panic!("PreviousMilestoneNotComplete");
+                }
+            }
         }
 
         let platform_fee = Self::get_platform_fee_internal(&env);

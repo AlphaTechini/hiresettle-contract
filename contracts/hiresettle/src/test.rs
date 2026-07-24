@@ -4257,3 +4257,105 @@ fn test_renounce_admin_blocks_further_admin_actions() {
 
     client.set_platform_fee(&company, &100, &treasury);
 }
+
+// ============================================================
+// ISSUE #184 — batch_confirm_milestones sequential-order semantics
+// ============================================================
+
+/// batch_confirm_milestones must reject an out-of-order batch the same way
+/// confirm_milestone rejects an out-of-order single confirm.
+#[test]
+#[should_panic(expected = "PreviousMilestoneNotComplete")]
+fn test_batch_confirm_rejects_out_of_order_milestones() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    // A Locked Retention milestone cannot receive proof before its predecessor
+    // is confirmed, so the ordering gap is only reachable with two Placement
+    // milestones (same kind, no built-in unlock ordering between them).
+    let milestones = vec![
+        &env,
+        Milestone {
+            name: String::from_str(&env, "M1"),
+            payment_percent: 50,
+            kind: MilestoneKind::Placement,
+            valid_after_ledger: 0,
+            proof_hash: String::from_str(&env, ""),
+            status: MilestoneStatus::Pending,
+            proof_submitted_at: 0,
+        },
+        Milestone {
+            name: String::from_str(&env, "M2"),
+            payment_percent: 50,
+            kind: MilestoneKind::Placement,
+            valid_after_ledger: 0,
+            proof_hash: String::from_str(&env, ""),
+            status: MilestoneStatus::Pending,
+            proof_submitted_at: 0,
+        },
+    ];
+    let eng_id2 = String::from_str(&env, "ENG-BATCH-ORDER-2");
+    client.create_engagement(
+        &eng_id2, &company, &recruiter,
+        &ArbiterSetup { arbiters: vec![&env, arbiter.clone()], quorum: 1 },
+        &token_id, &1_000_000_000,
+        &String::from_str(&env, "Job"), &milestones,
+        &vec![&env], &default_config(),
+    );
+
+    // Only submit proof for index 1, skipping index 0 entirely — both are Placement
+    // so submit_proof does not itself enforce ordering.
+    client.submit_proof(&recruiter, &eng_id2, &1, &String::from_str(&env, "ipfs://b"));
+
+    // Batch-confirming just [1] must be rejected: milestone 0 is still Pending.
+    client.batch_confirm_milestones(&company, &eng_id2, &vec![&env, 1u32]);
+}
+
+/// A batch that confirms milestones in ascending order, including all prerequisites
+/// within the same call, succeeds — matching confirm_milestone's semantics when
+/// called index-by-index.
+#[test]
+fn test_batch_confirm_in_order_matches_single_confirm_semantics() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_id);
+
+    let milestones = vec![
+        &env,
+        Milestone {
+            name: String::from_str(&env, "M1"),
+            payment_percent: 50,
+            kind: MilestoneKind::Placement,
+            valid_after_ledger: 0,
+            proof_hash: String::from_str(&env, ""),
+            status: MilestoneStatus::Pending,
+            proof_submitted_at: 0,
+        },
+        Milestone {
+            name: String::from_str(&env, "M2"),
+            payment_percent: 50,
+            kind: MilestoneKind::Placement,
+            valid_after_ledger: 0,
+            proof_hash: String::from_str(&env, ""),
+            status: MilestoneStatus::Pending,
+            proof_submitted_at: 0,
+        },
+    ];
+    let eng_id = String::from_str(&env, "ENG-BATCH-ORDER-OK");
+    client.create_engagement(
+        &eng_id, &company, &recruiter,
+        &ArbiterSetup { arbiters: vec![&env, arbiter.clone()], quorum: 1 },
+        &token_id, &1_000_000_000,
+        &String::from_str(&env, "Job"), &milestones,
+        &vec![&env], &default_config(),
+    );
+
+    client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://a"));
+    client.submit_proof(&recruiter, &eng_id, &1, &String::from_str(&env, "ipfs://b"));
+
+    client.batch_confirm_milestones(&company, &eng_id, &vec![&env, 0u32, 1u32]);
+
+    let eng = client.get_engagement(&eng_id);
+    assert_eq!(eng.status, EngagementStatus::Completed);
+    assert_eq!(token_client.balance(&recruiter), 1_000_000_000);
+}
