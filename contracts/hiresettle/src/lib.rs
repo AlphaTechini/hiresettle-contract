@@ -402,6 +402,25 @@ impl HireSettleContract {
     // INIT
     // ----------------------------------------------------------
 
+    /// Initializes the HireSettle contract.
+    ///
+    /// # Caller
+    /// Called by the contract deployer or initial administrator (`admin`). Requires authentication from `admin`.
+    ///
+    /// # Initialized State
+    /// Sets up default contract storage values:
+    /// - `DataKey::Admin`: Set to `admin`
+    /// - `DataKey::Paused`: Set to `false`
+    /// - `DataKey::PlatformFee`: Set to 0 bps with treasury `admin`
+    /// - `DataKey::Version`: Set to `DEFAULT_VERSION` ("0.2.0")
+    /// - `DataKey::MinEngagementAmount`: Set to `DEFAULT_MIN_ENGAGEMENT_AMOUNT` (100,000 stroops)
+    ///
+    /// # One-Time-Only / Calling Twice
+    /// Note: No already-initialized guard is currently present. If invoked again, it will overwrite
+    /// all initialized storage fields provided `admin.require_auth()` succeeds.
+    ///
+    /// # Panics
+    /// Panics if authentication from `admin` (`admin.require_auth()`) fails.
     pub fn init(env: Env, admin: Address) {
         admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &admin);
