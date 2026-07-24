@@ -1397,6 +1397,298 @@ fn test_single_arbiter_backward_compat() {
     assert_eq!(m0.status, MilestoneStatus::Resolved);
 }
 
+#[test]
+fn test_quorum_unanimous_requires_all_approvals() {
+    // quorum == arbiters.len(): every arbiter must approve before release.
+    let (env, contract_id, token_id, company, recruiter, _) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_id);
+
+    let a1 = Address::generate(&env);
+    let a2 = Address::generate(&env);
+    let a3 = Address::generate(&env);
+
+    let eng_id = String::from_str(&env, "ENG-Q33A");
+    client.create_engagement(
+        &eng_id,
+        &company,
+        &recruiter,
+        &ArbiterSetup { arbiters: vec![&env, a1.clone(), a2.clone(), a3.clone()], quorum: 3 },
+        &token_id,
+        &1_000_000_000,
+        &String::from_str(&env, "Engineer"),
+        &build_milestones(&env),
+        &vec![&env, 30u32, 90u32],
+        &default_config(),
+    );
+
+    client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://proof"));
+    client.raise_dispute(&company, &eng_id, &0, &String::from_str(&env, "dispute"));
+
+    // 1st approve — not yet at quorum of 3
+    client.cast_arbiter_vote(&a1, &eng_id, &0, &true);
+    let m0 = client.get_milestone(&eng_id, &0);
+    assert_eq!(m0.status, MilestoneStatus::Disputed);
+    assert_eq!(token_client.balance(&recruiter), 0);
+
+    // 2nd approve — still short of unanimous quorum
+    client.cast_arbiter_vote(&a2, &eng_id, &0, &true);
+    let m0 = client.get_milestone(&eng_id, &0);
+    assert_eq!(m0.status, MilestoneStatus::Disputed);
+    assert_eq!(token_client.balance(&recruiter), 0);
+
+    // 3rd approve — unanimous quorum reached, payment released
+    client.cast_arbiter_vote(&a3, &eng_id, &0, &true);
+    let m0 = client.get_milestone(&eng_id, &0);
+    assert_eq!(m0.status, MilestoneStatus::Resolved);
+    assert_eq!(token_client.balance(&recruiter), 300_000_000);
+}
+
+#[test]
+fn test_quorum_unanimous_single_reject_resets_milestone() {
+    // quorum == arbiters.len(): total_arbiters - quorum == 0, so a single
+    // reject vote already exceeds the threshold and resets the milestone.
+    let (env, contract_id, token_id, company, recruiter, _) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_id);
+
+    let a1 = Address::generate(&env);
+    let a2 = Address::generate(&env);
+    let a3 = Address::generate(&env);
+
+    let eng_id = String::from_str(&env, "ENG-Q33R");
+    client.create_engagement(
+        &eng_id,
+        &company,
+        &recruiter,
+        &ArbiterSetup { arbiters: vec![&env, a1.clone(), a2.clone(), a3.clone()], quorum: 3 },
+        &token_id,
+        &1_000_000_000,
+        &String::from_str(&env, "Engineer"),
+        &build_milestones(&env),
+        &vec![&env, 30u32, 90u32],
+        &default_config(),
+    );
+
+    client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://proof"));
+    client.raise_dispute(&company, &eng_id, &0, &String::from_str(&env, "dispute"));
+
+    // A single reject already exceeds total_arbiters - quorum (3 - 3 = 0).
+    client.cast_arbiter_vote(&a1, &eng_id, &0, &false);
+    let m0 = client.get_milestone(&eng_id, &0);
+    assert_eq!(m0.status, MilestoneStatus::Pending);
+    assert_eq!(m0.proof_hash, String::from_str(&env, ""));
+    assert_eq!(token_client.balance(&recruiter), 0);
+}
+
+#[test]
+fn test_quorum_unanimous_2_of_2_approve() {
+    // Smallest multi-arbiter unanimous case: quorum == arbiters.len() == 2.
+    let (env, contract_id, token_id, company, recruiter, _) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_id);
+
+    let a1 = Address::generate(&env);
+    let a2 = Address::generate(&env);
+
+    let eng_id = String::from_str(&env, "ENG-Q22A");
+    client.create_engagement(
+        &eng_id,
+        &company,
+        &recruiter,
+        &ArbiterSetup { arbiters: vec![&env, a1.clone(), a2.clone()], quorum: 2 },
+        &token_id,
+        &1_000_000_000,
+        &String::from_str(&env, "Engineer"),
+        &build_milestones(&env),
+        &vec![&env, 30u32, 90u32],
+        &default_config(),
+    );
+
+    client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://proof"));
+    client.raise_dispute(&company, &eng_id, &0, &String::from_str(&env, "dispute"));
+
+    client.cast_arbiter_vote(&a1, &eng_id, &0, &true);
+    let m0 = client.get_milestone(&eng_id, &0);
+    assert_eq!(m0.status, MilestoneStatus::Disputed);
+
+    client.cast_arbiter_vote(&a2, &eng_id, &0, &true);
+    let m0 = client.get_milestone(&eng_id, &0);
+    assert_eq!(m0.status, MilestoneStatus::Resolved);
+    assert_eq!(token_client.balance(&recruiter), 300_000_000);
+}
+
+#[test]
+fn test_quorum_unanimous_4_of_4_approve() {
+    // Generalizes the unanimous case beyond 3 arbiters.
+    let (env, contract_id, token_id, company, recruiter, _) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_id);
+
+    let a1 = Address::generate(&env);
+    let a2 = Address::generate(&env);
+    let a3 = Address::generate(&env);
+    let a4 = Address::generate(&env);
+
+    let eng_id = String::from_str(&env, "ENG-Q44A");
+    client.create_engagement(
+        &eng_id,
+        &company,
+        &recruiter,
+        &ArbiterSetup {
+            arbiters: vec![&env, a1.clone(), a2.clone(), a3.clone(), a4.clone()],
+            quorum: 4,
+        },
+        &token_id,
+        &1_000_000_000,
+        &String::from_str(&env, "Engineer"),
+        &build_milestones(&env),
+        &vec![&env, 30u32, 90u32],
+        &default_config(),
+    );
+
+    client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://proof"));
+    client.raise_dispute(&company, &eng_id, &0, &String::from_str(&env, "dispute"));
+
+    client.cast_arbiter_vote(&a1, &eng_id, &0, &true);
+    client.cast_arbiter_vote(&a2, &eng_id, &0, &true);
+    client.cast_arbiter_vote(&a3, &eng_id, &0, &true);
+    let m0 = client.get_milestone(&eng_id, &0);
+    assert_eq!(m0.status, MilestoneStatus::Disputed);
+    assert_eq!(token_client.balance(&recruiter), 0);
+
+    client.cast_arbiter_vote(&a4, &eng_id, &0, &true);
+    let m0 = client.get_milestone(&eng_id, &0);
+    assert_eq!(m0.status, MilestoneStatus::Resolved);
+    assert_eq!(token_client.balance(&recruiter), 300_000_000);
+}
+
+#[test]
+fn test_quorum_unanimous_mixed_votes_reject_wins() {
+    // Even with approvals already in, quorum == arbiters.len() means any
+    // single reject vote exceeds the (total_arbiters - quorum == 0)
+    // threshold and immediately resets the milestone.
+    let (env, contract_id, token_id, company, recruiter, _) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_id);
+
+    let a1 = Address::generate(&env);
+    let a2 = Address::generate(&env);
+    let a3 = Address::generate(&env);
+
+    let eng_id = String::from_str(&env, "ENG-Q33MIX");
+    client.create_engagement(
+        &eng_id,
+        &company,
+        &recruiter,
+        &ArbiterSetup { arbiters: vec![&env, a1.clone(), a2.clone(), a3.clone()], quorum: 3 },
+        &token_id,
+        &1_000_000_000,
+        &String::from_str(&env, "Engineer"),
+        &build_milestones(&env),
+        &vec![&env, 30u32, 90u32],
+        &default_config(),
+    );
+
+    client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://proof"));
+    client.raise_dispute(&company, &eng_id, &0, &String::from_str(&env, "dispute"));
+
+    client.cast_arbiter_vote(&a1, &eng_id, &0, &true);
+    client.cast_arbiter_vote(&a2, &eng_id, &0, &true);
+    let m0 = client.get_milestone(&eng_id, &0);
+    assert_eq!(m0.status, MilestoneStatus::Disputed);
+
+    // Last arbiter rejects — resets despite 2 prior approvals.
+    client.cast_arbiter_vote(&a3, &eng_id, &0, &false);
+    let m0 = client.get_milestone(&eng_id, &0);
+    assert_eq!(m0.status, MilestoneStatus::Pending);
+    assert_eq!(token_client.balance(&recruiter), 0);
+}
+
+#[test]
+#[should_panic(expected = "unauthorized")]
+fn test_quorum_unanimous_non_arbiter_cannot_vote() {
+    let (env, contract_id, token_id, company, recruiter, _) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    let a1 = Address::generate(&env);
+    let a2 = Address::generate(&env);
+    let a3 = Address::generate(&env);
+    let outsider = Address::generate(&env);
+
+    let eng_id = String::from_str(&env, "ENG-Q33OUT");
+    client.create_engagement(
+        &eng_id,
+        &company,
+        &recruiter,
+        &ArbiterSetup { arbiters: vec![&env, a1.clone(), a2.clone(), a3.clone()], quorum: 3 },
+        &token_id,
+        &1_000_000_000,
+        &String::from_str(&env, "Engineer"),
+        &build_milestones(&env),
+        &vec![&env, 30u32, 90u32],
+        &default_config(),
+    );
+
+    client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://proof"));
+    client.raise_dispute(&company, &eng_id, &0, &String::from_str(&env, "dispute"));
+
+    // Not one of the three arbiters — must panic.
+    client.cast_arbiter_vote(&outsider, &eng_id, &0, &true);
+}
+
+#[test]
+fn test_quorum_unanimous_vote_record_cleared_after_reset() {
+    // After a reject resets the milestone, the vote record must be cleared
+    // so a later dispute round starts fresh (no stale duplicate-vote panics
+    // and no carry-over vote counts).
+    let (env, contract_id, token_id, company, recruiter, _) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_id);
+
+    let a1 = Address::generate(&env);
+    let a2 = Address::generate(&env);
+    let a3 = Address::generate(&env);
+
+    let eng_id = String::from_str(&env, "ENG-Q33RESET");
+    client.create_engagement(
+        &eng_id,
+        &company,
+        &recruiter,
+        &ArbiterSetup { arbiters: vec![&env, a1.clone(), a2.clone(), a3.clone()], quorum: 3 },
+        &token_id,
+        &1_000_000_000,
+        &String::from_str(&env, "Engineer"),
+        &build_milestones(&env),
+        &vec![&env, 30u32, 90u32],
+        &default_config(),
+    );
+
+    client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://proof"));
+    client.raise_dispute(&company, &eng_id, &0, &String::from_str(&env, "dispute"));
+
+    // a1 rejects, resetting the milestone back to Pending.
+    client.cast_arbiter_vote(&a1, &eng_id, &0, &false);
+    let m0 = client.get_milestone(&eng_id, &0);
+    assert_eq!(m0.status, MilestoneStatus::Pending);
+
+    // Resubmit proof and raise a second dispute round.
+    client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://proof2"));
+    client.raise_dispute(&company, &eng_id, &0, &String::from_str(&env, "dispute2"));
+
+    // a1 can vote again (not a duplicate) since the prior record was cleared,
+    // and this time all three approve to reach unanimous quorum.
+    client.cast_arbiter_vote(&a1, &eng_id, &0, &true);
+    client.cast_arbiter_vote(&a2, &eng_id, &0, &true);
+    let m0 = client.get_milestone(&eng_id, &0);
+    assert_eq!(m0.status, MilestoneStatus::Disputed);
+
+    client.cast_arbiter_vote(&a3, &eng_id, &0, &true);
+    let m0 = client.get_milestone(&eng_id, &0);
+    assert_eq!(m0.status, MilestoneStatus::Resolved);
+    assert_eq!(token_client.balance(&recruiter), 300_000_000);
+}
+
 // ============================================================
 // #1-4 — AMENDMENT FEATURES
 // ============================================================
