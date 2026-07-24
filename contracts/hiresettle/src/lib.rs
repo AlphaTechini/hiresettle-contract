@@ -4,6 +4,7 @@ use soroban_sdk::{contract, contractimpl, contracttype, token, Address, BytesN, 
 
 const MAX_PLATFORM_FEE_BPS: u32 = 500;
 const MAX_ARBITER_FEE_BPS: u32 = 200;
+const FULL_SPLIT_BPS: u32 = 10_000;
 
 // ============================================================
 // DATA TYPES
@@ -172,6 +173,13 @@ pub struct Engagement {
     /// Ordered list of milestones; indices are stable and used throughout the contract API.
     pub milestones: Vec<Milestone>,
     pub status: EngagementStatus,
+    /// Optional co-recruiter address for split-fee engagements (issue #56).
+    /// When `Some`, the milestone payout is split between `recruiter` and `co_recruiter`
+    /// according to `recruiter_split_bps`.
+    pub co_recruiter: Option<Address>,
+    /// Primary recruiter's share of the net payout in basis points (issue #56).
+    /// Default is 10 000 (100 % to recruiter). Must be ≤ 10 000.
+    pub recruiter_split_bps: u32,
 }
 
 /// A lightweight read-only view of an engagement, suitable for list/dashboard APIs.
@@ -200,6 +208,10 @@ pub struct EngagementSummary {
     pub milestone_count: u32,
     /// Ledger sequence number at which the engagement was created.
     pub created_at_ledger: u32,
+    /// Optional co-recruiter address for split-fee engagements (issue #56).
+    pub co_recruiter: Option<Address>,
+    /// Primary recruiter's share of the net payout in basis points (issue #56).
+    pub recruiter_split_bps: u32,
 }
 
 /// Per-dispute, per-milestone vote tally stored on-chain until the dispute resolves.
@@ -266,18 +278,41 @@ pub struct PlatformFee {
     pub treasury: Address,
 }
 
+/// Bundled optional configuration passed as the last argument of `create_engagement`.
+/// Combines `metadata_hash` with the new co-recruiter split fields (issue #56)
+/// to stay within Soroban's 10-parameter limit.
+#[contracttype]
+#[derive(Clone)]
+pub struct EngagementConfig {
+    /// Optional IPFS CID linking to full job description / contract terms off-chain.
+    pub metadata_hash: Option<String>,
+    /// Optional co-recruiter address that shares the milestone payout.
+    pub co_recruiter: Option<Address>,
+    /// Primary recruiter's share in basis points (10 000 = 100 %).
+    /// If `co_recruiter` is `None` this field is ignored and the full payout goes to `recruiter`.
+    /// Must be ≤ 10 000.
+    pub recruiter_split_bps: u32,
+}
+
 // ============================================================
 // STORAGE KEYS
 // ============================================================
 
+/// Contract storage key space. Instance keys reset between transactions;
+/// persistent keys survive across ledgers.
 #[contracttype]
 pub enum DataKey {
+    /// Full engagement record stored by engagement_id (persistent).
     Engagement(String),
+    /// Current admin address (instance).
     Admin,
     /// Pending arbiter succession nomination for an engagement.
     PendingArbiter(String),
+    /// Platform fee configuration — basis points and treasury address (persistent).
     PlatformFee,
+    /// Whether the contract is currently paused (persistent).
     Paused,
+    /// Pending admin transfer nomination address (persistent).
     PendingAdmin,
     /// Admin-configurable proof resubmission cooldown in ledgers (default 2 880).
     ProofCooldown,
@@ -285,8 +320,11 @@ pub enum DataKey {
     LastProofAt(String, u32),
     /// Running vote tally for a disputed (engagement_id, milestone_index).
     ArbiterVotes(String, u32),
+    /// Active amendment proposal for an engagement milestone (persistent).
     AmendmentProposal(String, u32),
+    /// Amendment log entries for an engagement milestone (persistent).
     AmendmentLog(String, u32),
+    /// Admin-configurable TTL extension for amendment proposals (persistent).
     AmendmentTTL,
     /// Total number of engagements ever created (issue #34).
     EngagementCount,
@@ -332,6 +370,10 @@ pub enum DataKey {
     ArbiterFee,
     /// Set to true once admin has permanently renounced their role (issue #59).
     AdminRenounced,
+    /// Admin-configurable maximum simultaneous active engagements per company (default 50).
+    MaxActivePerCompany,
+    /// Per-company count of currently active (non-terminal) engagements.
+    CompanyActiveCount(Address),
 }
 
 // ============================================================
@@ -357,6 +399,7 @@ const DEFAULT_DISPUTE_WINDOW_LEDGERS: u32 = 51_840; // ~3 days
 const MAX_VERSION_LENGTH: u32 = 32;
 const MAX_PROOF_HASH_LENGTH: u32 = 200;
 const MAX_ENGAGEMENT_ID_LENGTH: u32 = 64;
+const DEFAULT_MAX_ACTIVE_PER_COMPANY: u32 = 50;
 
 #[contractimpl]
 impl HireSettleContract {
@@ -364,6 +407,25 @@ impl HireSettleContract {
     // INIT
     // ----------------------------------------------------------
 
+    /// Initializes the HireSettle contract.
+    ///
+    /// # Caller
+    /// Called by the contract deployer or initial administrator (`admin`). Requires authentication from `admin`.
+    ///
+    /// # Initialized State
+    /// Sets up default contract storage values:
+    /// - `DataKey::Admin`: Set to `admin`
+    /// - `DataKey::Paused`: Set to `false`
+    /// - `DataKey::PlatformFee`: Set to 0 bps with treasury `admin`
+    /// - `DataKey::Version`: Set to `DEFAULT_VERSION` ("0.2.0")
+    /// - `DataKey::MinEngagementAmount`: Set to `DEFAULT_MIN_ENGAGEMENT_AMOUNT` (100,000 stroops)
+    ///
+    /// # One-Time-Only / Calling Twice
+    /// Note: No already-initialized guard is currently present. If invoked again, it will overwrite
+    /// all initialized storage fields provided `admin.require_auth()` succeeds.
+    ///
+    /// # Panics
+    /// Panics if authentication from `admin` (`admin.require_auth()`) fails.
     pub fn init(env: Env, admin: Address) {
         admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &admin);
@@ -551,7 +613,7 @@ impl HireSettleContract {
     /// - `job_title`       — short job title string
     /// - `milestones`      — ordered milestone list
     /// - `retention_days`  — Vec of retention windows in days (one per Retention milestone)
-    /// - `metadata_hash`   — optional IPFS CID for off-chain job description; empty string rejected
+    /// - `config`          — bundled optional config: metadata_hash, co_recruiter, recruiter_split_bps
     pub fn create_engagement(
         env: Env,
         engagement_id: String,
@@ -563,7 +625,7 @@ impl HireSettleContract {
         job_title: String,
         milestones: Vec<Milestone>,
         retention_days: Vec<u32>,
-        metadata_hash: Option<String>,
+        config: EngagementConfig,
     ) -> String {
         Self::assert_not_paused(&env);
         company.require_auth();
@@ -669,10 +731,15 @@ impl HireSettleContract {
         }
 
         // Reject empty metadata hash — caller must either omit or provide a real CID.
-        if let Some(ref hash) = metadata_hash {
+        if let Some(ref hash) = config.metadata_hash {
             if hash.len() == 0 {
                 panic!("InvalidMetadataHash");
             }
+        }
+
+        // Issue #56: validate co-recruiter split basis points.
+        if config.recruiter_split_bps > FULL_SPLIT_BPS {
+            panic!("InvalidSplitBps");
         }
 
         let mut total_percent: u32 = 0;
@@ -689,6 +756,21 @@ impl HireSettleContract {
             .has(&DataKey::Engagement(engagement_id.clone()))
         {
             panic!("engagement already exists");
+        }
+
+        // Cap check: reject if the company is already at or over the active engagement limit.
+        let active_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CompanyActiveCount(company.clone()))
+            .unwrap_or(0u32);
+        let max_active: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaxActivePerCompany)
+            .unwrap_or(DEFAULT_MAX_ACTIVE_PER_COMPANY);
+        if active_count >= max_active {
+            panic!("CompanyActiveLimitReached");
         }
 
         let current_ledger = env.ledger().sequence();
@@ -736,11 +818,13 @@ impl HireSettleContract {
             total_amount,
             released_amount: 0,
             job_title,
-            metadata_hash,
+            metadata_hash: config.metadata_hash,
             created_at_ledger: current_ledger,
             last_activity_ledger: current_ledger,
             milestones: resolved_milestones,
             status: EngagementStatus::Active,
+            co_recruiter: config.co_recruiter,
+            recruiter_split_bps: config.recruiter_split_bps,
         };
 
         env.storage()
@@ -748,6 +832,17 @@ impl HireSettleContract {
             .set(&DataKey::Engagement(engagement_id.clone()), &engagement);
 
         Self::extend_engagement_ttl(&env, &engagement_id);
+
+        // Increment per-company active engagement count.
+        let new_active = active_count + 1;
+        env.storage()
+            .persistent()
+            .set(&DataKey::CompanyActiveCount(company.clone()), &new_active);
+        env.storage().persistent().extend_ttl(
+            &DataKey::CompanyActiveCount(company.clone()),
+            100_000,
+            6_300_000,
+        );
 
         // Issue #34: increment global engagement counter.
         let count: u64 = env
@@ -1001,7 +1096,7 @@ impl HireSettleContract {
         let payment = (engagement.total_amount * milestone.payment_percent as i128) / 100;
         let platform_fee = Self::get_platform_fee_internal(&env);
         let fee_amount = (payment * platform_fee.bps as i128) / 10_000;
-        let recruiter_payment = payment - fee_amount;
+        let net_payment = payment - fee_amount;
         engagement.released_amount += payment;
 
         let token_client = token::Client::new(&env, &engagement.token);
@@ -1019,11 +1114,7 @@ impl HireSettleContract {
                 (milestone_index, fee_amount, platform_fee.treasury),
             );
         }
-        token_client.transfer(
-            &env.current_contract_address(),
-            &engagement.recruiter,
-            &recruiter_payment,
-        );
+        Self::distribute_recruiter_payout(&env, &engagement, net_payment, &token_client);
 
         milestone.status = MilestoneStatus::Confirmed;
         engagement
@@ -1037,6 +1128,7 @@ impl HireSettleContract {
 
         if all_done {
             engagement.status = EngagementStatus::Completed;
+            Self::decrement_company_active_count(&env, &engagement.company);
         }
         engagement.last_activity_ledger = env.ledger().sequence();
 
@@ -1213,7 +1305,7 @@ impl HireSettleContract {
                 .get(&DataKey::ArbiterFee)
                 .unwrap_or(0u32);
             let arbiter_fee_amount = (payment * arbiter_fee_bps as i128) / 10_000;
-            let recruiter_payment = payment - arbiter_fee_amount;
+            let net_payment = payment - arbiter_fee_amount;
 
             let token_client = token::Client::new(&env, &engagement.token);
             if arbiter_fee_amount > 0 {
@@ -1223,11 +1315,7 @@ impl HireSettleContract {
                     &arbiter_fee_amount,
                 );
             }
-            token_client.transfer(
-                &env.current_contract_address(),
-                &engagement.recruiter,
-                &recruiter_payment,
-            );
+            Self::distribute_recruiter_payout(&env, &engagement, net_payment, &token_client);
 
             milestone.status = MilestoneStatus::Resolved;
             engagement.milestones.set(milestone_index, milestone);
@@ -1238,6 +1326,7 @@ impl HireSettleContract {
             });
             if all_done {
                 engagement.status = EngagementStatus::Completed;
+                Self::decrement_company_active_count(&env, &engagement.company);
             }
 
             env.storage().persistent().remove(&vote_key);
@@ -1451,6 +1540,8 @@ impl HireSettleContract {
             .set(&DataKey::Engagement(engagement_id.clone()), &engagement);
         Self::extend_engagement_ttl(&env, &engagement_id);
 
+        Self::decrement_company_active_count(&env, &engagement.company);
+
         env.events().publish(
             (
                 Symbol::new(&env, "engagement_cancelled"),
@@ -1647,6 +1738,8 @@ impl HireSettleContract {
             status: engagement.status,
             milestone_count: engagement.milestones.len(),
             created_at_ledger: engagement.created_at_ledger,
+            co_recruiter: engagement.co_recruiter,
+            recruiter_split_bps: engagement.recruiter_split_bps,
         }
     }
 
@@ -2230,6 +2323,8 @@ impl HireSettleContract {
             .set(&DataKey::Engagement(engagement_id.clone()), &engagement);
         Self::extend_engagement_ttl(&env, &engagement_id);
 
+        Self::decrement_company_active_count(&env, &engagement.company);
+
         env.events().publish(
             (
                 Symbol::new(&env, "early_exit_accepted"),
@@ -2408,6 +2503,45 @@ impl HireSettleContract {
     }
 
     // ----------------------------------------------------------
+    // PER-COMPANY ACTIVE ENGAGEMENT CAP
+    // ----------------------------------------------------------
+
+    /// Admin sets the maximum number of simultaneously active engagements allowed
+    /// per company address. Defaults to 50 when not explicitly configured.
+    ///
+    /// # Panics
+    /// - `"unauthorized"` — caller is not the contract admin.
+    /// - `"InvalidMaxActivePerCompany"` — `count` is 0.
+    pub fn set_max_active_per_company(env: Env, admin: Address, count: u32) {
+        Self::assert_admin(&env, &admin);
+        if count == 0 {
+            panic!("InvalidMaxActivePerCompany");
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::MaxActivePerCompany, &count);
+        env.events()
+            .publish((Symbol::new(&env, "max_active_per_company_set"),), count);
+    }
+
+    /// Return the current per-company active engagement cap.
+    /// Returns `DEFAULT_MAX_ACTIVE_PER_COMPANY` (50) when not configured.
+    pub fn get_max_active_per_company(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MaxActivePerCompany)
+            .unwrap_or(DEFAULT_MAX_ACTIVE_PER_COMPANY)
+    }
+
+    /// Return the current active engagement count for a company.
+    pub fn get_company_active_count(env: Env, company: Address) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::CompanyActiveCount(company))
+            .unwrap_or(0u32)
+    }
+
+    // ----------------------------------------------------------
     // ISSUE #38 — INACTIVITY TIMEOUT
     // ----------------------------------------------------------
 
@@ -2480,6 +2614,8 @@ impl HireSettleContract {
         env.storage()
             .persistent()
             .set(&DataKey::Engagement(engagement_id.clone()), &engagement);
+
+        Self::decrement_company_active_count(&env, &engagement.company);
 
         env.events().publish(
             (
@@ -2604,7 +2740,7 @@ impl HireSettleContract {
 
             let payment = (engagement.total_amount * m.payment_percent as i128) / 100;
             let fee_amount = (payment * platform_fee.bps as i128) / 10_000;
-            let recruiter_payment = payment - fee_amount;
+            let net_payment = payment - fee_amount;
             engagement.released_amount += payment;
 
             if fee_amount > 0 {
@@ -2621,11 +2757,7 @@ impl HireSettleContract {
                     (idx, fee_amount, platform_fee.treasury.clone()),
                 );
             }
-            token_client.transfer(
-                &env.current_contract_address(),
-                &engagement.recruiter,
-                &recruiter_payment,
-            );
+            Self::distribute_recruiter_payout(&env, &engagement, net_payment, &token_client);
 
             m.status = MilestoneStatus::Confirmed;
             engagement.milestones.set(idx, m);
@@ -2646,6 +2778,7 @@ impl HireSettleContract {
 
         if all_done {
             engagement.status = EngagementStatus::Completed;
+            Self::decrement_company_active_count(&env, &engagement.company);
         }
         engagement.last_activity_ledger = env.ledger().sequence();
 
@@ -2778,7 +2911,7 @@ impl HireSettleContract {
         let payment = (engagement.total_amount * milestone.payment_percent as i128) / 100;
         let platform_fee = Self::get_platform_fee_internal(&env);
         let fee_amount = (payment * platform_fee.bps as i128) / 10_000;
-        let recruiter_payment = payment - fee_amount;
+        let net_payment = payment - fee_amount;
         engagement.released_amount += payment;
 
         let token_client = token::Client::new(&env, &engagement.token);
@@ -2796,11 +2929,7 @@ impl HireSettleContract {
                 (milestone_index, fee_amount, platform_fee.treasury),
             );
         }
-        token_client.transfer(
-            &env.current_contract_address(),
-            &engagement.recruiter,
-            &recruiter_payment,
-        );
+        Self::distribute_recruiter_payout(&env, &engagement, net_payment, &token_client);
 
         milestone.status = MilestoneStatus::Confirmed;
         engagement.milestones.set(milestone_index, milestone);
@@ -2812,6 +2941,7 @@ impl HireSettleContract {
 
         if all_done {
             engagement.status = EngagementStatus::Completed;
+            Self::decrement_company_active_count(&env, &engagement.company);
         }
         engagement.last_activity_ledger = env.ledger().sequence();
 
@@ -3088,6 +3218,48 @@ impl HireSettleContract {
             .instance()
             .get(&DataKey::MaxProofHashLength)
             .unwrap_or(MAX_PROOF_HASH_LENGTH)
+    }
+
+    // ----------------------------------------------------------
+    // ISSUE #56 — CO-RECRUITER SPLIT PAYOUT
+    // ----------------------------------------------------------
+
+    /// Distribute the net payment (after platform / arbiter fee) between the
+    /// primary recruiter and the optional co-recruiter.
+    ///
+    /// When `co_recruiter` is `Some`, the primary receives
+    /// `net * split_bps / 10_000` and the co-recruiter receives the remainder.
+    /// When `co_recruiter` is `None` the full net amount goes to the recruiter.
+    fn distribute_recruiter_payout(
+        env: &Env,
+        engagement: &Engagement,
+        net_payment: i128,
+        token_client: &token::Client,
+    ) {
+        match &engagement.co_recruiter {
+            Some(co_recruiter) => {
+                let split = engagement.recruiter_split_bps as i128;
+                let primary_payment = (net_payment * split) / (FULL_SPLIT_BPS as i128);
+                let co_payment = net_payment - primary_payment;
+                token_client.transfer(
+                    &env.current_contract_address(),
+                    &engagement.recruiter,
+                    &primary_payment,
+                );
+                token_client.transfer(
+                    &env.current_contract_address(),
+                    co_recruiter,
+                    &co_payment,
+                );
+            }
+            None => {
+                token_client.transfer(
+                    &env.current_contract_address(),
+                    &engagement.recruiter,
+                    &net_payment,
+                );
+            }
+        }
     }
 }
 

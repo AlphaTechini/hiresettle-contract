@@ -114,7 +114,7 @@ Each milestone declares its kind: `Placement` (immediately available, recruiter 
 |------|---------|-------------|
 | **Company** | Locks USDC, confirms milestones, raises disputes, cancels, requests replacement | Primary actor |
 | **Recruiter** | Submits proof documents at each milestone | `submit_proof` only |
-| **Arbiter** | Resolves disputes | `resolve_dispute` only |
+| **Arbiter** | Votes to resolve disputes; quorum of arbiters must agree before a disputed milestone moves to `Resolved` or back to `Pending` | `cast_arbiter_vote` only |
 
 ---
 
@@ -140,7 +140,8 @@ pub struct Engagement {
     pub id: String,                  // unique company-defined ID e.g. "ENG-2026-001"
     pub company: Address,
     pub recruiter: Address,
-    pub arbiter: Address,
+    pub arbiters: Vec<Address>,      // ordered list of arbiters eligible to vote on disputes
+    pub quorum: u32,                 // number of arbiter votes required to resolve (M-of-N)
     pub token: Address,              // USDC Stellar Asset Contract
     pub total_amount: i128,          // total fee locked (stroops)
     pub released_amount: i128,       // amount paid out so far
@@ -163,12 +164,13 @@ Locked ──── unlock_milestone() ──→ Pending
                                      ↓
                               ProofSubmitted
                               /            \
-              confirm_milestone()      raise_dispute()
+              confirm_milestone()      raise_dispute(reason)
                     │                       │
                     ↓                       ↓
                 Confirmed               Disputed
                                        /        \
-                       resolve(approve=true)  resolve(approve=false)
+                  cast_arbiter_vote(approve=true)  cast_arbiter_vote(approve=false)
+                  [quorum reached]                 [rejection quorum reached]
                               │                      │
                               ↓                      ↓
                            Resolved               Pending  ← recruiter resubmits
@@ -192,12 +194,13 @@ Parameters:
   engagement_id   String           — unique ID
   company         Address          — funds source + milestone approver
   recruiter       Address          — payment recipient
-  arbiter         Address          — dispute resolver
+  arbiter_setup   ArbiterSetup     — { arbiters: Vec<Address>, quorum: u32 }
   token           Address          — USDC SAC address
   total_amount    i128             — total fee in stroops
   job_title       String           — short job description
   milestones      Vec<Milestone>   — ordered list
   retention_days  Vec<u32>         — one day count per Retention milestone
+  metadata_hash   Option<String>   — optional IPFS CID for full job description
 ```
 
 ### `unlock_milestone(engagement_id, milestone_index)`
@@ -212,11 +215,15 @@ Recruiter submits an IPFS hash or URL as proof for a Pending milestone.
 ### `confirm_milestone(company, engagement_id, milestone_index)`
 Company confirms a ProofSubmitted milestone. Releases the milestone's payment % to the recruiter. For Retention milestones, double-checks that `current_ledger >= valid_after_ledger` as a safety guard.
 
-### `raise_dispute(company, engagement_id, milestone_index)`
-Company disputes a ProofSubmitted milestone. Freezes it in Disputed status.
+### `raise_dispute(company, engagement_id, milestone_index, reason: String)`
+Company disputes a ProofSubmitted milestone. Freezes it in Disputed status. The `reason` string (max 128 characters) is stored on-chain and queryable via `get_dispute_reason`.
 
-### `resolve_dispute(arbiter, engagement_id, milestone_index, approve: bool)`
-Arbiter resolves a Disputed milestone. `approve = true` releases payment; `approve = false` resets to Pending.
+### `cast_arbiter_vote(arbiter, engagement_id, milestone_index, approve: bool)`
+Each arbiter casts a single vote on a Disputed milestone. The dispute resolves automatically once a quorum is reached:
+- `approve_votes >= quorum` → payment released to recruiter, milestone moves to `Resolved`
+- `reject_votes > total_arbiters - quorum` → proof cleared, milestone resets to `Pending` for the recruiter to resubmit
+
+Duplicate votes from the same arbiter are rejected. Vote tallies are tracked on-chain per `(engagement_id, milestone_index)` and cleared once the dispute is resolved.
 
 ### `request_replacement(company, engagement_id)`
 Company requests a replacement when a candidate leaves. Requires Placement to be already confirmed. Resets Placement milestone to Pending, restarts all unconfirmed retention clocks.
@@ -280,7 +287,8 @@ The Placement fee already released to the recruiter is **not clawed back** — t
 | `proof_submitted` | `(engagement_id, milestone_index)` | Proof submitted |
 | `milestone_confirmed` | `(engagement_id, milestone_index, payment)` | Milestone confirmed, fee released |
 | `dispute_raised` | `(engagement_id, milestone_index)` | Dispute opened |
-| `dispute_resolved` | `(engagement_id, milestone_index, approved)` | Dispute resolved |
+| `arbiter_voted` | `(engagement_id, milestone_index, approve)` | Single arbiter casts a vote on a dispute |
+| `dispute_resolved` | `(engagement_id, milestone_index, approved)` | Dispute resolved (quorum reached) |
 | `replacement_requested` | `engagement_id` | Replacement requested |
 | `engagement_cancelled` | `(engagement_id, refund_amount)` | Engagement cancelled |
 
@@ -398,7 +406,7 @@ stellar contract invoke \
   --engagement_id "ENG-TEST-001" \
   --company <COMPANY_ADDRESS> \
   --recruiter <RECRUITER_ADDRESS> \
-  --arbiter <ARBITER_ADDRESS> \
+  --arbiter_setup '{"arbiters":["<ARBITER_ADDRESS>"],"quorum":1}' \
   --token <USDC_SAC_ADDRESS> \
   --total_amount 5000000000 \
   --job_title "Senior Engineer" \
@@ -412,11 +420,13 @@ stellar contract invoke \
 
 ## Security Considerations
 
-- **Authorization**: Every state-changing function calls `require_auth()`. Recruiters cannot confirm their own milestones. Companies cannot resolve disputes.
+- **Authorization**: Every state-changing function calls `require_auth()`. Recruiters cannot confirm their own milestones. Companies cannot cast arbiter votes.
+- **Multi-arbiter quorum**: Disputes require M-of-N arbiter votes to resolve. A single arbiter cannot unilaterally release or withhold payment — both approval and rejection require a configurable quorum. Duplicate votes from the same arbiter are rejected on-chain.
+- **Arbiter fee cap**: The arbiter fee is capped at 200 bps (2%) to prevent excessive deduction from recruiter payouts on dispute approval.
 - **Retention double-check**: `confirm_milestone()` re-verifies `valid_after_ledger` even if `unlock_milestone()` was called, preventing a company from confirming a retention milestone before the window truly ends.
 - **Replacement fee fairness**: The Placement tranche paid to the recruiter is non-refundable. Only unreleased amounts are frozen. This is explicit in the contract and documented clearly so both parties understand the terms at engagement creation.
 - **Ledger drift**: The 5s/ledger assumption is approximate. Stellar's actual ledger time may vary slightly. The contract uses ledger sequence numbers — not timestamps — so the unlock is purely count-based. Production deployments should account for ~±5% drift in real-world retention windows.
-- **Contract Upgrade Mechanism**: The contract supports WASM upgrades via `propose_upgrade` and `execute_upgrade` with a mandatory time-lock (`upgrade_lock_duration`, default 17,280 ledgers ≈ 1 day). The admin proposes a new WASM hash; after the time-lock elapses, anyone may call `execute_upgrade` to apply it. The time-lock duration is configurable via `set_upgrade_lock_duration`. This prevents immediate, non-transparent upgrades while allowing the contract to evolve. Note: upgrades depend on admin key custody — a compromised admin key could propose and execute a malicious upgrade after the time-lock window (addressable with a multisig admin or DAO governance).
+- **Upgrade time-lock**: Contract upgrades require a configurable time-lock (default 17,280 ledgers ≈ 1 day) between proposal and execution, giving stakeholders time to review before changes take effect.
 
 ---
 
