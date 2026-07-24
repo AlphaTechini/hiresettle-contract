@@ -152,6 +152,139 @@ pub struct Engagement {
 }
 ```
 
+### `EngagementSummary`
+
+```rust
+pub struct EngagementSummary {
+    pub id: String,                  // unique engagement identifier
+    pub job_title: String,           // short title set at creation
+    pub company: Address,
+    pub recruiter: Address,
+    pub total_amount: i128,          // total fee locked (stroops)
+    pub released_amount: i128,       // amount paid out so far
+    pub status: EngagementStatus,
+    pub milestone_count: u32,        // total milestones (does not change)
+    pub created_at_ledger: u32,
+}
+```
+
+Lightweight read-only view returned by `get_engagement_summary`, omitting the milestone vector for efficient dashboard listing.
+
+### `AmendmentEntry`
+
+```rust
+pub struct AmendmentEntry {
+    pub proposer: Address,           // company or recruiter who proposed
+    pub old_payment_percent: u32,
+    pub new_payment_percent: u32,
+    pub ledger: u32,                 // ledger when the amendment was accepted
+}
+```
+
+History entry recorded when a milestone payment-percent amendment is accepted.
+
+### `AmendmentProposal`
+
+```rust
+pub struct AmendmentProposal {
+    pub proposer: Address,
+    pub new_payment_percent: u32,
+    pub proposed_at_ledger: u32,
+    pub expires_at_ledger: u32,      // proposal TTL; expires if not accepted in time
+}
+```
+
+A pending milestone amendment proposal; either party may propose and the other must accept before expiry.
+
+### `ArbiterSetup`
+
+```rust
+pub struct ArbiterSetup {
+    pub arbiters: Vec<Address>,      // ordered list eligible to vote on disputes
+    pub quorum: u32,                 // M-of-N votes required to resolve
+}
+```
+
+Bundled argument passed to `create_engagement` to configure the arbitration panel (keeps parameter count within Soroban's 10-arg limit).
+
+### `ArbiterVoteRecord`
+
+```rust
+pub struct ArbiterVoteRecord {
+    pub approve_votes: u32,
+    pub reject_votes: u32,
+    pub voted: Vec<Address>,         // prevents double-voting
+}
+```
+
+Per-dispute vote tally stored on-chain until the dispute resolves (approve or reject quorum is reached).
+
+### `ArbiterVoteCounts`
+
+```rust
+pub struct ArbiterVoteCounts {
+    pub approve_votes: u32,
+    pub reject_votes: u32,
+}
+```
+
+Returned by `get_arbiter_votes` — lightweight view of the current tally without the voter list.
+
+### `ArbiterNomination`
+
+```rust
+pub struct ArbiterNomination {
+    pub current: Address,            // nominating arbiter
+    pub nominee: Address,            // successor
+}
+```
+
+Stored under `DataKey::PendingArbiter` during arbiter succession; the nominee calls `claim_arbiter` to finalise.
+
+### `UpgradeProposal`
+
+```rust
+pub struct UpgradeProposal {
+    pub new_wasm_hash: BytesN<32>,   // new contract WASM hash
+    pub execute_after_ledger: u32,   // earliest ledger at which execution is allowed
+}
+```
+
+Pending contract WASM upgrade proposal; subject to an admin-configurable time-lock (default 17,280 ledgers ≈ 1 day).
+
+### `PlatformFee`
+
+```rust
+pub struct PlatformFee {
+    pub bps: u32,                    // fee in basis points (max 500 = 5%)
+    pub treasury: Address,           // fee recipient
+}
+```
+
+Platform fee deducted from each milestone payment before release to the recruiter.
+
+### `DataKey`
+
+```rust
+pub enum DataKey {
+    Engagement(String),              // full engagement record by ID (persistent)
+    Admin,                           // current admin address (instance)
+    PendingArbiter(String),          // pending arbiter succession nomination
+    PlatformFee,                     // bps + treasury config (persistent)
+    Paused,                          // pause-guard bool (persistent)
+    PendingAdmin,                    // nominated admin successor (persistent)
+    ProofCooldown,                   // min ledgers between resubmissions (instance)
+    LastProofAt(String, u32),        // ledger of last proof submission
+    ArbiterVotes(String, u32),       // running vote tally for a dispute
+    AmendmentProposal(String, u32),  // active amendment proposal
+    AmendmentLog(String, u32),       // amendment history entries
+    AmendmentTTL,                    // proposal expiry duration (persistent)
+    // … additional keys for counts, allowlist, timeouts, etc.
+}
+```
+
+Contract storage key space enumerating all persistent and instance-stored values. Instance keys reset between transactions; persistent keys survive across ledgers.
+
 ---
 
 ## Milestone State Machine
