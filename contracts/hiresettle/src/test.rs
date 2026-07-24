@@ -4220,3 +4220,23 @@ fn test_active_count_default_zero_for_new_company() {
     let new_company = Address::generate(&env);
     assert_eq!(client.get_company_active_count(&new_company), 0);
 }
+
+// ============================================================
+// #190 — public get_admin() query
+// ============================================================
+
+/// get_admin returns the address set at init, and reflects rotation after
+/// nominate_admin/claim_admin.
+#[test]
+fn test_get_admin_reflects_init_and_rotation() {
+    let (env, contract_id, _token_id, company, _recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    assert_eq!(client.get_admin(), company);
+
+    let new_admin = Address::generate(&env);
+    client.nominate_admin(&company, &new_admin);
+    client.claim_admin(&new_admin);
+
+    assert_eq!(client.get_admin(), new_admin);
+}

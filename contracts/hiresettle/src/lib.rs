@@ -568,6 +568,11 @@ impl HireSettleContract {
         env.storage().persistent().get(&DataKey::PendingAdmin)
     }
 
+    /// Return the current contract admin.
+    pub fn get_admin(env: Env) -> Address {
+        Self::get_admin_internal(&env)
+    }
+
     // ----------------------------------------------------------
     // ADMIN CONFIG
     // ----------------------------------------------------------
@@ -3182,7 +3187,7 @@ impl HireSettleContract {
             .unwrap_or_else(|| panic!("engagement not found"))
     }
 
-    fn get_admin(env: &Env) -> Address {
+    fn get_admin_internal(env: &Env) -> Address {
         env.storage()
             .instance()
             .get(&DataKey::Admin)
@@ -3199,7 +3204,7 @@ impl HireSettleContract {
             panic!("NoAdmin");
         }
         admin.require_auth();
-        if *admin != Self::get_admin(env) {
+        if *admin != Self::get_admin_internal(env) {
             panic!("unauthorized");
         }
     }
@@ -3223,7 +3228,7 @@ impl HireSettleContract {
             .get(&DataKey::PlatformFee)
             .unwrap_or_else(|| PlatformFee {
                 bps: 0,
-                treasury: Self::get_admin(env),
+                treasury: Self::get_admin_internal(env),
             })
     }
 
