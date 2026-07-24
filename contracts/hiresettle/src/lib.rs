@@ -188,6 +188,9 @@ pub struct Engagement {
     /// Primary recruiter's share of the net payout in basis points (issue #56).
     /// Default is 10 000 (100 % to recruiter). Must be ≤ 10 000.
     pub recruiter_split_bps: u32,
+    /// Optional off-chain attestation hash (e.g. SHA-256 of the contract PDF).
+    /// Stored at engagement creation for audit and verification purposes.
+    pub contract_pdf_hash: Option<String>,
 }
 
 /// A lightweight read-only view of an engagement, suitable for list/dashboard APIs.
@@ -220,6 +223,8 @@ pub struct EngagementSummary {
     pub co_recruiter: Option<Address>,
     /// Primary recruiter's share of the net payout in basis points (issue #56).
     pub recruiter_split_bps: u32,
+    /// Optional off-chain attestation hash (e.g. SHA-256 of the contract PDF).
+    pub contract_pdf_hash: Option<String>,
 }
 
 /// Per-dispute, per-milestone vote tally stored on-chain until the dispute resolves.
@@ -254,7 +259,11 @@ pub struct ArbiterSetup {
 #[contracttype]
 #[derive(Clone)]
 pub struct ArbiterVoteCounts {
+    /// Number of arbiters who voted to approve (release) the milestone payment.
+    /// Incremented in `cast_arbiter_vote` when `approve` is `true`.
     pub approve_votes: u32,
+    /// Number of arbiters who voted to reject (withhold) the milestone payment.
+    /// Incremented in `cast_arbiter_vote` when `approve` is `false`.
     pub reject_votes: u32,
 }
 
@@ -300,6 +309,9 @@ pub struct EngagementConfig {
     /// If `co_recruiter` is `None` this field is ignored and the full payout goes to `recruiter`.
     /// Must be ≤ 10 000.
     pub recruiter_split_bps: u32,
+    /// Optional off-chain attestation hash (e.g. SHA-256 of the contract PDF).
+    /// Must be non-empty if provided.
+    pub contract_pdf_hash: Option<String>,
 }
 
 // ============================================================
@@ -576,6 +588,11 @@ impl HireSettleContract {
         env.storage().persistent().get(&DataKey::PendingAdmin)
     }
 
+    /// Return the current contract admin.
+    pub fn get_admin(env: Env) -> Address {
+        Self::get_admin_internal(&env)
+    }
+
     // ----------------------------------------------------------
     // ADMIN CONFIG
     // ----------------------------------------------------------
@@ -745,6 +762,13 @@ impl HireSettleContract {
             }
         }
 
+        // Reject empty contract_pdf_hash — caller must either omit or provide a real hash.
+        if let Some(ref hash) = config.contract_pdf_hash {
+            if hash.len() == 0 {
+                panic!("InvalidContractPdfHash");
+            }
+        }
+
         // Issue #56: validate co-recruiter split basis points.
         if config.recruiter_split_bps > FULL_SPLIT_BPS {
             panic!("InvalidSplitBps");
@@ -833,6 +857,7 @@ impl HireSettleContract {
             status: EngagementStatus::Active,
             co_recruiter: config.co_recruiter,
             recruiter_split_bps: config.recruiter_split_bps,
+            contract_pdf_hash: config.contract_pdf_hash,
         };
 
         env.storage()
@@ -920,6 +945,7 @@ impl HireSettleContract {
         let valid_after_ledger = milestone.valid_after_ledger;
         let unlocked_at_ledger = current_ledger;
 
+        let old_status = milestone.status.clone();
         milestone.status = MilestoneStatus::Pending;
         engagement.milestones.set(milestone_index, milestone);
         engagement.last_activity_ledger = unlocked_at_ledger;
@@ -928,6 +954,13 @@ impl HireSettleContract {
             .persistent()
             .set(&DataKey::Engagement(engagement_id.clone()), &engagement);
         Self::extend_engagement_ttl(&env, &engagement_id);
+        Self::emit_milestone_status_changed(
+            &env,
+            &engagement_id,
+            milestone_index,
+            old_status,
+            MilestoneStatus::Pending,
+        );
 
         // Event body carries the time-gate evidence so off-chain consumers can
         // confirm the unlock was legitimate without a follow-up `get_milestone`
@@ -964,6 +997,8 @@ impl HireSettleContract {
     /// - `"milestone not pending"` — milestone is not in `Pending` status.
     /// - `"proof cooldown active"` — resubmitting too soon after a previous proof.
     /// - `"proof hash cannot be empty"` — empty string passed as `proof_hash`.
+    /// - `"DuplicateProofHash"` — the proof hash is already used by another milestone
+    ///   in this engagement.
     ///
     /// # Events
     /// Emits `("proof_submitted", engagement_id)` with `(milestone_index, proof_hash)`.
@@ -1015,6 +1050,20 @@ impl HireSettleContract {
             }
         }
 
+        // A proof hash identifies the evidence for a milestone and must not be
+        // reused by another milestone in the same engagement. Exclude the
+        // target milestone so a valid resubmission can replace its own proof.
+        for i in 0..engagement.milestones.len() {
+            if i != milestone_index {
+                let existing_milestone = engagement.milestones.get(i).unwrap();
+                if existing_milestone.proof_hash.len() > 0
+                    && existing_milestone.proof_hash == proof_hash
+                {
+                    panic!("DuplicateProofHash");
+                }
+            }
+        }
+
         // Record this submission ledger for future cooldown checks.
         env.storage().persistent().set(&last_key, &current_ledger);
         env.storage()
@@ -1025,10 +1074,12 @@ impl HireSettleContract {
         let old_hash = milestone.proof_hash.clone();
 
         milestone.proof_hash = proof_hash.clone();
+        let old_status = milestone.status.clone();
         milestone.status = MilestoneStatus::ProofSubmitted;
         milestone.proof_submitted_at = current_ledger;
         engagement.milestones.set(milestone_index, milestone);
 
+        let old_engagement_status = engagement.status.clone();
         if engagement.status == EngagementStatus::ReplacementRequested {
             engagement.status = EngagementStatus::Active;
         }
@@ -1038,6 +1089,19 @@ impl HireSettleContract {
             .persistent()
             .set(&DataKey::Engagement(engagement_id.clone()), &engagement);
         Self::extend_engagement_ttl(&env, &engagement_id);
+        Self::emit_milestone_status_changed(
+            &env,
+            &engagement_id,
+            milestone_index,
+            old_status,
+            MilestoneStatus::ProofSubmitted,
+        );
+        Self::emit_engagement_status_changed(
+            &env,
+            &engagement_id,
+            old_engagement_status,
+            engagement.status.clone(),
+        );
 
         if is_resubmission {
             env.events().publish(
@@ -1131,6 +1195,7 @@ impl HireSettleContract {
             Self::distribute_recruiter_payout(&env, &engagement, net_payment, &token_client);
         }
 
+        let old_status = milestone.status.clone();
         milestone.status = MilestoneStatus::Confirmed;
         engagement
             .milestones
@@ -1141,6 +1206,7 @@ impl HireSettleContract {
             s == MilestoneStatus::Confirmed || s == MilestoneStatus::Resolved
         });
 
+        let old_engagement_status = engagement.status.clone();
         if all_done {
             engagement.status = EngagementStatus::Completed;
             Self::decrement_company_active_count(&env, &engagement.company);
@@ -1151,6 +1217,20 @@ impl HireSettleContract {
             .persistent()
             .set(&DataKey::Engagement(engagement_id.clone()), &engagement);
         Self::extend_engagement_ttl(&env, &engagement_id);
+
+        Self::emit_milestone_status_changed(
+            &env,
+            &engagement_id,
+            milestone_index,
+            old_status,
+            MilestoneStatus::Confirmed,
+        );
+        Self::emit_engagement_status_changed(
+            &env,
+            &engagement_id,
+            old_engagement_status,
+            engagement.status.clone(),
+        );
 
         env.events().publish(
             (
@@ -1219,6 +1299,7 @@ impl HireSettleContract {
             panic!("DisputeWindowClosed");
         }
 
+        let old_status = milestone.status.clone();
         milestone.status = MilestoneStatus::Disputed;
         engagement.milestones.set(milestone_index, milestone);
         engagement.last_activity_ledger = env.ledger().sequence();
@@ -1232,6 +1313,14 @@ impl HireSettleContract {
             .persistent()
             .set(&DataKey::Engagement(engagement_id.clone()), &engagement);
         Self::extend_engagement_ttl(&env, &engagement_id);
+
+        Self::emit_milestone_status_changed(
+            &env,
+            &engagement_id,
+            milestone_index,
+            old_status,
+            MilestoneStatus::Disputed,
+        );
 
         env.events().publish(
             (Symbol::new(&env, "dispute_raised"), engagement_id.clone()),
@@ -1332,6 +1421,7 @@ impl HireSettleContract {
             }
             Self::distribute_recruiter_payout(&env, &engagement, net_payment, &token_client);
 
+            let old_status = milestone.status.clone();
             milestone.status = MilestoneStatus::Resolved;
             engagement.milestones.set(milestone_index, milestone);
 
@@ -1339,6 +1429,7 @@ impl HireSettleContract {
                 let s = engagement.milestones.get(i).unwrap().status;
                 s == MilestoneStatus::Confirmed || s == MilestoneStatus::Resolved
             });
+            let old_engagement_status = engagement.status.clone();
             if all_done {
                 engagement.status = EngagementStatus::Completed;
                 Self::decrement_company_active_count(&env, &engagement.company);
@@ -1354,7 +1445,21 @@ impl HireSettleContract {
                 (Symbol::new(&env, "dispute_resolved"), engagement_id.clone()),
                 (milestone_index, true),
             );
+            Self::emit_milestone_status_changed(
+                &env,
+                &engagement_id,
+                milestone_index,
+                old_status,
+                MilestoneStatus::Resolved,
+            );
+            Self::emit_engagement_status_changed(
+                &env,
+                &engagement_id,
+                old_engagement_status,
+                engagement.status.clone(),
+            );
         } else if record.reject_votes > total_arbiters - quorum {
+            let old_status = milestone.status.clone();
             milestone.status = MilestoneStatus::Pending;
             milestone.proof_hash = String::from_str(&env, "");
             engagement.milestones.set(milestone_index, milestone);
@@ -1368,6 +1473,13 @@ impl HireSettleContract {
             env.events().publish(
                 (Symbol::new(&env, "dispute_resolved"), engagement_id.clone()),
                 (milestone_index, false),
+            );
+            Self::emit_milestone_status_changed(
+                &env,
+                &engagement_id,
+                milestone_index,
+                old_status,
+                MilestoneStatus::Pending,
             );
         } else {
             env.storage().persistent().set(&vote_key, &record);
@@ -1425,13 +1537,16 @@ impl HireSettleContract {
                     if m.status == MilestoneStatus::Confirmed
                         || m.status == MilestoneStatus::Resolved
                     {
+                        let old_status = m.status.clone();
                         m.status = MilestoneStatus::Pending;
                         m.proof_hash = String::from_str(&env, "");
-                        // Record the gross amount already released for this milestone so a
-                        // later re-confirmation only pays out the difference versus its
-                        // (possibly larger, after top_up_escrow) current share. See issue #183.
-                        m.replacement_paid_out =
-                            (engagement.total_amount * m.payment_percent as i128) / 100;
+                        Self::emit_milestone_status_changed(
+                            &env,
+                            &engagement_id,
+                            i,
+                            old_status,
+                            MilestoneStatus::Pending,
+                        );
                         // Clear cooldown so the replacement candidate can submit immediately.
                         env.storage()
                             .persistent()
@@ -1446,8 +1561,18 @@ impl HireSettleContract {
                             / Self::get_ledgers_per_day_internal(&env);
                         m.valid_after_ledger = current_ledger
                             + (original_days * Self::get_ledgers_per_day_internal(&env));
+                        let old_status = m.status.clone();
                         m.status = MilestoneStatus::Locked;
                         m.proof_hash = String::from_str(&env, "");
+                        if old_status != MilestoneStatus::Locked {
+                            Self::emit_milestone_status_changed(
+                                &env,
+                                &engagement_id,
+                                i,
+                                old_status,
+                                MilestoneStatus::Locked,
+                            );
+                        }
                         env.storage()
                             .persistent()
                             .remove(&DataKey::LastProofAt(engagement_id.clone(), i));
@@ -1457,6 +1582,7 @@ impl HireSettleContract {
             engagement.milestones.set(i, m);
         }
 
+        let old_engagement_status = engagement.status.clone();
         engagement.status = EngagementStatus::ReplacementRequested;
         engagement.last_activity_ledger = env.ledger().sequence();
 
@@ -1481,6 +1607,12 @@ impl HireSettleContract {
         );
 
         Self::extend_engagement_ttl(&env, &engagement_id);
+        Self::emit_engagement_status_changed(
+            &env,
+            &engagement_id,
+            old_engagement_status,
+            engagement.status.clone(),
+        );
 
         env.events().publish(
             (
@@ -1552,6 +1684,7 @@ impl HireSettleContract {
             &refund,
         );
 
+        let old_engagement_status = engagement.status.clone();
         engagement.status = EngagementStatus::Cancelled;
         engagement.last_activity_ledger = env.ledger().sequence();
 
@@ -1559,6 +1692,12 @@ impl HireSettleContract {
             .persistent()
             .set(&DataKey::Engagement(engagement_id.clone()), &engagement);
         Self::extend_engagement_ttl(&env, &engagement_id);
+        Self::emit_engagement_status_changed(
+            &env,
+            &engagement_id,
+            old_engagement_status,
+            engagement.status.clone(),
+        );
 
         Self::decrement_company_active_count(&env, &engagement.company);
 
@@ -1775,7 +1914,15 @@ impl HireSettleContract {
             created_at_ledger: engagement.created_at_ledger,
             co_recruiter: engagement.co_recruiter,
             recruiter_split_bps: engagement.recruiter_split_bps,
+            contract_pdf_hash: engagement.contract_pdf_hash,
         }
+    }
+
+    /// Return the off-chain attestation hash (e.g. SHA-256 of the contract PDF)
+    /// stored at engagement creation, or None if not provided.
+    /// Read-only and permissionless.
+    pub fn get_contract_pdf_hash(env: Env, engagement_id: String) -> Option<String> {
+        Self::get_engagement_internal(&env, &engagement_id).contract_pdf_hash
     }
 
     // ----------------------------------------------------------
@@ -1784,6 +1931,11 @@ impl HireSettleContract {
 
     /// Current arbiter nominates a successor. The successor must call `claim_arbiter`.
     /// Any arbiter in the engagement's arbiter list may initiate succession for their slot.
+    ///
+    /// # Panics
+    /// - `"engagement is in a terminal state"` — the engagement is `Completed`,
+    ///   `Cancelled`, or `Expired`. Arbiter succession has no practical function
+    ///   once an engagement can no longer be disputed.
     pub fn nominate_arbiter_successor(
         env: Env,
         arbiter: Address,
@@ -1794,6 +1946,10 @@ impl HireSettleContract {
         arbiter.require_auth();
 
         let engagement = Self::get_engagement_internal(&env, &engagement_id);
+
+        if Self::is_terminal_status(&engagement.status) {
+            panic!("engagement is in a terminal state");
+        }
 
         let is_arbiter =
             (0..engagement.arbiters.len()).any(|i| engagement.arbiters.get(i).unwrap() == arbiter);
@@ -1826,6 +1982,11 @@ impl HireSettleContract {
     }
 
     /// Nominated successor claims the arbiter slot, replacing the nominating arbiter.
+    ///
+    /// # Panics
+    /// - `"engagement is in a terminal state"` — the engagement reached `Completed`,
+    ///   `Cancelled`, or `Expired` after the nomination was made; the seat can no
+    ///   longer be claimed.
     pub fn claim_arbiter(env: Env, nominee: Address, engagement_id: String) {
         Self::assert_not_paused(&env);
         nominee.require_auth();
@@ -1841,6 +2002,10 @@ impl HireSettleContract {
         }
 
         let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
+
+        if Self::is_terminal_status(&engagement.status) {
+            panic!("engagement is in a terminal state");
+        }
 
         // Replace the nominating arbiter's slot with the nominee.
         for i in 0..engagement.arbiters.len() {
@@ -2290,12 +2455,19 @@ impl HireSettleContract {
             panic!("unauthorized");
         }
 
+        let old_engagement_status = engagement.status.clone();
         engagement.status = EngagementStatus::ExitRequested;
         engagement.last_activity_ledger = env.ledger().sequence();
         env.storage()
             .persistent()
             .set(&DataKey::Engagement(engagement_id.clone()), &engagement);
         Self::extend_engagement_ttl(&env, &engagement_id);
+        Self::emit_engagement_status_changed(
+            &env,
+            &engagement_id,
+            old_engagement_status,
+            engagement.status.clone(),
+        );
 
         env.events().publish(
             (
@@ -2351,12 +2523,19 @@ impl HireSettleContract {
             );
         }
 
+        let old_engagement_status = engagement.status.clone();
         engagement.status = EngagementStatus::Cancelled;
         engagement.last_activity_ledger = env.ledger().sequence();
         env.storage()
             .persistent()
             .set(&DataKey::Engagement(engagement_id.clone()), &engagement);
         Self::extend_engagement_ttl(&env, &engagement_id);
+        Self::emit_engagement_status_changed(
+            &env,
+            &engagement_id,
+            old_engagement_status,
+            engagement.status.clone(),
+        );
 
         Self::decrement_company_active_count(&env, &engagement.company);
 
@@ -2402,12 +2581,19 @@ impl HireSettleContract {
             panic!("unauthorized");
         }
 
+        let old_engagement_status = engagement.status.clone();
         engagement.status = EngagementStatus::Active;
         engagement.last_activity_ledger = env.ledger().sequence();
         env.storage()
             .persistent()
             .set(&DataKey::Engagement(engagement_id.clone()), &engagement);
         Self::extend_engagement_ttl(&env, &engagement_id);
+        Self::emit_engagement_status_changed(
+            &env,
+            &engagement_id,
+            old_engagement_status,
+            engagement.status.clone(),
+        );
 
         env.events().publish(
             (
@@ -2504,6 +2690,12 @@ impl HireSettleContract {
     // ----------------------------------------------------------
 
     /// Admin sets the maximum retention days cap.
+    ///
+    /// This cap is enforced only at `create_engagement` time. Lowering it has
+    /// no effect on existing engagements whose retention windows already
+    /// exceed the new cap — their lifecycle (`unlock_milestone`,
+    /// `propose_amendment`, etc.) re-reads stored per-engagement values, not
+    /// this config.
     pub fn set_max_retention_days(env: Env, admin: Address, days: u32) {
         Self::assert_admin(&env, &admin);
         env.storage()
@@ -2526,6 +2718,12 @@ impl HireSettleContract {
     // ----------------------------------------------------------
 
     /// Admin sets the maximum milestone count cap.
+    ///
+    /// This cap is enforced only at `create_engagement` time. Lowering it has
+    /// no effect on existing engagements that already have more milestones
+    /// than the new cap — their lifecycle (`unlock_milestone`,
+    /// `propose_amendment`, etc.) operates on the stored milestone list, not
+    /// this config.
     pub fn set_max_milestones(env: Env, admin: Address, count: u32) {
         Self::assert_admin(&env, &admin);
         env.storage()
@@ -2663,10 +2861,17 @@ impl HireSettleContract {
             );
         }
 
+        let old_engagement_status = engagement.status.clone();
         engagement.status = EngagementStatus::Expired;
         env.storage()
             .persistent()
             .set(&DataKey::Engagement(engagement_id.clone()), &engagement);
+        Self::emit_engagement_status_changed(
+            &env,
+            &engagement_id,
+            old_engagement_status,
+            engagement.status.clone(),
+        );
 
         Self::decrement_company_active_count(&env, &engagement.company);
 
@@ -2709,6 +2914,38 @@ impl HireSettleContract {
             100_000,
             extend_to,
         );
+    }
+
+    fn emit_milestone_status_changed(
+        env: &Env,
+        engagement_id: &String,
+        milestone_index: u32,
+        old_status: MilestoneStatus,
+        new_status: MilestoneStatus,
+    ) {
+        if old_status != new_status {
+            env.events().publish(
+                (
+                    Symbol::new(env, "milestone_status_changed"),
+                    engagement_id.clone(),
+                ),
+                (milestone_index, old_status, new_status),
+            );
+        }
+    }
+
+    fn emit_engagement_status_changed(
+        env: &Env,
+        engagement_id: &String,
+        old_status: EngagementStatus,
+        new_status: EngagementStatus,
+    ) {
+        if old_status != new_status {
+            env.events().publish(
+                (Symbol::new(env, "status_changed"), engagement_id.clone()),
+                (old_status, new_status),
+            );
+        }
     }
 
     // ----------------------------------------------------------
@@ -2825,8 +3062,17 @@ impl HireSettleContract {
             }
             Self::distribute_recruiter_payout(&env, &engagement, net_payment, &token_client);
 
+            let old_status = m.status.clone();
             m.status = MilestoneStatus::Confirmed;
             engagement.milestones.set(idx, m);
+
+            Self::emit_milestone_status_changed(
+                &env,
+                &engagement_id,
+                idx,
+                old_status,
+                MilestoneStatus::Confirmed,
+            );
 
             env.events().publish(
                 (
@@ -2842,6 +3088,7 @@ impl HireSettleContract {
             s == MilestoneStatus::Confirmed || s == MilestoneStatus::Resolved
         });
 
+        let old_engagement_status = engagement.status.clone();
         if all_done {
             engagement.status = EngagementStatus::Completed;
             Self::decrement_company_active_count(&env, &engagement.company);
@@ -2852,6 +3099,12 @@ impl HireSettleContract {
             .persistent()
             .set(&DataKey::Engagement(engagement_id.clone()), &engagement);
         Self::extend_engagement_ttl(&env, &engagement_id);
+        Self::emit_engagement_status_changed(
+            &env,
+            &engagement_id,
+            old_engagement_status,
+            engagement.status.clone(),
+        );
 
         if all_done {
             env.events().publish(
@@ -2997,6 +3250,7 @@ impl HireSettleContract {
         }
         Self::distribute_recruiter_payout(&env, &engagement, net_payment, &token_client);
 
+        let old_status = milestone.status.clone();
         milestone.status = MilestoneStatus::Confirmed;
         engagement.milestones.set(milestone_index, milestone);
 
@@ -3005,6 +3259,7 @@ impl HireSettleContract {
             s == MilestoneStatus::Confirmed || s == MilestoneStatus::Resolved
         });
 
+        let old_engagement_status = engagement.status.clone();
         if all_done {
             engagement.status = EngagementStatus::Completed;
             Self::decrement_company_active_count(&env, &engagement.company);
@@ -3015,6 +3270,20 @@ impl HireSettleContract {
             .persistent()
             .set(&DataKey::Engagement(engagement_id.clone()), &engagement);
         Self::extend_engagement_ttl(&env, &engagement_id);
+        Self::emit_engagement_status_changed(
+            &env,
+            &engagement_id,
+            old_engagement_status,
+            engagement.status.clone(),
+        );
+
+        Self::emit_milestone_status_changed(
+            &env,
+            &engagement_id,
+            milestone_index,
+            old_status,
+            MilestoneStatus::Confirmed,
+        );
 
         env.events().publish(
             (
@@ -3209,6 +3478,25 @@ impl HireSettleContract {
         engagement.status == EngagementStatus::Completed
     }
 
+    /// Return the fraction of milestones that are unlocked (not in Locked status).
+    /// Returns `(unlocked_count, total_count)`.
+    /// - `unlocked_count` = number of milestones with status != Locked
+    /// - `total_count` = total number of milestones in the engagement
+    ///
+    /// Read-only and permissionless.
+    pub fn get_unlock_progress(env: Env, engagement_id: String) -> (u32, u32) {
+        let engagement = Self::get_engagement_internal(&env, &engagement_id);
+        let total = engagement.milestones.len();
+        let mut unlocked: u32 = 0;
+        for i in 0..total {
+            let m = engagement.milestones.get(i).unwrap();
+            if m.status != MilestoneStatus::Locked {
+                unlocked += 1;
+            }
+        }
+        (unlocked, total)
+    }
+
     // ----------------------------------------------------------
     // ISSUE #59 — ADMIN ROLE RENOUNCEMENT
     // ----------------------------------------------------------
@@ -3241,7 +3529,7 @@ impl HireSettleContract {
             .unwrap_or_else(|| panic!("engagement not found"))
     }
 
-    fn get_admin(env: &Env) -> Address {
+    fn get_admin_internal(env: &Env) -> Address {
         env.storage()
             .instance()
             .get(&DataKey::Admin)
@@ -3258,7 +3546,7 @@ impl HireSettleContract {
             panic!("NoAdmin");
         }
         admin.require_auth();
-        if *admin != Self::get_admin(env) {
+        if *admin != Self::get_admin_internal(env) {
             panic!("unauthorized");
         }
     }
@@ -3276,13 +3564,21 @@ impl HireSettleContract {
         }
     }
 
+    /// Terminal engagement states — no further state transitions are possible.
+    fn is_terminal_status(status: &EngagementStatus) -> bool {
+        matches!(
+            status,
+            EngagementStatus::Completed | EngagementStatus::Cancelled | EngagementStatus::Expired
+        )
+    }
+
     fn get_platform_fee_internal(env: &Env) -> PlatformFee {
         env.storage()
             .persistent()
             .get(&DataKey::PlatformFee)
             .unwrap_or_else(|| PlatformFee {
                 bps: 0,
-                treasury: Self::get_admin(env),
+                treasury: Self::get_admin_internal(env),
             })
     }
 
