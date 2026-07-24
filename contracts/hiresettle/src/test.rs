@@ -4370,3 +4370,46 @@ fn test_lowering_max_retention_days_does_not_break_existing_engagement() {
     assert_eq!(token_client.balance(&recruiter), 1_000_000_000);
     assert_eq!(client.get_engagement(&eng_id).status, EngagementStatus::Completed);
 }
+
+// ============================================================
+// #187 — query functions remain callable while paused
+// ============================================================
+
+/// Pausing the contract must not block reads. Sweep a representative sample of
+/// getters/predicates across engagement, admin, and config state and assert
+/// they all still succeed while paused.
+#[test]
+fn test_query_functions_callable_while_paused() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let eng_id = String::from_str(&env, "ENG-PAUSED-QUERY");
+    create_standard_engagement(&env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-PAUSED-QUERY");
+
+    client.pause(&company);
+    assert!(client.is_paused());
+
+    // Engagement-scoped queries.
+    let _ = client.get_engagement(&eng_id);
+    let _ = client.get_milestone(&eng_id, &0);
+    let _ = client.get_escrow_balance(&eng_id);
+    let _ = client.is_milestone_unlockable(&eng_id, &1);
+    let _ = client.get_engagement_summary(&eng_id);
+    let _ = client.get_total_released(&eng_id);
+    let _ = client.get_amendment_ttl();
+    let _ = client.get_pending_amendment(&eng_id, &0);
+
+    // Admin / global config queries.
+    let _ = client.get_admin();
+    let _ = client.get_pending_admin();
+    let _ = client.get_max_milestones();
+    let _ = client.get_max_retention_days();
+    let _ = client.get_max_active_per_company();
+    let _ = client.get_company_active_count(&company);
+    let _ = client.get_engagement_count();
+    let _ = client.get_version();
+    let _ = client.get_min_amount();
+    let _ = client.get_platform_fee();
+
+    // Still paused — confirms none of the above accidentally unpaused anything.
+    assert!(client.is_paused());
+}
