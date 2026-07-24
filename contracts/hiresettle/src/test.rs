@@ -4057,7 +4057,7 @@ fn test_cap_is_per_company_isolated() {
         &String::from_str(&env, "CTO"),
         &build_milestones(&env),
         &vec![&env, 30u32, 90u32],
-        &None,
+        &default_config(),
     );
 
     assert_eq!(client.get_company_active_count(&company), 1);
@@ -4098,7 +4098,7 @@ fn test_completion_frees_slot() {
         &String::from_str(&env, "Engineer"),
         &single_milestone,
         &vec![&env],
-        &None,
+        &default_config(),
     );
 
     // At cap now — a second create would fail.
@@ -4136,7 +4136,7 @@ fn test_completion_frees_slot() {
             },
         ],
         &vec![&env],
-        &None,
+        &default_config(),
     );
     assert_eq!(client.get_company_active_count(&company), 1);
 }
@@ -4207,7 +4207,7 @@ fn test_admin_decreasing_cap_blocks_new_while_over() {
         &String::from_str(&env, "Engineer"),
         &build_milestones(&env),
         &vec![&env, 30u32, 90u32],
-        &None,
+        &default_config(),
     );
     assert!(result.is_err());
 }
