@@ -180,6 +180,8 @@ pub struct Engagement {
     pub last_activity_ledger: u32,
     /// Ordered list of milestones; indices are stable and used throughout the contract API.
     pub milestones: Vec<Milestone>,
+    /// Current lifecycle state of the engagement; drives all state-machine transitions.
+    /// See [`EngagementStatus`] for the full list of variants and their semantics.
     pub status: EngagementStatus,
     /// Optional co-recruiter address for split-fee engagements (issue #56).
     /// When `Some`, the milestone payout is split between `recruiter` and `co_recruiter`
