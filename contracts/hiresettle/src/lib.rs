@@ -180,6 +180,9 @@ pub struct Engagement {
     /// Primary recruiter's share of the net payout in basis points (issue #56).
     /// Default is 10 000 (100 % to recruiter). Must be ≤ 10 000.
     pub recruiter_split_bps: u32,
+    /// Optional off-chain attestation hash (e.g. SHA-256 of the contract PDF).
+    /// Stored at engagement creation for audit and verification purposes.
+    pub contract_pdf_hash: Option<String>,
 }
 
 /// A lightweight read-only view of an engagement, suitable for list/dashboard APIs.
@@ -212,6 +215,8 @@ pub struct EngagementSummary {
     pub co_recruiter: Option<Address>,
     /// Primary recruiter's share of the net payout in basis points (issue #56).
     pub recruiter_split_bps: u32,
+    /// Optional off-chain attestation hash (e.g. SHA-256 of the contract PDF).
+    pub contract_pdf_hash: Option<String>,
 }
 
 /// Per-dispute, per-milestone vote tally stored on-chain until the dispute resolves.
@@ -292,6 +297,9 @@ pub struct EngagementConfig {
     /// If `co_recruiter` is `None` this field is ignored and the full payout goes to `recruiter`.
     /// Must be ≤ 10 000.
     pub recruiter_split_bps: u32,
+    /// Optional off-chain attestation hash (e.g. SHA-256 of the contract PDF).
+    /// Must be non-empty if provided.
+    pub contract_pdf_hash: Option<String>,
 }
 
 // ============================================================
@@ -713,6 +721,13 @@ impl HireSettleContract {
             }
         }
 
+        // Reject empty contract_pdf_hash — caller must either omit or provide a real hash.
+        if let Some(ref hash) = config.contract_pdf_hash {
+            if hash.len() == 0 {
+                panic!("InvalidContractPdfHash");
+            }
+        }
+
         // Issue #56: validate co-recruiter split basis points.
         if config.recruiter_split_bps > FULL_SPLIT_BPS {
             panic!("InvalidSplitBps");
@@ -786,6 +801,7 @@ impl HireSettleContract {
             status: EngagementStatus::Active,
             co_recruiter: config.co_recruiter,
             recruiter_split_bps: config.recruiter_split_bps,
+            contract_pdf_hash: config.contract_pdf_hash,
         };
 
         env.storage()
@@ -1686,7 +1702,15 @@ impl HireSettleContract {
             created_at_ledger: engagement.created_at_ledger,
             co_recruiter: engagement.co_recruiter,
             recruiter_split_bps: engagement.recruiter_split_bps,
+            contract_pdf_hash: engagement.contract_pdf_hash,
         }
+    }
+
+    /// Return the off-chain attestation hash (e.g. SHA-256 of the contract PDF)
+    /// stored at engagement creation, or None if not provided.
+    /// Read-only and permissionless.
+    pub fn get_contract_pdf_hash(env: Env, engagement_id: String) -> Option<String> {
+        Self::get_engagement_internal(&env, &engagement_id).contract_pdf_hash
     }
 
     // ----------------------------------------------------------
@@ -3031,6 +3055,25 @@ impl HireSettleContract {
     pub fn get_is_engagement_complete(env: Env, engagement_id: String) -> bool {
         let engagement = Self::get_engagement_internal(&env, &engagement_id);
         engagement.status == EngagementStatus::Completed
+    }
+
+    /// Return the fraction of milestones that are unlocked (not in Locked status).
+    /// Returns `(unlocked_count, total_count)`.
+    /// - `unlocked_count` = number of milestones with status != Locked
+    /// - `total_count` = total number of milestones in the engagement
+    ///
+    /// Read-only and permissionless.
+    pub fn get_unlock_progress(env: Env, engagement_id: String) -> (u32, u32) {
+        let engagement = Self::get_engagement_internal(&env, &engagement_id);
+        let total = engagement.milestones.len();
+        let mut unlocked: u32 = 0;
+        for i in 0..total {
+            let m = engagement.milestones.get(i).unwrap();
+            if m.status != MilestoneStatus::Locked {
+                unlocked += 1;
+            }
+        }
+        (unlocked, total)
     }
 
     // ----------------------------------------------------------
