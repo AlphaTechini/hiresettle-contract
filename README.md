@@ -231,6 +231,32 @@ Company requests a replacement when a candidate leaves. Requires Placement to be
 ### `cancel_engagement(company, engagement_id)`
 Cancels the engagement and refunds the full amount to the company. Only allowed before any milestones are confirmed.
 
+### Upgradability
+
+The contract supports admin-gated WASM upgrades behind a mandatory time-lock, so
+there's always a review window between an upgrade being proposed and it taking effect.
+
+#### `propose_upgrade(admin: Address, new_wasm_hash: BytesN<32>)`
+Admin proposes a new contract WASM hash. The upgrade becomes executable after the
+configured time-lock (`upgrade_lock_duration`, default **17,280 ledgers ≈ 1 day**)
+has elapsed. Only one proposal can be pending at a time — calling this again
+overwrites the existing proposal and resets its unlock ledger. Emits
+`upgrade_proposed` with `(new_wasm_hash, execute_after_ledger)`.
+
+#### `execute_upgrade()`
+Applies the pending upgrade. **Permissionless** — anyone can call this once the
+time-lock has elapsed; it doesn't require the admin's signature. Panics with
+`"no pending upgrade"` if nothing was proposed, or `"UpgradeLockNotElapsed"` if
+called before `execute_after_ledger`. Emits `upgrade_executed` and then swaps the
+contract's WASM via `update_current_contract_wasm`.
+
+#### `set_upgrade_lock_duration(admin: Address, ledgers: u32)`
+Admin sets how many ledgers must elapse between a proposal and its execution.
+Defaults to 17,280 (~1 day) if never called.
+
+#### `get_upgrade_lock_duration() → u32`
+Read-only. Returns the currently configured time-lock duration in ledgers.
+
 ### Read-only queries
 
 | Function | Returns |
