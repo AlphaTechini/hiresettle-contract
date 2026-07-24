@@ -3,6 +3,37 @@
 A [Soroban](https://soroban.stellar.org/) smart contract deployed on Stellar for managing recruitment fee settlements through milestone-based escrow payments. Built with `#![no_std]` Rust and the Soroban SDK.
 
 ---
+## Setup & Installation
+
+### Prerequisites
+
+Before getting started, ensure you have:
+
+- Rust (latest stable version)
+- Cargo
+- Soroban CLI
+- Stellar CLI
+- Git
+
+### Clone the Repository
+
+```bash
+git clone https://github.com/TrustHire/hiresettle-contract.git
+cd hiresettle-contract
+```
+
+### Build the Contract
+
+```bash
+cd contracts/hiresettle
+cargo build
+```
+
+### Run the Tests
+
+```bash
+cargo test
+```
 
 ## Overview
 
