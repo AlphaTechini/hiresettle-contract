@@ -1769,6 +1769,11 @@ impl HireSettleContract {
 
     /// Current arbiter nominates a successor. The successor must call `claim_arbiter`.
     /// Any arbiter in the engagement's arbiter list may initiate succession for their slot.
+    ///
+    /// # Panics
+    /// - `"engagement is in a terminal state"` — the engagement is `Completed`,
+    ///   `Cancelled`, or `Expired`. Arbiter succession has no practical function
+    ///   once an engagement can no longer be disputed.
     pub fn nominate_arbiter_successor(
         env: Env,
         arbiter: Address,
@@ -1779,6 +1784,10 @@ impl HireSettleContract {
         arbiter.require_auth();
 
         let engagement = Self::get_engagement_internal(&env, &engagement_id);
+
+        if Self::is_terminal_status(&engagement.status) {
+            panic!("engagement is in a terminal state");
+        }
 
         let is_arbiter =
             (0..engagement.arbiters.len()).any(|i| engagement.arbiters.get(i).unwrap() == arbiter);
@@ -1811,6 +1820,11 @@ impl HireSettleContract {
     }
 
     /// Nominated successor claims the arbiter slot, replacing the nominating arbiter.
+    ///
+    /// # Panics
+    /// - `"engagement is in a terminal state"` — the engagement reached `Completed`,
+    ///   `Cancelled`, or `Expired` after the nomination was made; the seat can no
+    ///   longer be claimed.
     pub fn claim_arbiter(env: Env, nominee: Address, engagement_id: String) {
         Self::assert_not_paused(&env);
         nominee.require_auth();
@@ -1826,6 +1840,10 @@ impl HireSettleContract {
         }
 
         let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
+
+        if Self::is_terminal_status(&engagement.status) {
+            panic!("engagement is in a terminal state");
+        }
 
         // Replace the nominating arbiter's slot with the nominee.
         for i in 0..engagement.arbiters.len() {
@@ -3220,6 +3238,14 @@ impl HireSettleContract {
         if Self::is_paused_internal(env) {
             panic!("ContractPaused");
         }
+    }
+
+    /// Terminal engagement states — no further state transitions are possible.
+    fn is_terminal_status(status: &EngagementStatus) -> bool {
+        matches!(
+            status,
+            EngagementStatus::Completed | EngagementStatus::Cancelled | EngagementStatus::Expired
+        )
     }
 
     fn get_platform_fee_internal(env: &Env) -> PlatformFee {

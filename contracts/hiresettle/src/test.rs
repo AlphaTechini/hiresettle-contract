@@ -4240,3 +4240,54 @@ fn test_get_admin_reflects_init_and_rotation() {
 
     assert_eq!(client.get_admin(), new_admin);
 }
+
+// ============================================================
+// #188 — stale arbiter nomination on terminal engagements
+// ============================================================
+
+/// Nominating a successor after the engagement is cancelled must be rejected —
+/// a terminal engagement has no active arbiter seat to hand off.
+#[test]
+#[should_panic(expected = "engagement is in a terminal state")]
+fn test_nominate_arbiter_after_cancel_rejected() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let eng_id = String::from_str(&env, "ENG-ARB-TERM-NOM");
+    create_standard_engagement(&env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-ARB-TERM-NOM");
+
+    client.cancel_engagement(&company, &recruiter, &eng_id);
+    assert_eq!(client.get_engagement(&eng_id).status, EngagementStatus::Cancelled);
+
+    let new_arbiter = Address::generate(&env);
+    client.nominate_arbiter_successor(&arbiter, &eng_id, &new_arbiter);
+}
+
+/// If a nomination was already pending and the engagement completes before the
+/// nominee claims, `claim_arbiter` must be rejected rather than silently
+/// installing an arbiter for an engagement that can no longer be disputed.
+#[test]
+#[should_panic(expected = "engagement is in a terminal state")]
+fn test_claim_arbiter_after_completion_rejected() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let eng_id = String::from_str(&env, "ENG-ARB-TERM-CLAIM");
+    create_standard_engagement(&env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-ARB-TERM-CLAIM");
+
+    let new_arbiter = Address::generate(&env);
+    client.nominate_arbiter_successor(&arbiter, &eng_id, &new_arbiter);
+
+    // Drive the engagement to completion while the nomination is still pending.
+    client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://offer-letter"));
+    client.confirm_milestone(&company, &eng_id, &0);
+    advance_ledger(&env, 31 * 17_280);
+    client.unlock_milestone(&eng_id, &1);
+    client.submit_proof(&recruiter, &eng_id, &1, &String::from_str(&env, "ipfs://30-day"));
+    client.confirm_milestone(&company, &eng_id, &1);
+    advance_ledger(&env, 60 * 17_280);
+    client.unlock_milestone(&eng_id, &2);
+    client.submit_proof(&recruiter, &eng_id, &2, &String::from_str(&env, "ipfs://90-day"));
+    client.confirm_milestone(&company, &eng_id, &2);
+    assert_eq!(client.get_engagement(&eng_id).status, EngagementStatus::Completed);
+
+    client.claim_arbiter(&new_arbiter, &eng_id);
+}
