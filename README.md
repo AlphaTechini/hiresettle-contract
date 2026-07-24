@@ -416,7 +416,7 @@ stellar contract invoke \
 - **Retention double-check**: `confirm_milestone()` re-verifies `valid_after_ledger` even if `unlock_milestone()` was called, preventing a company from confirming a retention milestone before the window truly ends.
 - **Replacement fee fairness**: The Placement tranche paid to the recruiter is non-refundable. Only unreleased amounts are frozen. This is explicit in the contract and documented clearly so both parties understand the terms at engagement creation.
 - **Ledger drift**: The 5s/ledger assumption is approximate. Stellar's actual ledger time may vary slightly. The contract uses ledger sequence numbers — not timestamps — so the unlock is purely count-based. Production deployments should account for ~±5% drift in real-world retention windows.
-- **No upgradability (MVP)**: This scaffold has no upgrade mechanism. Add Soroban's upgrade pattern before mainnet.
+- **Contract Upgrade Mechanism**: The contract supports WASM upgrades via `propose_upgrade` and `execute_upgrade` with a mandatory time-lock (`upgrade_lock_duration`, default 17,280 ledgers ≈ 1 day). The admin proposes a new WASM hash; after the time-lock elapses, anyone may call `execute_upgrade` to apply it. The time-lock duration is configurable via `set_upgrade_lock_duration`. This prevents immediate, non-transparent upgrades while allowing the contract to evolve. Note: upgrades depend on admin key custody — a compromised admin key could propose and execute a malicious upgrade after the time-lock window (addressable with a multisig admin or DAO governance).
 
 ---
 
@@ -430,7 +430,7 @@ stellar contract invoke \
 - [x] 11 unit tests
 - [ ] Multi-candidate engagements (multiple positions, one company-recruiter pair)
 - [ ] Partial payout on replacement (configurable replacement fee)
-- [ ] Contract upgrade mechanism
+- [x] Contract upgrade mechanism
 - [ ] Mainnet deployment
 
 ---
