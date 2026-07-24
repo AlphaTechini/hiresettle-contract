@@ -378,6 +378,10 @@ pub enum DataKey {
     ArbiterFee,
     /// Set to true once admin has permanently renounced their role (issue #59).
     AdminRenounced,
+    /// Admin-configurable maximum simultaneous active engagements per company (default 50).
+    MaxActivePerCompany,
+    /// Per-company count of currently active (non-terminal) engagements.
+    CompanyActiveCount(Address),
 }
 
 // ============================================================
@@ -403,6 +407,7 @@ const DEFAULT_DISPUTE_WINDOW_LEDGERS: u32 = 51_840; // ~3 days
 const MAX_VERSION_LENGTH: u32 = 32;
 const MAX_PROOF_HASH_LENGTH: u32 = 200;
 const MAX_ENGAGEMENT_ID_LENGTH: u32 = 64;
+const DEFAULT_MAX_ACTIVE_PER_COMPANY: u32 = 50;
 
 #[contractimpl]
 impl HireSettleContract {
@@ -410,6 +415,25 @@ impl HireSettleContract {
     // INIT
     // ----------------------------------------------------------
 
+    /// Initializes the HireSettle contract.
+    ///
+    /// # Caller
+    /// Called by the contract deployer or initial administrator (`admin`). Requires authentication from `admin`.
+    ///
+    /// # Initialized State
+    /// Sets up default contract storage values:
+    /// - `DataKey::Admin`: Set to `admin`
+    /// - `DataKey::Paused`: Set to `false`
+    /// - `DataKey::PlatformFee`: Set to 0 bps with treasury `admin`
+    /// - `DataKey::Version`: Set to `DEFAULT_VERSION` ("0.2.0")
+    /// - `DataKey::MinEngagementAmount`: Set to `DEFAULT_MIN_ENGAGEMENT_AMOUNT` (100,000 stroops)
+    ///
+    /// # One-Time-Only / Calling Twice
+    /// Note: No already-initialized guard is currently present. If invoked again, it will overwrite
+    /// all initialized storage fields provided `admin.require_auth()` succeeds.
+    ///
+    /// # Panics
+    /// Panics if authentication from `admin` (`admin.require_auth()`) fails.
     pub fn init(env: Env, admin: Address) {
         admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &admin);
@@ -749,6 +773,21 @@ impl HireSettleContract {
             panic!("engagement already exists");
         }
 
+        // Cap check: reject if the company is already at or over the active engagement limit.
+        let active_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CompanyActiveCount(company.clone()))
+            .unwrap_or(0u32);
+        let max_active: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaxActivePerCompany)
+            .unwrap_or(DEFAULT_MAX_ACTIVE_PER_COMPANY);
+        if active_count >= max_active {
+            panic!("CompanyActiveLimitReached");
+        }
+
         let current_ledger = env.ledger().sequence();
         let lpd = Self::get_ledgers_per_day_internal(&env);
         let max_retention_days = Self::get_max_retention_days(env.clone());
@@ -809,6 +848,17 @@ impl HireSettleContract {
             .set(&DataKey::Engagement(engagement_id.clone()), &engagement);
 
         Self::extend_engagement_ttl(&env, &engagement_id);
+
+        // Increment per-company active engagement count.
+        let new_active = active_count + 1;
+        env.storage()
+            .persistent()
+            .set(&DataKey::CompanyActiveCount(company.clone()), &new_active);
+        env.storage().persistent().extend_ttl(
+            &DataKey::CompanyActiveCount(company.clone()),
+            100_000,
+            6_300_000,
+        );
 
         // Issue #34: increment global engagement counter.
         let count: u64 = env
@@ -1094,6 +1144,7 @@ impl HireSettleContract {
 
         if all_done {
             engagement.status = EngagementStatus::Completed;
+            Self::decrement_company_active_count(&env, &engagement.company);
         }
         engagement.last_activity_ledger = env.ledger().sequence();
 
@@ -1291,6 +1342,7 @@ impl HireSettleContract {
             });
             if all_done {
                 engagement.status = EngagementStatus::Completed;
+                Self::decrement_company_active_count(&env, &engagement.company);
             }
 
             env.storage().persistent().remove(&vote_key);
@@ -1504,6 +1556,8 @@ impl HireSettleContract {
             .set(&DataKey::Engagement(engagement_id.clone()), &engagement);
         Self::extend_engagement_ttl(&env, &engagement_id);
 
+        Self::decrement_company_active_count(&env, &engagement.company);
+
         env.events().publish(
             (
                 Symbol::new(&env, "engagement_cancelled"),
@@ -1594,6 +1648,9 @@ impl HireSettleContract {
         engagement.total_amount - engagement.released_amount
     }
 
+    /// Returns `true` if the milestone is `Locked` and the current ledger
+    /// sequence is greater than or equal to its `valid_after_ledger`, meaning
+    /// it can currently be unlocked via `unlock_milestone`.
     pub fn is_milestone_unlockable(env: Env, engagement_id: String, milestone_index: u32) -> bool {
         let engagement = Self::get_engagement_internal(&env, &engagement_id);
         let milestone = engagement
@@ -1605,6 +1662,12 @@ impl HireSettleContract {
             && env.ledger().sequence() >= milestone.valid_after_ledger
     }
 
+    /// Returns the number of ledgers remaining until the milestone becomes
+    /// unlockable, or `0` if it is already unlockable.
+    ///
+    /// When the result is `0`, `unlock_milestone` can be called immediately.
+    /// Otherwise, the caller must wait at least this many more ledgers before
+    /// `env.ledger().sequence() >= milestone.valid_after_ledger` holds.
     pub fn ledgers_until_unlock(env: Env, engagement_id: String, milestone_index: u32) -> u32 {
         let engagement = Self::get_engagement_internal(&env, &engagement_id);
         let milestone = engagement
@@ -1676,6 +1739,12 @@ impl HireSettleContract {
         }
     }
 
+    /// Total amount released for this engagement, represented by
+    /// `Engagement.released_amount`.
+    ///
+    /// This is not the escrow balance. To get remaining contract funds,
+    /// use `total_amount - released_amount`; `get_escrow_balance` provides
+    /// that derived value.
     pub fn get_total_released(env: Env, engagement_id: String) -> i128 {
         Self::get_engagement_internal(&env, &engagement_id).released_amount
     }
@@ -2293,6 +2362,8 @@ impl HireSettleContract {
             .set(&DataKey::Engagement(engagement_id.clone()), &engagement);
         Self::extend_engagement_ttl(&env, &engagement_id);
 
+        Self::decrement_company_active_count(&env, &engagement.company);
+
         env.events().publish(
             (
                 Symbol::new(&env, "early_exit_accepted"),
@@ -2382,11 +2453,17 @@ impl HireSettleContract {
             .unwrap_or_else(|| Vec::new(&env));
 
         let total = ids.len();
-        let start = page * page_size;
-        if start >= total || page_size == 0 {
+        if page_size == 0 {
             return Vec::new(&env);
         }
-        let end = (start + page_size).min(total);
+        // Use saturating arithmetic so a huge `page` / `page_size` combination
+        // clamps to an out-of-range start (caught below) instead of wrapping
+        // around via u32 overflow.
+        let start = page.saturating_mul(page_size);
+        if start >= total {
+            return Vec::new(&env);
+        }
+        let end = start.saturating_add(page_size).min(total);
         let mut result = Vec::new(&env);
         for i in start..end {
             result.push_back(ids.get(i).unwrap());
@@ -2471,6 +2548,45 @@ impl HireSettleContract {
     }
 
     // ----------------------------------------------------------
+    // PER-COMPANY ACTIVE ENGAGEMENT CAP
+    // ----------------------------------------------------------
+
+    /// Admin sets the maximum number of simultaneously active engagements allowed
+    /// per company address. Defaults to 50 when not explicitly configured.
+    ///
+    /// # Panics
+    /// - `"unauthorized"` — caller is not the contract admin.
+    /// - `"InvalidMaxActivePerCompany"` — `count` is 0.
+    pub fn set_max_active_per_company(env: Env, admin: Address, count: u32) {
+        Self::assert_admin(&env, &admin);
+        if count == 0 {
+            panic!("InvalidMaxActivePerCompany");
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::MaxActivePerCompany, &count);
+        env.events()
+            .publish((Symbol::new(&env, "max_active_per_company_set"),), count);
+    }
+
+    /// Return the current per-company active engagement cap.
+    /// Returns `DEFAULT_MAX_ACTIVE_PER_COMPANY` (50) when not configured.
+    pub fn get_max_active_per_company(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MaxActivePerCompany)
+            .unwrap_or(DEFAULT_MAX_ACTIVE_PER_COMPANY)
+    }
+
+    /// Return the current active engagement count for a company.
+    pub fn get_company_active_count(env: Env, company: Address) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::CompanyActiveCount(company))
+            .unwrap_or(0u32)
+    }
+
+    // ----------------------------------------------------------
     // ISSUE #38 — INACTIVITY TIMEOUT
     // ----------------------------------------------------------
 
@@ -2543,6 +2659,8 @@ impl HireSettleContract {
         env.storage()
             .persistent()
             .set(&DataKey::Engagement(engagement_id.clone()), &engagement);
+
+        Self::decrement_company_active_count(&env, &engagement.company);
 
         env.events().publish(
             (
@@ -2705,6 +2823,7 @@ impl HireSettleContract {
 
         if all_done {
             engagement.status = EngagementStatus::Completed;
+            Self::decrement_company_active_count(&env, &engagement.company);
         }
         engagement.last_activity_ledger = env.ledger().sequence();
 
@@ -2867,6 +2986,7 @@ impl HireSettleContract {
 
         if all_done {
             engagement.status = EngagementStatus::Completed;
+            Self::decrement_company_active_count(&env, &engagement.company);
         }
         engagement.last_activity_ledger = env.ledger().sequence();
 

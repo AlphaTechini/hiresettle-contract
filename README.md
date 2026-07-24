@@ -148,6 +148,54 @@ HireSettleContract::submit_proof(env, recruiter, "engagement-1", 1, "ipfs://QmPr
 HireSettleContract::confirm_milestone(env, company, "engagement-1", 1);
 ```
 
+### Create a test engagement via CLI
+
+```bash
+stellar contract invoke \
+  --id <CONTRACT_ID> \
+  --source my-account \
+  --network testnet \
+  -- create_engagement \
+  --engagement_id "ENG-TEST-001" \
+  --company <COMPANY_ADDRESS> \
+  --recruiter <RECRUITER_ADDRESS> \
+  --arbiter_setup '{"arbiters":["<ARBITER_ADDRESS>"],"quorum":1}' \
+  --token <USDC_SAC_ADDRESS> \
+  --total_amount 5000000000 \
+  --job_title "Senior Engineer" \
+  --milestones '[...]' \
+  --retention_days '[30, 90]'
+```
+
+> USDC SAC on Testnet: `CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA`
+
+---
+
+## Security Considerations
+
+- **Authorization**: Every state-changing function calls `require_auth()`. Recruiters cannot confirm their own milestones. Companies cannot cast arbiter votes.
+- **Multi-arbiter quorum**: Disputes require M-of-N arbiter votes to resolve. A single arbiter cannot unilaterally release or withhold payment — both approval and rejection require a configurable quorum. Duplicate votes from the same arbiter are rejected on-chain.
+- **Arbiter fee cap**: The arbiter fee is capped at 200 bps (2%) to prevent excessive deduction from recruiter payouts on dispute approval.
+- **Retention double-check**: `confirm_milestone()` re-verifies `valid_after_ledger` even if `unlock_milestone()` was called, preventing a company from confirming a retention milestone before the window truly ends.
+- **Replacement fee fairness**: The Placement tranche paid to the recruiter is non-refundable. Only unreleased amounts are frozen. This is explicit in the contract and documented clearly so both parties understand the terms at engagement creation.
+- **Ledger drift**: The 5s/ledger assumption is approximate. Stellar's actual ledger time may vary slightly. The contract uses ledger sequence numbers — not timestamps — so the unlock is purely count-based. Production deployments should account for ~±5% drift in real-world retention windows.
+- **Upgrade time-lock**: Contract upgrades require a configurable time-lock (default 17,280 ledgers ≈ 1 day) between proposal and execution, giving stakeholders time to review before changes take effect.
+
+---
+
+## Roadmap
+
+- [x] Core escrow + milestone logic
+- [x] Time-gated retention milestones (ledger-based unlock)
+- [x] Replacement clause with clock reset
+- [x] Dispute resolution via arbiter
+- [x] Flexible milestone structure (2-milestone 50/50, 3-milestone, custom)
+- [x] 11 unit tests
+- [ ] Multi-candidate engagements (multiple positions, one company-recruiter pair)
+- [ ] Partial payout on replacement (configurable replacement fee)
+- [x] Contract upgrade mechanism
+- [ ] Mainnet deployment
+
 ---
 
 ## License
