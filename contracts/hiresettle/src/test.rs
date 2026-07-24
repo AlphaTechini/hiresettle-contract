@@ -4359,3 +4359,59 @@ fn test_batch_confirm_in_order_matches_single_confirm_semantics() {
     assert_eq!(eng.status, EngagementStatus::Completed);
     assert_eq!(token_client.balance(&recruiter), 1_000_000_000);
 }
+
+// ============================================================
+// ISSUE #185 — propose_upgrade repeated calls / timelock behaviour
+// ============================================================
+
+/// Re-proposing an upgrade while a previous proposal is still pending resets the
+/// timelock countdown (execute_after_ledger is recomputed from the current ledger).
+/// This is the documented, intended behaviour — see the doc comment on propose_upgrade.
+#[test]
+fn test_repeated_propose_upgrade_resets_timelock() {
+    let (env, contract_id, _token_id, company, _recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    let hash_a = BytesN::from_array(&env, &[1u8; 32]);
+    let hash_b = BytesN::from_array(&env, &[2u8; 32]);
+
+    let lock_duration = client.get_upgrade_lock_duration();
+
+    client.propose_upgrade(&company, &hash_a);
+    let first_execute_after = env.ledger().sequence() + lock_duration;
+
+    // Advance partway through the lock window, then re-propose with a new hash.
+    advance_ledger(&env, lock_duration / 2);
+    client.propose_upgrade(&company, &hash_b);
+    let second_execute_after = env.ledger().sequence() + lock_duration;
+
+    assert!(second_execute_after > first_execute_after);
+
+    // Executing before the *new* window elapses must still fail.
+    advance_ledger(&env, lock_duration / 2);
+    let result = client.try_execute_upgrade();
+    assert!(result.is_err());
+}
+
+/// The upgrade proposal is fully overwritten on re-propose: executing at a ledger
+/// past the *first* proposal's window (but before the *second* proposal's window)
+/// must still fail, proving the stored timelock is the second proposal's, not the first's.
+#[test]
+#[should_panic(expected = "UpgradeLockNotElapsed")]
+fn test_repeated_propose_upgrade_overwrites_pending_hash() {
+    let (env, contract_id, _token_id, company, _recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    let hash_a = BytesN::from_array(&env, &[1u8; 32]);
+    let hash_b = BytesN::from_array(&env, &[2u8; 32]);
+    let lock_duration = client.get_upgrade_lock_duration();
+
+    client.propose_upgrade(&company, &hash_a);
+    advance_ledger(&env, lock_duration / 2);
+    client.propose_upgrade(&company, &hash_b);
+
+    // Only the remaining half of the *original* window has elapsed since the
+    // re-propose — the first proposal's window is over, but the second's is not.
+    advance_ledger(&env, lock_duration / 2 + 1);
+    client.execute_upgrade();
+}

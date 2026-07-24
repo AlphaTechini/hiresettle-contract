@@ -3044,6 +3044,17 @@ impl HireSettleContract {
     /// The pending upgrade is stored and becomes executable after `lock_duration` ledgers.
     /// Default time-lock is 17,280 ledgers (~1 day); use `set_upgrade_lock_duration` to change it.
     /// Emits `upgrade_proposed` with `(new_wasm_hash, execute_after_ledger)`.
+    ///
+    /// # Repeated calls (issue #185)
+    /// Calling `propose_upgrade` again while a previous proposal is still pending
+    /// **overwrites** it and **resets the timelock countdown** — the new
+    /// `execute_after_ledger` is computed from the current ledger, not the
+    /// original proposal's. This is intentional: it lets the admin correct or
+    /// retract a bad proposal (e.g. wrong wasm hash) without waiting out the
+    /// original lock. The tradeoff is that a compromised admin key can grief
+    /// legitimate upgrades by indefinitely re-proposing, or delay execution by
+    /// repeatedly re-proposing the same hash — this is accepted as inherent to
+    /// admin-key trust and is not separately mitigated here.
     pub fn propose_upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) {
         Self::assert_admin(&env, &admin);
 
