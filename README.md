@@ -440,7 +440,7 @@ stellar contract invoke \
 - [x] 11 unit tests
 - [ ] Multi-candidate engagements (multiple positions, one company-recruiter pair)
 - [ ] Partial payout on replacement (configurable replacement fee)
-- [ ] Contract upgrade mechanism
+- [x] Contract upgrade mechanism
 - [ ] Mainnet deployment
 
 ---

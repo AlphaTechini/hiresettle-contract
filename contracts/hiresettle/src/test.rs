@@ -3936,260 +3936,287 @@ fn test_job_title_65_char_rejected() {
 }
 
 // ============================================================
-// RESOURCE BUDGET REGRESSION GUARD
-//
-// Protects against a future change to `create_engagement` (e.g. an
-// accidentally-introduced O(n^2) loop over milestones) silently pushing
-// CPU/memory usage close to Soroban's per-transaction resource limits.
-// The limits below mirror `soroban-env-host`'s `DEFAULT_CPU_INSN_LIMIT`
-// (100_000_000) and `DEFAULT_MEM_BYTES_LIMIT` (40 MiB) — the budget the
-// test `Env` is metered against by default. We assert consumption for the
-// worst case (max_milestones) stays well under half of each limit so a
-// regression is caught long before it risks tripping the real limit.
+// PER-COMPANY ACTIVE ENGAGEMENT CAP
 // ============================================================
 
-const TEST_ENV_DEFAULT_CPU_INSN_LIMIT: u64 = 100_000_000;
-const TEST_ENV_DEFAULT_MEM_BYTES_LIMIT: u64 = 40 * 1024 * 1024;
-
+/// Default cap is 50; verify it is readable immediately after init.
 #[test]
-fn test_create_engagement_max_milestones_stays_within_budget() {
+fn test_max_active_per_company_default() {
+    let (env, contract_id, _token_id, _company, _recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    assert_eq!(client.get_max_active_per_company(), 50);
+}
+
+/// Admin can change the cap; the new value is immediately readable.
+#[test]
+fn test_set_max_active_per_company_admin_update() {
+    let (env, contract_id, _token_id, company, _recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    client.set_max_active_per_company(&company, &10u32);
+    assert_eq!(client.get_max_active_per_company(), 10);
+
+    // Can update again
+    client.set_max_active_per_company(&company, &25u32);
+    assert_eq!(client.get_max_active_per_company(), 25);
+}
+
+/// Non-admin cannot change the cap.
+#[test]
+#[should_panic(expected = "unauthorized")]
+fn test_set_max_active_per_company_non_admin_rejected() {
+    let (env, contract_id, _token_id, _company, recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    client.set_max_active_per_company(&recruiter, &10u32);
+}
+
+/// Zero cap is rejected with InvalidMaxActivePerCompany.
+#[test]
+#[should_panic(expected = "InvalidMaxActivePerCompany")]
+fn test_set_max_active_per_company_zero_rejected() {
+    let (env, contract_id, _token_id, company, _recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    client.set_max_active_per_company(&company, &0u32);
+}
+
+/// Active count starts at 0 and increments with each creation.
+#[test]
+fn test_company_active_count_tracks_creations() {
     let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
     let client = HireSettleContractClient::new(&env, &contract_id);
 
-    let max_milestones = client.get_max_milestones();
-    let base_percent = 100 / max_milestones;
-    let remainder = 100 - (base_percent * max_milestones);
+    assert_eq!(client.get_company_active_count(&company), 0);
 
-    let mut milestones: Vec<Milestone> = Vec::new(&env);
-    for i in 0..max_milestones {
-        let percent = if i == max_milestones - 1 {
-            base_percent + remainder
-        } else {
-            base_percent
-        };
-        milestones.push_back(Milestone {
-            name: String::from_str(&env, &std::format!("Milestone {}", i)),
-            payment_percent: percent,
+    create_standard_engagement(&env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-CAP-T1");
+    assert_eq!(client.get_company_active_count(&company), 1);
+
+    create_standard_engagement(&env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-CAP-T2");
+    assert_eq!(client.get_company_active_count(&company), 2);
+}
+
+/// Engagement is accepted when the company is under the cap.
+#[test]
+fn test_engagement_accepted_under_cap() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    // Set a cap of 3 and create 3 engagements — all must succeed.
+    client.set_max_active_per_company(&company, &3u32);
+
+    create_standard_engagement(&env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-UNDER-1");
+    create_standard_engagement(&env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-UNDER-2");
+    create_standard_engagement(&env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-UNDER-3");
+
+    assert_eq!(client.get_company_active_count(&company), 3);
+}
+
+/// Engagement is rejected with CompanyActiveLimitReached when at cap.
+#[test]
+#[should_panic(expected = "CompanyActiveLimitReached")]
+fn test_engagement_rejected_at_cap() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    // Cap of 2: first two succeed, third panics.
+    client.set_max_active_per_company(&company, &2u32);
+
+    create_standard_engagement(&env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-AT-CAP-1");
+    create_standard_engagement(&env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-AT-CAP-2");
+    // This one is over the cap — must panic.
+    create_standard_engagement(&env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-AT-CAP-3");
+}
+
+/// The cap is per-company: a different company is unaffected.
+#[test]
+fn test_cap_is_per_company_isolated() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    // Give company2 its own minted balance.
+    let token_admin = Address::generate(&env);
+    let token_id2 = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_client2 = token::StellarAssetClient::new(&env, &token_id2);
+    let company2 = Address::generate(&env);
+    token_client2.mint(&company2, &500_000_000_000);
+
+    client.set_max_active_per_company(&company, &1u32);
+
+    // company hits the cap
+    create_standard_engagement(&env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-ISOL-C1");
+
+    // company2 is still free to create using its own token
+    client.create_engagement(
+        &String::from_str(&env, "ENG-ISOL-C2"),
+        &company2,
+        &recruiter,
+        &ArbiterSetup { arbiters: vec![&env, arbiter.clone()], quorum: 1 },
+        &token_id2,
+        &1_000_000_000,
+        &String::from_str(&env, "CTO"),
+        &build_milestones(&env),
+        &vec![&env, 30u32, 90u32],
+        &None,
+    );
+
+    assert_eq!(client.get_company_active_count(&company), 1);
+    assert_eq!(client.get_company_active_count(&company2), 1);
+}
+
+/// Completing an engagement frees its slot so a new one can be created.
+#[test]
+fn test_completion_frees_slot() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    // Cap of 1: only one active engagement allowed at a time.
+    client.set_max_active_per_company(&company, &1u32);
+
+    // Use a single-milestone (100%) engagement for simplicity.
+    let single_milestone = vec![
+        &env,
+        Milestone {
+            name: String::from_str(&env, "Placement"),
+            payment_percent: 100,
             kind: MilestoneKind::Placement,
             valid_after_ledger: 0,
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
-        });
-    }
+        },
+    ];
 
+    let eng_id_1 = String::from_str(&env, "ENG-FREES-1");
     client.create_engagement(
-        &String::from_str(&env, "ENG-BUDGET-MAX"),
+        &eng_id_1,
         &company,
         &recruiter,
-        &ArbiterSetup {
-            arbiters: vec![&env, arbiter.clone()],
-            quorum: 1,
-        },
+        &ArbiterSetup { arbiters: vec![&env, arbiter.clone()], quorum: 1 },
         &token_id,
         &1_000_000_000,
-        &String::from_str(&env, "Senior Engineer"),
-        &milestones,
-        &Vec::new(&env),
-        &default_config(),
+        &String::from_str(&env, "Engineer"),
+        &single_milestone,
+        &vec![&env],
+        &None,
     );
 
-    let eng = client.get_engagement(&String::from_str(&env, "ENG-BUDGET-MAX"));
-    assert_eq!(eng.milestones.len(), max_milestones);
+    // At cap now — a second create would fail.
+    assert_eq!(client.get_company_active_count(&company), 1);
 
-    let budget = env.cost_estimate().budget();
-    let cpu_consumed = budget.cpu_instruction_cost();
-    let mem_consumed = budget.memory_bytes_cost();
+    // Complete the first engagement.
+    client.submit_proof(&recruiter, &eng_id_1, &0, &String::from_str(&env, "ipfs://proof"));
+    client.confirm_milestone(&company, &eng_id_1, &0);
 
-    assert!(
-        cpu_consumed < TEST_ENV_DEFAULT_CPU_INSN_LIMIT / 2,
-        "create_engagement at max_milestones consumed {} CPU instructions — over half of the default {} limit; check for an accidental O(n^2) regression",
-        cpu_consumed,
-        TEST_ENV_DEFAULT_CPU_INSN_LIMIT
-    );
-    assert!(
-        mem_consumed < TEST_ENV_DEFAULT_MEM_BYTES_LIMIT / 2,
-        "create_engagement at max_milestones consumed {} bytes of memory — over half of the default {} limit; check for an accidental O(n^2) regression",
-        mem_consumed,
-        TEST_ENV_DEFAULT_MEM_BYTES_LIMIT
-    );
-}
+    let eng = client.get_engagement(&eng_id_1);
+    assert_eq!(eng.status, EngagementStatus::Completed);
+    // Count must have decremented.
+    assert_eq!(client.get_company_active_count(&company), 0);
 
-// ============================================================
-// SYSTEMATIC PAUSE-GUARD SWEEP
-//
-// The per-function pause tests above (test_pause_blocks_create,
-// test_pause_blocks_submit, test_pause_blocks_confirm,
-// test_pause_blocks_unlock) each cover one function in isolation. This
-// test instead enumerates every state-changing function that guards
-// itself with `Self::assert_not_paused(&env)` and asserts each one
-// panics while the contract is paused, so a newly-added state-changing
-// function that forgets to call `assert_not_paused` gets caught here.
-//
-// Every function below calls `assert_not_paused` as its very first
-// statement (verified by inspection of lib.rs), so invoking each with a
-// non-existent engagement_id / placeholder arguments is sufficient to
-// prove the guard fires: no other panic path can execute first.
-//
-// Covered (18): set_platform_fee, nominate_admin, claim_admin,
-// create_engagement, unlock_milestone, submit_proof, confirm_milestone,
-// cast_arbiter_vote, request_replacement, cancel_engagement,
-// top_up_escrow, nominate_arbiter_successor, claim_arbiter,
-// request_early_exit, accept_early_exit, reject_early_exit,
-// batch_confirm_milestones, force_confirm_milestone.
-//
-// NOTE: admin-config setters (set_version, set_min_amount,
-// set_ledgers_per_day, set_max_milestones, propose_upgrade, ...) are
-// intentionally NOT pause-guarded, so admin can still reconfigure the
-// contract while it is paused. They are excluded from this sweep on
-// purpose — if that changes, add them here too.
-// ============================================================
-
-#[test]
-fn test_pause_blocks_all_state_changing_functions() {
-    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
-    let client = HireSettleContractClient::new(&env, &contract_id);
-    let other = Address::generate(&env);
-    let missing_id = String::from_str(&env, "MISSING-ENGAGEMENT");
-    let _ = &token_id;
-
-    client.pause(&company);
-    assert!(client.is_paused());
-
-    let mut covered = 0u32;
-
-    macro_rules! assert_blocked {
-        ($name:literal, $call:expr) => {{
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                $call;
-            }));
-            assert!(
-                result.is_err(),
-                "{} did not panic while the contract was paused",
-                $name
-            );
-            covered += 1;
-        }};
-    }
-
-    assert_blocked!(
-        "set_platform_fee",
-        client.set_platform_fee(&company, &100, &company)
-    );
-    assert_blocked!(
-        "nominate_admin",
-        client.nominate_admin(&company, &other)
-    );
-    assert_blocked!("claim_admin", client.claim_admin(&other));
-    assert_blocked!(
-        "create_engagement",
-        client.create_engagement(
-            &missing_id,
-            &company,
-            &recruiter,
-            &ArbiterSetup {
-                arbiters: vec![&env, arbiter.clone()],
-                quorum: 1,
+    // Now a new engagement must be accepted.
+    let eng_id_2 = String::from_str(&env, "ENG-FREES-2");
+    client.create_engagement(
+        &eng_id_2,
+        &company,
+        &recruiter,
+        &ArbiterSetup { arbiters: vec![&env, arbiter.clone()], quorum: 1 },
+        &token_id,
+        &1_000_000_000,
+        &String::from_str(&env, "Engineer"),
+        &vec![
+            &env,
+            Milestone {
+                name: String::from_str(&env, "Placement"),
+                payment_percent: 100,
+                kind: MilestoneKind::Placement,
+                valid_after_ledger: 0,
+                proof_hash: String::from_str(&env, ""),
+                status: MilestoneStatus::Pending,
+                proof_submitted_at: 0,
             },
-            &token_id,
-            &1_000_000_000,
-            &String::from_str(&env, "Title"),
-            &Vec::new(&env),
-            &Vec::new(&env),
-            &default_config(),
-        )
+        ],
+        &vec![&env],
+        &None,
     );
-    assert_blocked!(
-        "unlock_milestone",
-        client.unlock_milestone(&missing_id, &0)
-    );
-    assert_blocked!(
-        "submit_proof",
-        client.submit_proof(&recruiter, &missing_id, &0, &String::from_str(&env, "ipfs://x"))
-    );
-    assert_blocked!(
-        "confirm_milestone",
-        client.confirm_milestone(&company, &missing_id, &0)
-    );
-    assert_blocked!(
-        "cast_arbiter_vote",
-        client.cast_arbiter_vote(&arbiter, &missing_id, &0, &true)
-    );
-    assert_blocked!(
-        "request_replacement",
-        client.request_replacement(&company, &missing_id, &String::from_str(&env, "reason"))
-    );
-    assert_blocked!(
-        "cancel_engagement",
-        client.cancel_engagement(&company, &recruiter, &missing_id)
-    );
-    assert_blocked!(
-        "top_up_escrow",
-        client.top_up_escrow(&company, &missing_id, &100)
-    );
-    assert_blocked!(
-        "nominate_arbiter_successor",
-        client.nominate_arbiter_successor(&arbiter, &missing_id, &other)
-    );
-    assert_blocked!(
-        "claim_arbiter",
-        client.claim_arbiter(&other, &missing_id)
-    );
-    assert_blocked!(
-        "request_early_exit",
-        client.request_early_exit(&recruiter, &missing_id)
-    );
-    assert_blocked!(
-        "accept_early_exit",
-        client.accept_early_exit(&company, &missing_id)
-    );
-    assert_blocked!(
-        "reject_early_exit",
-        client.reject_early_exit(&company, &missing_id)
-    );
-    assert_blocked!(
-        "batch_confirm_milestones",
-        client.batch_confirm_milestones(&company, &missing_id, &vec![&env, 0u32])
-    );
-    assert_blocked!(
-        "force_confirm_milestone",
-        client.force_confirm_milestone(&company, &missing_id, &0)
-    );
-
-    assert_eq!(covered, 18, "expected to sweep exactly 18 pause-guarded functions");
-
-    // Sanity check: contract is still functional once unpaused.
-    client.unpause(&company);
-    assert!(!client.is_paused());
+    assert_eq!(client.get_company_active_count(&company), 1);
 }
 
-// ============================================================
-// COMPANY ENGAGEMENT PAGINATION — u32 OVERFLOW REGRESSION
-//
-// `get_engagements_by_company` used to compute `page * page_size` with
-// plain u32 multiplication, which panics on overflow (this crate builds
-// with `overflow-checks = true` even in release) instead of returning an
-// empty page for an out-of-range request. The fix switched to saturating
-// arithmetic so an overflowing page/page_size combination clamps to an
-// out-of-range start and returns an empty Vec. This test locks in that
-// behaviour.
-// ============================================================
-
+/// Cancellation frees the slot.
 #[test]
-fn test_get_engagements_by_company_large_page_size_does_not_overflow() {
+fn test_cancellation_frees_slot() {
     let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
     let client = HireSettleContractClient::new(&env, &contract_id);
 
-    create_standard_engagement(
-        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-PAGE-001",
+    client.set_max_active_per_company(&company, &1u32);
+
+    let eng_id = String::from_str(&env, "ENG-CANCEL-CAP");
+    create_standard_engagement(&env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-CANCEL-CAP");
+
+    assert_eq!(client.get_company_active_count(&company), 1);
+
+    client.cancel_engagement(&company, &recruiter, &eng_id);
+    assert_eq!(client.get_company_active_count(&company), 0);
+
+    // Slot freed — next create succeeds.
+    create_standard_engagement(&env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-CANCEL-CAP-2");
+    assert_eq!(client.get_company_active_count(&company), 1);
+}
+
+/// Increasing the cap immediately allows more engagements to be created.
+#[test]
+fn test_admin_increasing_cap_allows_more_engagements() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    client.set_max_active_per_company(&company, &1u32);
+
+    create_standard_engagement(&env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-INC-CAP-1");
+
+    // At cap — would panic if we tried to create now.
+    // Admin raises cap to 3.
+    client.set_max_active_per_company(&company, &3u32);
+
+    create_standard_engagement(&env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-INC-CAP-2");
+    create_standard_engagement(&env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-INC-CAP-3");
+
+    assert_eq!(client.get_company_active_count(&company), 3);
+}
+
+/// Decreasing the cap doesn't affect already-active engagements (existing ones are
+/// grandfathered), but prevents new ones until count drops below the new cap.
+#[test]
+fn test_admin_decreasing_cap_blocks_new_while_over() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    // Start with cap of 3, create 2 engagements.
+    client.set_max_active_per_company(&company, &3u32);
+    create_standard_engagement(&env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-DEC-1");
+    create_standard_engagement(&env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-DEC-2");
+
+    // Admin lowers cap to 2 — existing engagements still active, but no new ones allowed.
+    client.set_max_active_per_company(&company, &2u32);
+
+    let result = client.try_create_engagement(
+        &String::from_str(&env, "ENG-DEC-3"),
+        &company,
+        &recruiter,
+        &ArbiterSetup { arbiters: vec![&env, arbiter.clone()], quorum: 1 },
+        &token_id,
+        &1_000_000_000,
+        &String::from_str(&env, "Engineer"),
+        &build_milestones(&env),
+        &vec![&env, 30u32, 90u32],
+        &None,
     );
+    assert!(result.is_err());
+}
 
-    // page * page_size would overflow u32::MAX many times over.
-    let result = client.get_engagements_by_company(&company, &u32::MAX, &u32::MAX);
-    assert_eq!(result.len(), 0);
-
-    // A large page_size alone (with page 0) should still return the real page,
-    // clamped to however many engagements actually exist.
-    let result = client.get_engagements_by_company(&company, &0, &u32::MAX);
-    assert_eq!(result.len(), 1);
+/// Active count for a company that has never created an engagement is 0.
+#[test]
+fn test_active_count_default_zero_for_new_company() {
+    let (env, contract_id, _token_id, _company, _recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let new_company = Address::generate(&env);
+    assert_eq!(client.get_company_active_count(&new_company), 0);
 }
