@@ -298,14 +298,21 @@ pub struct EngagementConfig {
 // STORAGE KEYS
 // ============================================================
 
+/// Contract storage key space. Instance keys reset between transactions;
+/// persistent keys survive across ledgers.
 #[contracttype]
 pub enum DataKey {
+    /// Full engagement record stored by engagement_id (persistent).
     Engagement(String),
+    /// Current admin address (instance).
     Admin,
     /// Pending arbiter succession nomination for an engagement.
     PendingArbiter(String),
+    /// Platform fee configuration — basis points and treasury address (persistent).
     PlatformFee,
+    /// Whether the contract is currently paused (persistent).
     Paused,
+    /// Pending admin transfer nomination address (persistent).
     PendingAdmin,
     /// Admin-configurable proof resubmission cooldown in ledgers (default 2 880).
     ProofCooldown,
@@ -313,8 +320,11 @@ pub enum DataKey {
     LastProofAt(String, u32),
     /// Running vote tally for a disputed (engagement_id, milestone_index).
     ArbiterVotes(String, u32),
+    /// Active amendment proposal for an engagement milestone (persistent).
     AmendmentProposal(String, u32),
+    /// Amendment log entries for an engagement milestone (persistent).
     AmendmentLog(String, u32),
+    /// Admin-configurable TTL extension for amendment proposals (persistent).
     AmendmentTTL,
     /// Total number of engagements ever created (issue #34).
     EngagementCount,
