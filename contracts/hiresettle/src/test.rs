@@ -849,6 +849,94 @@ fn test_old_arbiter_retains_role_until_claim() {
     assert_eq!(eng.arbiters.get(0).unwrap(), new_arbiter);
 }
 
+/// Issue #178: succeeding an arbiter mid-vote must not let the successor cast
+/// a second vote for the same seat on a dispute the predecessor already voted on.
+#[test]
+#[should_panic(expected = "duplicate vote")]
+fn test_arbiter_successor_cannot_double_vote_mid_dispute() {
+    let (env, contract_id, token_id, company, recruiter, _) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    let a1 = Address::generate(&env);
+    let a2 = Address::generate(&env);
+    let successor = Address::generate(&env);
+
+    let eng_id = String::from_str(&env, "ENG-SUCC-MIDVOTE");
+    client.create_engagement(
+        &eng_id,
+        &company,
+        &recruiter,
+        &ArbiterSetup { arbiters: vec![&env, a1.clone(), a2.clone()], quorum: 2 },
+        &token_id,
+        &1_000_000_000,
+        &String::from_str(&env, "Engineer"),
+        &build_milestones(&env),
+        &vec![&env, 30u32, 90u32],
+        &default_config(),
+    );
+
+    client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://proof"));
+    client.raise_dispute(&company, &eng_id, &0, &String::from_str(&env, "dispute"));
+
+    // a1 votes; quorum is 2 so the dispute is still pending.
+    client.cast_arbiter_vote(&a1, &eng_id, &0, &true);
+    let m0 = client.get_milestone(&eng_id, &0);
+    assert_eq!(m0.status, MilestoneStatus::Disputed);
+
+    // a1 nominates a successor mid-vote and the successor claims the seat.
+    client.nominate_arbiter_successor(&a1, &eng_id, &successor);
+    client.claim_arbiter(&successor, &eng_id);
+
+    let eng = client.get_engagement(&eng_id);
+    assert_eq!(eng.arbiters.get(0).unwrap(), successor);
+
+    // Successor must not be able to cast a second vote for a1's seat.
+    client.cast_arbiter_vote(&successor, &eng_id, &0, &true);
+}
+
+/// Companion to the above: the successor should still be able to cast the
+/// *other* seat's vote normally once installed, and the dispute resolves
+/// via the untouched a2 vote as expected.
+#[test]
+fn test_arbiter_successor_seat_migrated_not_duplicated() {
+    let (env, contract_id, token_id, company, recruiter, _) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_id);
+
+    let a1 = Address::generate(&env);
+    let a2 = Address::generate(&env);
+    let successor = Address::generate(&env);
+
+    let eng_id = String::from_str(&env, "ENG-SUCC-MIGRATE");
+    client.create_engagement(
+        &eng_id,
+        &company,
+        &recruiter,
+        &ArbiterSetup { arbiters: vec![&env, a1.clone(), a2.clone()], quorum: 2 },
+        &token_id,
+        &1_000_000_000,
+        &String::from_str(&env, "Engineer"),
+        &build_milestones(&env),
+        &vec![&env, 30u32, 90u32],
+        &default_config(),
+    );
+
+    client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://proof"));
+    client.raise_dispute(&company, &eng_id, &0, &String::from_str(&env, "dispute"));
+
+    client.cast_arbiter_vote(&a1, &eng_id, &0, &true);
+
+    client.nominate_arbiter_successor(&a1, &eng_id, &successor);
+    client.claim_arbiter(&successor, &eng_id);
+
+    // a2 casts the second (real) vote — quorum reached, dispute resolves.
+    client.cast_arbiter_vote(&a2, &eng_id, &0, &true);
+
+    let m0 = client.get_milestone(&eng_id, &0);
+    assert_eq!(m0.status, MilestoneStatus::Resolved);
+    assert_eq!(token_client.balance(&recruiter), 300_000_000);
+}
+
 #[test]
 #[should_panic(expected = "unauthorized")]
 fn test_non_arbiter_cannot_nominate() {
@@ -1737,7 +1825,9 @@ fn test_quorum_unanimous_vote_record_cleared_after_reset() {
     let m0 = client.get_milestone(&eng_id, &0);
     assert_eq!(m0.status, MilestoneStatus::Pending);
 
-    // Resubmit proof and raise a second dispute round.
+    // Resubmit proof and raise a second dispute round (advance past the
+    // proof resubmission cooldown first).
+    advance_ledger(&env, 2_880);
     client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://proof2"));
     client.raise_dispute(&company, &eng_id, &0, &String::from_str(&env, "dispute2"));
 

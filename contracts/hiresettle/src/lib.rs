@@ -2114,6 +2114,29 @@ impl HireSettleContract {
             }
         }
 
+        // Migrate the seat's vote identity on any dispute currently in progress
+        // (issue #178). Without this, the old arbiter's cast vote no longer
+        // matches any address in `engagement.arbiters`, but the successor's
+        // address also isn't in `voted`, so `cast_arbiter_vote`'s duplicate-vote
+        // check would let the successor cast a second vote for the same seat.
+        for i in 0..engagement.milestones.len() {
+            if engagement.milestones.get(i).unwrap().status == MilestoneStatus::Disputed {
+                let vote_key = DataKey::ArbiterVotes(engagement_id.clone(), i);
+                if let Some(mut record) = env
+                    .storage()
+                    .persistent()
+                    .get::<DataKey, ArbiterVoteRecord>(&vote_key)
+                {
+                    for j in 0..record.voted.len() {
+                        if record.voted.get(j).unwrap() == nomination.current {
+                            record.voted.set(j, nominee.clone());
+                        }
+                    }
+                    env.storage().persistent().set(&vote_key, &record);
+                }
+            }
+        }
+
         env.storage()
             .persistent()
             .set(&DataKey::Engagement(engagement_id.clone()), &engagement);
