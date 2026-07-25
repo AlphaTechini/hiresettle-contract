@@ -57,6 +57,7 @@ fn build_milestones(env: &Env) -> Vec<Milestone> {
             proof_hash: String::from_str(env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         },
         Milestone {
             name: String::from_str(env, "30-Day Retention"),
@@ -66,6 +67,7 @@ fn build_milestones(env: &Env) -> Vec<Milestone> {
             proof_hash: String::from_str(env, ""),
             status: MilestoneStatus::Locked,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         },
         Milestone {
             name: String::from_str(env, "90-Day Retention"),
@@ -75,6 +77,7 @@ fn build_milestones(env: &Env) -> Vec<Milestone> {
             proof_hash: String::from_str(env, ""),
             status: MilestoneStatus::Locked,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         },
     ]
 }
@@ -193,6 +196,7 @@ fn test_create_engagement_invalid_percentages() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         },
         Milestone {
             name: String::from_str(&env, "Retention"),
@@ -202,6 +206,7 @@ fn test_create_engagement_invalid_percentages() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Locked,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         },
     ];
 
@@ -553,6 +558,7 @@ fn test_two_milestone_engagement_50_50() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         },
         Milestone {
             name: String::from_str(&env, "30-Day Retention"),
@@ -562,6 +568,7 @@ fn test_two_milestone_engagement_50_50() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Locked,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         },
     ];
 
@@ -840,6 +847,94 @@ fn test_old_arbiter_retains_role_until_claim() {
     client.claim_arbiter(&new_arbiter, &eng_id);
     let eng = client.get_engagement(&eng_id);
     assert_eq!(eng.arbiters.get(0).unwrap(), new_arbiter);
+}
+
+/// Issue #178: succeeding an arbiter mid-vote must not let the successor cast
+/// a second vote for the same seat on a dispute the predecessor already voted on.
+#[test]
+#[should_panic(expected = "duplicate vote")]
+fn test_arbiter_successor_cannot_double_vote_mid_dispute() {
+    let (env, contract_id, token_id, company, recruiter, _) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    let a1 = Address::generate(&env);
+    let a2 = Address::generate(&env);
+    let successor = Address::generate(&env);
+
+    let eng_id = String::from_str(&env, "ENG-SUCC-MIDVOTE");
+    client.create_engagement(
+        &eng_id,
+        &company,
+        &recruiter,
+        &ArbiterSetup { arbiters: vec![&env, a1.clone(), a2.clone()], quorum: 2 },
+        &token_id,
+        &1_000_000_000,
+        &String::from_str(&env, "Engineer"),
+        &build_milestones(&env),
+        &vec![&env, 30u32, 90u32],
+        &default_config(),
+    );
+
+    client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://proof"));
+    client.raise_dispute(&company, &eng_id, &0, &String::from_str(&env, "dispute"));
+
+    // a1 votes; quorum is 2 so the dispute is still pending.
+    client.cast_arbiter_vote(&a1, &eng_id, &0, &true);
+    let m0 = client.get_milestone(&eng_id, &0);
+    assert_eq!(m0.status, MilestoneStatus::Disputed);
+
+    // a1 nominates a successor mid-vote and the successor claims the seat.
+    client.nominate_arbiter_successor(&a1, &eng_id, &successor);
+    client.claim_arbiter(&successor, &eng_id);
+
+    let eng = client.get_engagement(&eng_id);
+    assert_eq!(eng.arbiters.get(0).unwrap(), successor);
+
+    // Successor must not be able to cast a second vote for a1's seat.
+    client.cast_arbiter_vote(&successor, &eng_id, &0, &true);
+}
+
+/// Companion to the above: the successor should still be able to cast the
+/// *other* seat's vote normally once installed, and the dispute resolves
+/// via the untouched a2 vote as expected.
+#[test]
+fn test_arbiter_successor_seat_migrated_not_duplicated() {
+    let (env, contract_id, token_id, company, recruiter, _) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_id);
+
+    let a1 = Address::generate(&env);
+    let a2 = Address::generate(&env);
+    let successor = Address::generate(&env);
+
+    let eng_id = String::from_str(&env, "ENG-SUCC-MIGRATE");
+    client.create_engagement(
+        &eng_id,
+        &company,
+        &recruiter,
+        &ArbiterSetup { arbiters: vec![&env, a1.clone(), a2.clone()], quorum: 2 },
+        &token_id,
+        &1_000_000_000,
+        &String::from_str(&env, "Engineer"),
+        &build_milestones(&env),
+        &vec![&env, 30u32, 90u32],
+        &default_config(),
+    );
+
+    client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://proof"));
+    client.raise_dispute(&company, &eng_id, &0, &String::from_str(&env, "dispute"));
+
+    client.cast_arbiter_vote(&a1, &eng_id, &0, &true);
+
+    client.nominate_arbiter_successor(&a1, &eng_id, &successor);
+    client.claim_arbiter(&successor, &eng_id);
+
+    // a2 casts the second (real) vote — quorum reached, dispute resolves.
+    client.cast_arbiter_vote(&a2, &eng_id, &0, &true);
+
+    let m0 = client.get_milestone(&eng_id, &0);
+    assert_eq!(m0.status, MilestoneStatus::Resolved);
+    assert_eq!(token_client.balance(&recruiter), 300_000_000);
 }
 
 #[test]
@@ -1234,6 +1329,58 @@ fn test_proof_cooldown_passes_after_wait() {
     client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://proof2"));
     let m0 = client.get_milestone(&eng_id, &0);
     assert_eq!(m0.status, MilestoneStatus::ProofSubmitted);
+}
+
+#[test]
+#[should_panic(expected = "DuplicateProofHash")]
+fn test_duplicate_proof_hash_rejected_across_milestones() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    let eng_id = String::from_str(&env, "ENG-DUP-PROOF");
+    create_standard_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-DUP-PROOF",
+    );
+
+    let proof_hash = String::from_str(&env, "ipfs://same-proof");
+    client.submit_proof(&recruiter, &eng_id, &0, &proof_hash);
+
+    advance_ledger(&env, 31 * 17_280);
+    client.unlock_milestone(&eng_id, &1);
+
+    client.submit_proof(&recruiter, &eng_id, &1, &proof_hash);
+}
+
+#[test]
+fn test_different_proof_hashes_allowed_across_milestones() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    let eng_id = String::from_str(&env, "ENG-DIFF-PROOF");
+    create_standard_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-DIFF-PROOF",
+    );
+
+    client.submit_proof(
+        &recruiter,
+        &eng_id,
+        &0,
+        &String::from_str(&env, "ipfs://placement-proof"),
+    );
+
+    advance_ledger(&env, 31 * 17_280);
+    client.unlock_milestone(&eng_id, &1);
+    client.submit_proof(
+        &recruiter,
+        &eng_id,
+        &1,
+        &String::from_str(&env, "ipfs://retention-proof"),
+    );
+
+    assert_eq!(
+        client.get_milestone(&eng_id, &1).status,
+        MilestoneStatus::ProofSubmitted
+    );
 }
 
 #[test]
@@ -1678,7 +1825,9 @@ fn test_quorum_unanimous_vote_record_cleared_after_reset() {
     let m0 = client.get_milestone(&eng_id, &0);
     assert_eq!(m0.status, MilestoneStatus::Pending);
 
-    // Resubmit proof and raise a second dispute round.
+    // Resubmit proof and raise a second dispute round (advance past the
+    // proof resubmission cooldown first).
+    advance_ledger(&env, 2_880);
     client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://proof2"));
     client.raise_dispute(&company, &eng_id, &0, &String::from_str(&env, "dispute2"));
 
@@ -1873,6 +2022,7 @@ fn test_quorum_unanimous_final_milestone_completes_engagement() {
                 proof_hash: String::from_str(&env, ""),
                 status: MilestoneStatus::Pending,
                 proof_submitted_at: 0,
+                replacement_paid_out: 0,
             },
         ],
         &vec![&env],
@@ -2617,7 +2767,7 @@ fn test_engagement_count_does_not_decrement_on_cancel() {
 }
 
 #[test]
-#[should_panic]
+#[should_panic(expected = "engagement already exists")]
 fn test_engagement_count_no_increment_on_failed_create() {
     let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
     let client = HireSettleContractClient::new(&env, &contract_id);
@@ -3028,6 +3178,7 @@ fn test_batch_confirm_atomic_rejection() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         },
         Milestone {
             name: String::from_str(&env, "Milestone B"),
@@ -3037,6 +3188,7 @@ fn test_batch_confirm_atomic_rejection() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         },
     ];
 
@@ -3081,6 +3233,7 @@ fn test_batch_confirm_emits_event_per_milestone() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         },
         Milestone {
             name: String::from_str(&env, "M2"),
@@ -3090,6 +3243,7 @@ fn test_batch_confirm_emits_event_per_milestone() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         },
     ];
 
@@ -3404,6 +3558,7 @@ fn test_force_confirm_last_milestone_completes_engagement() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         },
     ];
 
@@ -3924,6 +4079,7 @@ fn test_milestone_cap_at_cap() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         });
     }
 
@@ -3970,6 +4126,7 @@ fn test_milestone_cap_over_cap() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         });
     }
 
@@ -4039,6 +4196,7 @@ fn test_milestone_cap_admin_update() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         });
     }
 
@@ -4080,6 +4238,7 @@ fn test_milestone_name_64_char_accepted() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         }
     ];
 
@@ -4117,6 +4276,7 @@ fn test_milestone_name_65_char_rejected() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         }
     ];
 
@@ -4153,6 +4313,7 @@ fn test_milestone_name_empty_rejected() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         }
     ];
 
@@ -4190,6 +4351,7 @@ fn test_milestone_name_multi_milestone_partial_failure() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         },
         Milestone {
             name: name_65,
@@ -4199,6 +4361,7 @@ fn test_milestone_name_multi_milestone_partial_failure() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         }
     ];
 
@@ -4238,6 +4401,7 @@ fn test_milestone_name_uniqueness_happy_path() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         },
         Milestone {
             name: String::from_str(&env, "Second Milestone"),
@@ -4247,6 +4411,7 @@ fn test_milestone_name_uniqueness_happy_path() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         }
     ];
 
@@ -4283,6 +4448,7 @@ fn test_milestone_name_uniqueness_duplicate_detection() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         },
         Milestone {
             name: String::from_str(&env, "Duplicate Milestone"),
@@ -4292,6 +4458,7 @@ fn test_milestone_name_uniqueness_duplicate_detection() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         }
     ];
 
@@ -4327,6 +4494,7 @@ fn test_milestone_name_uniqueness_case_sensitivity() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         },
         Milestone {
             name: String::from_str(&env, "placement"),
@@ -4336,6 +4504,7 @@ fn test_milestone_name_uniqueness_case_sensitivity() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         }
     ];
 
@@ -4581,6 +4750,7 @@ fn test_completion_frees_slot() {
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
             proof_submitted_at: 0,
+            replacement_paid_out: 0,
         },
     ];
 
@@ -4630,6 +4800,7 @@ fn test_completion_frees_slot() {
                 proof_hash: String::from_str(&env, ""),
                 status: MilestoneStatus::Pending,
                 proof_submitted_at: 0,
+                replacement_paid_out: 0,
             },
         ],
         &vec![&env],
@@ -4716,4 +4887,531 @@ fn test_active_count_default_zero_for_new_company() {
     let client = HireSettleContractClient::new(&env, &contract_id);
     let new_company = Address::generate(&env);
     assert_eq!(client.get_company_active_count(&new_company), 0);
+}
+
+// ============================================================
+// #190 — public get_admin() query
+// ============================================================
+
+/// get_admin returns the address set at init, and reflects rotation after
+/// nominate_admin/claim_admin.
+#[test]
+fn test_get_admin_reflects_init_and_rotation() {
+    let (env, contract_id, _token_id, company, _recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    assert_eq!(client.get_admin(), company);
+
+    let new_admin = Address::generate(&env);
+    client.nominate_admin(&company, &new_admin);
+    client.claim_admin(&new_admin);
+
+    assert_eq!(client.get_admin(), new_admin);
+}
+
+// ============================================================
+// #188 — stale arbiter nomination on terminal engagements
+// ============================================================
+
+/// Nominating a successor after the engagement is cancelled must be rejected —
+/// a terminal engagement has no active arbiter seat to hand off.
+#[test]
+#[should_panic(expected = "engagement is in a terminal state")]
+fn test_nominate_arbiter_after_cancel_rejected() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let eng_id = String::from_str(&env, "ENG-ARB-TERM-NOM");
+    create_standard_engagement(&env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-ARB-TERM-NOM");
+
+    client.cancel_engagement(&company, &recruiter, &eng_id);
+    assert_eq!(client.get_engagement(&eng_id).status, EngagementStatus::Cancelled);
+
+    let new_arbiter = Address::generate(&env);
+    client.nominate_arbiter_successor(&arbiter, &eng_id, &new_arbiter);
+}
+
+/// If a nomination was already pending and the engagement completes before the
+/// nominee claims, `claim_arbiter` must be rejected rather than silently
+/// installing an arbiter for an engagement that can no longer be disputed.
+#[test]
+#[should_panic(expected = "engagement is in a terminal state")]
+fn test_claim_arbiter_after_completion_rejected() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let eng_id = String::from_str(&env, "ENG-ARB-TERM-CLAIM");
+    create_standard_engagement(&env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-ARB-TERM-CLAIM");
+
+    let new_arbiter = Address::generate(&env);
+    client.nominate_arbiter_successor(&arbiter, &eng_id, &new_arbiter);
+
+    // Drive the engagement to completion while the nomination is still pending.
+    client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://offer-letter"));
+    client.confirm_milestone(&company, &eng_id, &0);
+    advance_ledger(&env, 31 * 17_280);
+    client.unlock_milestone(&eng_id, &1);
+    client.submit_proof(&recruiter, &eng_id, &1, &String::from_str(&env, "ipfs://30-day"));
+    client.confirm_milestone(&company, &eng_id, &1);
+    advance_ledger(&env, 60 * 17_280);
+    client.unlock_milestone(&eng_id, &2);
+    client.submit_proof(&recruiter, &eng_id, &2, &String::from_str(&env, "ipfs://90-day"));
+    client.confirm_milestone(&company, &eng_id, &2);
+    assert_eq!(client.get_engagement(&eng_id).status, EngagementStatus::Completed);
+
+    client.claim_arbiter(&new_arbiter, &eng_id);
+}
+
+// ============================================================
+// #186 — lowering max_milestones / max_retention_days caps is
+// creation-time-only and doesn't affect existing engagements
+// ============================================================
+
+/// Create an engagement at the current milestone cap, lower the cap below that
+/// count, then exercise the full remaining lifecycle (unlock, propose/accept
+/// amendment, confirm) — nothing should panic or misbehave from now being
+/// "over" the new cap.
+#[test]
+fn test_lowering_max_milestones_does_not_break_existing_engagement() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_id);
+
+    // build_milestones() creates a 3-milestone engagement; set the cap to exactly 3.
+    client.set_max_milestones(&company, &3u32);
+    let eng_id = String::from_str(&env, "ENG-CAP-MS");
+    create_standard_engagement(&env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-CAP-MS");
+
+    // Admin lowers the cap below the existing engagement's milestone count.
+    client.set_max_milestones(&company, &1u32);
+    assert_eq!(client.get_max_milestones(), 1);
+
+    // Full lifecycle still works: unlock, amend, confirm.
+    client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://offer-letter"));
+    client.confirm_milestone(&company, &eng_id, &0);
+    assert_eq!(token_client.balance(&recruiter), 300_000_000);
+
+    advance_ledger(&env, 31 * 17_280);
+    client.unlock_milestone(&eng_id, &1);
+
+    client.propose_amendment(&company, &eng_id, &1, &50u32);
+    client.accept_amendment(&recruiter, &eng_id, &1);
+    assert_eq!(client.get_milestone(&eng_id, &1).payment_percent, 50);
+
+    client.submit_proof(&recruiter, &eng_id, &1, &String::from_str(&env, "ipfs://30-day"));
+    client.confirm_milestone(&company, &eng_id, &1);
+
+    let eng = client.get_engagement(&eng_id);
+    assert_eq!(eng.status, EngagementStatus::Active);
+    assert_eq!(eng.milestones.len(), 3);
+}
+
+/// Create an engagement with a retention window at the current cap, lower the
+/// cap below that window, then confirm the milestone still unlocks and
+/// confirms normally once its original `valid_after_ledger` is reached.
+#[test]
+fn test_lowering_max_retention_days_does_not_break_existing_engagement() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_id);
+
+    client.set_max_retention_days(&company, &90u32);
+    let eng_id = String::from_str(&env, "ENG-CAP-RET");
+    create_standard_engagement(&env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-CAP-RET");
+
+    // Admin lowers the cap below the 90-day retention milestone already stored.
+    client.set_max_retention_days(&company, &10u32);
+    assert_eq!(client.get_max_retention_days(), 10);
+
+    // Existing engagement's lifecycle is unaffected by the new, lower cap.
+    client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://offer-letter"));
+    client.confirm_milestone(&company, &eng_id, &0);
+
+    advance_ledger(&env, 31 * 17_280);
+    client.unlock_milestone(&eng_id, &1);
+    client.submit_proof(&recruiter, &eng_id, &1, &String::from_str(&env, "ipfs://30-day"));
+    client.confirm_milestone(&company, &eng_id, &1);
+
+    advance_ledger(&env, 60 * 17_280);
+    client.unlock_milestone(&eng_id, &2);
+    client.submit_proof(&recruiter, &eng_id, &2, &String::from_str(&env, "ipfs://90-day"));
+    client.confirm_milestone(&company, &eng_id, &2);
+
+    assert_eq!(token_client.balance(&recruiter), 1_000_000_000);
+    assert_eq!(client.get_engagement(&eng_id).status, EngagementStatus::Completed);
+}
+
+// ============================================================
+// #187 — query functions remain callable while paused
+// ============================================================
+
+/// Pausing the contract must not block reads. Sweep a representative sample of
+/// getters/predicates across engagement, admin, and config state and assert
+/// they all still succeed while paused.
+#[test]
+fn test_query_functions_callable_while_paused() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let eng_id = String::from_str(&env, "ENG-PAUSED-QUERY");
+    create_standard_engagement(&env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-PAUSED-QUERY");
+
+    client.pause(&company);
+    assert!(client.is_paused());
+
+    // Engagement-scoped queries.
+    let _ = client.get_engagement(&eng_id);
+    let _ = client.get_milestone(&eng_id, &0);
+    let _ = client.get_escrow_balance(&eng_id);
+    let _ = client.is_milestone_unlockable(&eng_id, &1);
+    let _ = client.get_engagement_summary(&eng_id);
+    let _ = client.get_total_released(&eng_id);
+    let _ = client.get_amendment_ttl();
+    let _ = client.get_pending_amendment(&eng_id, &0);
+
+    // Admin / global config queries.
+    let _ = client.get_admin();
+    let _ = client.get_pending_admin();
+    let _ = client.get_max_milestones();
+    let _ = client.get_max_retention_days();
+    let _ = client.get_max_active_per_company();
+    let _ = client.get_company_active_count(&company);
+    let _ = client.get_engagement_count();
+    let _ = client.get_version();
+    let _ = client.get_min_amount();
+    let _ = client.get_platform_fee();
+
+    // Still paused — confirms none of the above accidentally unpaused anything.
+    assert!(client.is_paused());
+}
+
+// ============================================================
+// #174 — create_engagement must reject company/recruiter/arbiter collisions
+// ============================================================
+
+#[test]
+#[should_panic(expected = "CompanyRecruiterCollision")]
+fn test_create_engagement_rejects_company_as_recruiter() {
+    let (env, contract_id, token_id, company, _recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    client.create_engagement(
+        &String::from_str(&env, "ENG-COLLIDE-CR"),
+        &company,
+        &company,
+        &ArbiterSetup { arbiters: vec![&env, arbiter.clone()], quorum: 1 },
+        &token_id,
+        &1_000_000_000,
+        &String::from_str(&env, "Engineer"),
+        &build_milestones(&env),
+        &vec![&env, 30u32, 90u32],
+        &default_config(),
+    );
+}
+
+#[test]
+#[should_panic(expected = "CompanyArbiterCollision")]
+fn test_create_engagement_rejects_company_as_arbiter() {
+    let (env, contract_id, token_id, company, recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    client.create_engagement(
+        &String::from_str(&env, "ENG-COLLIDE-CA"),
+        &company,
+        &recruiter,
+        &ArbiterSetup { arbiters: vec![&env, company.clone()], quorum: 1 },
+        &token_id,
+        &1_000_000_000,
+        &String::from_str(&env, "Engineer"),
+        &build_milestones(&env),
+        &vec![&env, 30u32, 90u32],
+        &default_config(),
+    );
+}
+
+#[test]
+#[should_panic(expected = "RecruiterArbiterCollision")]
+fn test_create_engagement_rejects_recruiter_as_arbiter() {
+    let (env, contract_id, token_id, company, recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    client.create_engagement(
+        &String::from_str(&env, "ENG-COLLIDE-RA"),
+        &company,
+        &recruiter,
+        &ArbiterSetup { arbiters: vec![&env, recruiter.clone()], quorum: 1 },
+        &token_id,
+        &1_000_000_000,
+        &String::from_str(&env, "Engineer"),
+        &build_milestones(&env),
+        &vec![&env, 30u32, 90u32],
+        &default_config(),
+    );
+}
+
+#[test]
+#[should_panic(expected = "RecruiterArbiterCollision")]
+fn test_create_engagement_rejects_recruiter_as_one_of_several_arbiters() {
+    // Collision check must scan the whole arbiter set, not just index 0.
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    client.create_engagement(
+        &String::from_str(&env, "ENG-COLLIDE-MULTI"),
+        &company,
+        &recruiter,
+        &ArbiterSetup {
+            arbiters: vec![&env, arbiter.clone(), recruiter.clone()],
+            quorum: 1,
+        },
+        &token_id,
+        &1_000_000_000,
+        &String::from_str(&env, "Engineer"),
+        &build_milestones(&env),
+        &vec![&env, 30u32, 90u32],
+        &default_config(),
+    );
+}
+
+#[test]
+fn test_create_engagement_allows_distinct_addresses() {
+    // Sanity control: distinct company/recruiter/arbiter addresses are unaffected.
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    create_standard_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-DISTINCT",
+    );
+    let eng = client.get_engagement(&String::from_str(&env, "ENG-DISTINCT"));
+    assert_eq!(eng.status, EngagementStatus::Active);
+}
+
+// ============================================================
+// #175 — amount math is token-decimals-agnostic (raw integer units)
+// ============================================================
+
+/// Minimal mock token implementing just enough of the Token interface
+/// (`transfer`, `balance`, `mint`) for HireSettleContract to use it as an
+/// escrow asset, plus `decimals()` reporting a non-USDC-like precision (18)
+/// — unlike the 7-decimal Stellar classic asset `setup()` wires up elsewhere
+/// in this suite. HireSettleContract never calls `decimals()` itself; it is
+/// exposed here purely so the test can state the precision it represents.
+#[contract]
+struct MockToken18;
+
+#[contractimpl]
+impl MockToken18 {
+    pub fn decimals(_env: Env) -> u32 {
+        18
+    }
+
+    pub fn mint(env: Env, to: Address, amount: i128) {
+        let bal: i128 = env.storage().persistent().get(&to).unwrap_or(0);
+        env.storage().persistent().set(&to, &(bal + amount));
+    }
+
+    pub fn balance(env: Env, id: Address) -> i128 {
+        env.storage().persistent().get(&id).unwrap_or(0)
+    }
+
+    pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
+        from.require_auth();
+        let from_bal: i128 = env.storage().persistent().get(&from).unwrap_or(0);
+        let to_bal: i128 = env.storage().persistent().get(&to).unwrap_or(0);
+        env.storage().persistent().set(&from, &(from_bal - amount));
+        env.storage().persistent().set(&to, &(to_bal + amount));
+    }
+}
+
+#[test]
+fn test_engagement_payout_math_is_decimal_agnostic_for_18_decimal_token() {
+    let (env, contract_id, _token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    let mock_token_id = env.register(MockToken18, ());
+    let mock_client = MockToken18Client::new(&env, &mock_token_id);
+    assert_eq!(mock_client.decimals(), 18);
+
+    // 1 token at 18 decimals — a value that dwarfs any realistic 7-decimal
+    // USDC engagement, chosen to show the payout split is pure integer
+    // percentage math with no decimals-awareness baked in.
+    let total_amount: i128 = 1_000_000_000_000_000_000;
+    mock_client.mint(&company, &total_amount);
+
+    let eng_id = String::from_str(&env, "ENG-18DEC");
+    client.create_engagement(
+        &eng_id,
+        &company,
+        &recruiter,
+        &ArbiterSetup { arbiters: vec![&env, arbiter.clone()], quorum: 1 },
+        &mock_token_id,
+        &total_amount,
+        &String::from_str(&env, "Engineer"),
+        &build_milestones(&env),
+        &vec![&env, 30u32, 90u32],
+        &default_config(),
+    );
+
+    client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://proof"));
+    client.confirm_milestone(&company, &eng_id, &0);
+
+    // 30% of 1e18 = 3e17, exactly — confirms `total_amount * percent / 100`
+    // is unaffected by the token's real decimal precision.
+    assert_eq!(mock_client.balance(&recruiter), 300_000_000_000_000_000);
+}
+
+#[test]
+fn test_min_amount_is_raw_units_not_scaled_per_token_decimals() {
+    // Documents the intentional behaviour from issue #175: `MinEngagementAmount`
+    // is a single admin-wide floor applied as raw integer units regardless of
+    // which allowlisted token is used. For a token with more decimals than the
+    // 7-decimal USDC the default was calibrated for, the floor no longer
+    // represents "0.01 USDC" worth of real value — it is up to the integrator
+    // to call `set_min_amount` appropriately per token precision.
+    let (env, contract_id, _token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    let mock_token_id = env.register(MockToken18, ());
+    let mock_client = MockToken18Client::new(&env, &mock_token_id);
+
+    let min_amount = client.get_min_amount();
+    mock_client.mint(&company, &min_amount);
+
+    // Exactly the default floor (100_000 raw units — 0.01 of a 7-decimal
+    // token, but a vanishingly small 1e-13 of a token at 18 decimals) is
+    // accepted without any decimals-based rejection or adjustment.
+    let eng_id = String::from_str(&env, "ENG-18DEC-DUST");
+    client.create_engagement(
+        &eng_id,
+        &company,
+        &recruiter,
+        &ArbiterSetup { arbiters: vec![&env, arbiter.clone()], quorum: 1 },
+        &mock_token_id,
+        &min_amount,
+        &String::from_str(&env, "Engineer"),
+        &build_milestones(&env),
+        &vec![&env, 30u32, 90u32],
+        &default_config(),
+    );
+
+    let eng = client.get_engagement(&eng_id);
+    assert_eq!(eng.total_amount, min_amount);
+}
+
+// ============================================================
+// #176 — cancel_engagement must clear a pending amendment proposal
+// ============================================================
+
+#[test]
+fn test_cancel_engagement_clears_pending_amendment() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    let eng_id = String::from_str(&env, "ENG-CANCEL-AMEND");
+    create_standard_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-CANCEL-AMEND",
+    );
+
+    // Propose an amendment on milestone 0 before any milestone is confirmed —
+    // cancel_engagement is only callable in that window.
+    client.propose_amendment(&company, &eng_id, &0, &50);
+    assert!(client.get_pending_amendment(&eng_id, &0).is_some());
+
+    client.cancel_engagement(&company, &recruiter, &eng_id);
+
+    // The stale proposal must not remain visible as "harmless leftover" state —
+    // get_pending_amendment must report none once the engagement is terminal.
+    assert!(client.get_pending_amendment(&eng_id, &0).is_none());
+}
+
+#[test]
+#[should_panic(expected = "no pending amendment proposal")]
+fn test_accept_amendment_after_cancel_is_rejected() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    let eng_id = String::from_str(&env, "ENG-CANCEL-AMEND-ACCEPT");
+    create_standard_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-CANCEL-AMEND-ACCEPT",
+    );
+
+    client.propose_amendment(&company, &eng_id, &0, &50);
+    client.cancel_engagement(&company, &recruiter, &eng_id);
+
+    // Without clearing on cancel, this would succeed and mutate
+    // milestone.payment_percent on a terminal Cancelled engagement.
+    client.accept_amendment(&recruiter, &eng_id, &0);
+}
+
+// ============================================================
+// #177 — request_replacement interaction with an in-flight dispute
+// ============================================================
+
+#[test]
+fn test_request_replacement_clears_in_flight_dispute_on_retention_milestone() {
+    let (env, contract_id, token_id, company, recruiter, _) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    let a1 = Address::generate(&env);
+    let a2 = Address::generate(&env);
+    let a3 = Address::generate(&env);
+
+    let eng_id = String::from_str(&env, "ENG-REPL-DISPUTE");
+    client.create_engagement(
+        &eng_id,
+        &company,
+        &recruiter,
+        &ArbiterSetup {
+            arbiters: vec![&env, a1.clone(), a2.clone(), a3.clone()],
+            quorum: 2,
+        },
+        &token_id,
+        &1_000_000_000,
+        &String::from_str(&env, "Engineer"),
+        &build_milestones(&env),
+        &vec![&env, 30u32, 90u32],
+        &default_config(),
+    );
+
+    // Confirm placement so request_replacement becomes available.
+    client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://placement"));
+    client.confirm_milestone(&company, &eng_id, &0);
+
+    // Unlock and dispute the 30-day retention milestone (index 1); one approve
+    // vote leaves the dispute unresolved since quorum is 2 of 3.
+    advance_ledger(&env, 30 * 17_280 + 1);
+    client.unlock_milestone(&eng_id, &1);
+    client.submit_proof(&recruiter, &eng_id, &1, &String::from_str(&env, "ipfs://retention-30"));
+    client.raise_dispute(&company, &eng_id, &1, &String::from_str(&env, "not retained"));
+    client.cast_arbiter_vote(&a1, &eng_id, &1, &true);
+
+    let votes_before = client.get_arbiter_votes(&eng_id, &1);
+    assert_eq!(votes_before.approve_votes, 1);
+    assert!(client.get_dispute_reason(&eng_id, &1).is_some());
+
+    // Company requests a replacement while milestone 1 is still Disputed.
+    client.request_replacement(&company, &eng_id, &String::from_str(&env, "candidate underperformed"));
+
+    // The milestone lands in a well-defined state: reset to Locked, with the
+    // stale vote tally and dispute reason from the abandoned dispute cleared —
+    // otherwise a future dispute on this same index would inherit a1's vote.
+    let m1 = client.get_milestone(&eng_id, &1);
+    assert_eq!(m1.status, MilestoneStatus::Locked);
+
+    let votes_after = client.get_arbiter_votes(&eng_id, &1);
+    assert_eq!(votes_after.approve_votes, 0);
+    assert_eq!(votes_after.reject_votes, 0);
+    assert!(client.get_dispute_reason(&eng_id, &1).is_none());
+
+    // Bring the engagement back to Active via the placement milestone, then
+    // unlock and dispute milestone 1 again. a1 must be able to vote again —
+    // proving the earlier vote record was actually cleared, not just shadowed.
+    client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://placement-2"));
+    client.confirm_milestone(&company, &eng_id, &0);
+
+    advance_ledger(&env, 30 * 17_280 + 1);
+    client.unlock_milestone(&eng_id, &1);
+    client.submit_proof(&recruiter, &eng_id, &1, &String::from_str(&env, "ipfs://retention-30-again"));
+    client.raise_dispute(&company, &eng_id, &1, &String::from_str(&env, "still disputed"));
+
+    // Would panic with "duplicate vote" if the earlier vote record had leaked through.
+    client.cast_arbiter_vote(&a1, &eng_id, &1, &true);
+    let votes_second = client.get_arbiter_votes(&eng_id, &1);
+    assert_eq!(votes_second.approve_votes, 1);
 }

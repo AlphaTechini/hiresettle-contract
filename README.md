@@ -3,6 +3,37 @@
 A [Soroban](https://soroban.stellar.org/) smart contract deployed on Stellar for managing recruitment fee settlements through milestone-based escrow payments. Built with `#![no_std]` Rust and the Soroban SDK.
 
 ---
+## Setup & Installation
+
+### Prerequisites
+
+Before getting started, ensure you have:
+
+- Rust (latest stable version)
+- Cargo
+- Soroban CLI
+- Stellar CLI
+- Git
+
+### Clone the Repository
+
+```bash
+git clone https://github.com/TrustHire/hiresettle-contract.git
+cd hiresettle-contract
+```
+
+### Build the Contract
+
+```bash
+cd contracts/hiresettle
+cargo build
+```
+
+### Run the Tests
+
+```bash
+cargo test
+```
 
 ## Overview
 
@@ -139,6 +170,7 @@ pub struct ArbiterVoteCounts {
     pub reject_votes: u32,
 }
 ```
+```
 
 Returned by `get_arbiter_votes` — lightweight view of the current tally without the voter list.
 
@@ -199,6 +231,62 @@ Contract storage key space enumerating all persistent and instance-stored values
 
 ---
 
+## Amendments
+
+Either the company or the recruiter may propose a change to a milestone's `payment_percent`. Amendments are scoped to a single milestone per proposal and require explicit acceptance from the counterparty before taking effect.
+
+### Propose → Accept / Reject Flow
+
+1. **Propose** — `propose_amendment(proposer, engagement_id, milestone_index, new_payment_percent)`
+   - Caller must be the engagement's `company` or `recruiter`; must sign the transaction.
+   - `new_payment_percent` is validated to be within 0–100 (inclusive).
+   - A new proposal overwrites any existing pending proposal for the same milestone (only one pending per milestone at a time).
+   - Emits an `amendment_proposed` event.
+   - The pending state is stored as an [`AmendmentProposal`](#amendmentproposal) struct under `DataKey::AmendmentProposal(engagement_id, milestone_index)`.
+
+2. **Accept** — `accept_amendment(acceptor, engagement_id, milestone_index)`
+   - Caller must be the *other* party (the one who did **not** propose). A proposer cannot accept their own proposal.
+   - The milestone's `payment_percent` is updated to the proposed value immediately.
+   - An [`AmendmentEntry`](#amendmententry) is appended to the milestone's amendment log (see below) recording the old/new percentages, the proposer, and the acceptance ledger.
+   - The pending proposal is cleared from storage.
+   - Emits an `amendment_accepted` event.
+
+3. **Reject** — `reject_amendment(rejector, engagement_id, milestone_index)`
+   - Caller must be the *other* party (the one who did **not** propose). A proposer cannot reject their own proposal.
+   - The pending proposal is cleared from storage without any change to the milestone.
+   - Emits an `amendment_rejected` event with reason `declined`.
+
+### TTL and Expiry
+
+Every proposal carries an expiry ledger computed as `proposed_at_ledger + amendment_ttl` (see [`AmendmentProposal.expires_at_ledger`](#amendmentproposal)).
+
+- The default TTL is **17,280 ledgers** (≈ 1 day at 5 s/ledger).
+- Admin can change the default globally via `set_amendment_ttl(ledgers)`; the current value is queried with `get_amendment_ttl()`.
+- If the current ledger exceeds `expires_at_ledger`, the proposal is considered *expired*:
+  - Calling `accept_amendment` on an expired proposal clears it, emits an `amendment_rejected` event with reason `expired`, and panics with `amendment_expired`.
+  - `get_pending_amendment` automatically treats expired proposals as non-existent and returns `None`.
+- Expired proposals do **not** auto-clean from storage on ledger tick; they are lazily cleared on the next `accept_amendment`, `reject_amendment`, or overwritten by the next `propose_amendment` for the same milestone.
+
+### What an Amendment Can Change
+
+Only one field is mutable via the amendment system:
+
+| Field | Type | Description |
+|---|---|---|
+| `milestone.payment_percent` | `u32` | Percentage of `total_amount` released when the milestone confirms. Must be 0–100 inclusive. |
+
+An amendment does **not** change the total escrow, milestone status, proof hash, retention time-gates, arbiter configuration, or any other engagement field. Percentage-sum validation across all milestones is not re-enforced at amendment time; integrators are expected to ensure the combined set across all milestones still sums to 100 after applying accepted amendments.
+
+### Amendment History (Log)
+
+Each time an amendment is accepted, an [`AmendmentEntry`](#amendmententry) is appended to the per-milestone log:
+
+- Accessible via `get_amendment_log(engagement_id, milestone_index)` which returns entries in chronological order (oldest first).
+- The log is **FIFO-capped at 20 entries per milestone** — once the cap is reached, the oldest entry is evicted on the next accepted amendment.
+- The pending proposal itself is not part of the log until it is accepted; use `get_pending_amendment` to inspect a live proposal.
+
+---
+
 ## Public Function Reference
 
 ### Admin
@@ -212,6 +300,52 @@ Contract storage key space enumerating all persistent and instance-stored values
 
 ### Arbiter Succession
 `nominate_arbiter_successor`, `claim_arbiter`
+### Arbiter Voting & Succession
+
+#### Arbiter Voting
+
+HireSettle uses a **multi-arbiter M-of-N voting model** to resolve disputes. When a company raises a dispute on a milestone, each assigned arbiter may cast a single vote using `cast_arbiter_vote()`.
+
+Votes are tracked until one of the following conditions is met:
+
+- **Approval quorum reached** (`approve_votes >= quorum`)
+  - The dispute is resolved in favour of the recruiter.
+  - The milestone payment is released from escrow.
+- **Rejection quorum reached** (`reject_votes > arbiters.len() - quorum`)
+  - The submitted proof is rejected.
+  - The milestone returns to the `Pending` state, allowing the recruiter to submit new proof.
+
+Each arbiter may vote only once for a dispute. Duplicate votes are rejected by the contract.
+
+#### Viewing Vote Progress
+
+Applications can retrieve the current dispute vote tally using:
+
+```text
+get_arbiter_votes()
+```
+
+This read-only function returns the current approval and rejection vote counts without exposing the voter list, allowing dashboards to display dispute progress while preserving voter privacy.
+
+#### Arbiter Succession
+
+To support long-running engagements, HireSettle allows arbiters to transfer their responsibilities to a successor without modifying the engagement itself.
+
+The succession process consists of two steps:
+
+1. The current arbiter nominates a successor using:
+
+```text
+nominate_arbiter_successor()
+```
+
+2. The nominated address accepts the role by calling:
+
+```text
+claim_arbiter()
+```
+
+Only the nominated address can complete the claim. Once claimed, the successor assumes the arbiter's position for future dispute voting while preserving the integrity of the arbitration panel.
 
 ### Read-Only Queries
 `get_engagement`, `get_engagement_summary`, `get_milestone`, `get_escrow_balance`, `get_total_released`, `get_metadata_hash`, `get_contract_pdf_hash`, `get_version`, `get_min_amount`, `get_platform_fee`, `get_pending_admin`, `get_amendment_ttl`, `get_amendment_log`, `get_pending_amendment`, `get_arbiter_votes`, `get_dispute_reason`, `get_replacement_reason`, `get_replacement_count`, `get_engagement_count`, `get_company_engagement_count`, `get_engagements_by_company`, `is_milestone_unlockable`, `ledgers_until_unlock`, `get_estimated_unlock_seconds`, `get_active_dispute_count`, `get_is_engagement_complete`, `get_unlock_progress`, `is_paused`, `get_ledgers_per_day`, `get_max_retention_days`, `get_max_milestones`, `get_inactivity_timeout_ledgers`, `get_storage_ttl_extend_to`, `get_confirm_window`, `get_dispute_window`, `get_max_proof_hash_length`, `get_arbiter_fee`, `get_upgrade_lock_duration`, `get_allowed_tokens`
@@ -307,7 +441,9 @@ stellar contract invoke \
 ## Security Considerations
 
 - **Authorization**: Every state-changing function calls `require_auth()`. Recruiters cannot confirm their own milestones. Companies cannot cast arbiter votes.
+- **No party/arbiter address overlap**: `create_engagement` rejects `company == recruiter`, `company` appearing in the arbiter set, or `recruiter` appearing in the arbiter set. Without this check a company could name itself (or a colluding address) as arbiter and vote on its own disputes, or name itself as recruiter to self-confirm milestones.
 - **Multi-arbiter quorum**: Disputes require M-of-N arbiter votes to resolve. A single arbiter cannot unilaterally release or withhold payment — both approval and rejection require a configurable quorum. Duplicate votes from the same arbiter are rejected on-chain.
+- **Token amounts are raw integer units, not decimal-aware**: The token allowlist accepts any allowlisted SAC, not just USDC. `total_amount`, `MinEngagementAmount`, and all milestone payout math (`amount * payment_percent / 100`) operate on raw integer units of whichever token is used — the contract never reads a token's `decimals()`. Percentage splits are exact regardless of precision, but a single admin-wide minimum amount (`set_min_amount`) will represent a different real-world value across tokens of different precision (e.g. 7-decimal vs. 18-decimal tokens). Integrators are responsible for only allowlisting tokens of comparable precision, or adjusting the minimum accordingly, when using a token other than the reference 7-decimal USDC used throughout this README's examples.
 - **Arbiter fee cap**: The arbiter fee is capped at 200 bps (2%) to prevent excessive deduction from recruiter payouts on dispute approval.
 - **Retention double-check**: `confirm_milestone()` re-verifies `valid_after_ledger` even if `unlock_milestone()` was called, preventing a company from confirming a retention milestone before the window truly ends.
 - **Replacement fee fairness**: The Placement tranche paid to the recruiter is non-refundable. Only unreleased amounts are frozen. This is explicit in the contract and documented clearly so both parties understand the terms at engagement creation.
