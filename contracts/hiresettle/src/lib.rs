@@ -3289,6 +3289,17 @@ impl HireSettleContract {
             .unwrap_or(MAX_PROOF_HASH_LENGTH)
     }
 
+    /// Decrease a company's active engagement count after an engagement reaches
+    /// a terminal state. A missing count is treated as zero for backward-safe
+    /// handling of engagements created before the counter was introduced.
+    fn decrement_company_active_count(env: &Env, company: &Address) {
+        let key = DataKey::CompanyActiveCount(company.clone());
+        let active_count: u32 = env.storage().persistent().get(&key).unwrap_or(0);
+        if active_count > 0 {
+            env.storage().persistent().set(&key, &(active_count - 1));
+        }
+    }
+
     // ----------------------------------------------------------
     // ISSUE #56 — CO-RECRUITER SPLIT PAYOUT
     // ----------------------------------------------------------
