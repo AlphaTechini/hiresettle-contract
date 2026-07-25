@@ -273,7 +273,13 @@ pub struct ArbiterVoteCounts {
 #[contracttype]
 #[derive(Clone)]
 pub struct ArbiterNomination {
+    /// The arbiter initiating the handover. Set when `nominate_arbiter_successor`
+    /// is called; used by `claim_arbiter` to locate the correct slot in
+    /// `engagement.arbiters` and replace it with the incoming nominee.
     pub current: Address,
+    /// The address authorised to complete the succession by calling
+    /// `claim_arbiter`. Only this exact address may claim the slot; any other
+    /// caller is rejected with `"unauthorized"`.
     pub nominee: Address,
 }
 
