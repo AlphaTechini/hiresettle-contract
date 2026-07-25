@@ -520,7 +520,14 @@ impl HireSettleContract {
             .publish((Symbol::new(&env, "version_set"),), version);
     }
 
-    /// Admin sets the minimum engagement amount in stroops (issue #17).
+    /// Admin sets the minimum engagement amount, in the raw smallest unit of
+    /// whichever token a given `create_engagement` call uses (issue #17). This
+    /// single global floor applies to every allowlisted token regardless of its
+    /// `decimals()` — the contract is token-decimals-agnostic (see issue #175).
+    /// If the allowlist mixes tokens of very different precision (e.g. a
+    /// 7-decimal token alongside an 18-decimal token), the admin is responsible
+    /// for picking a value that is a sane floor for all of them, or for keeping
+    /// the allowlist restricted to tokens of comparable precision.
     /// Panics with "unauthorized" if caller is not admin.
     pub fn set_min_amount(env: Env, admin: Address, amount: i128) {
         Self::assert_admin(&env, &admin);
@@ -627,7 +634,7 @@ impl HireSettleContract {
     // CREATE ENGAGEMENT
     // ----------------------------------------------------------
 
-    /// Create a new recruitment engagement and lock USDC in escrow.
+    /// Create a new recruitment engagement and lock funds in escrow.
     ///
     /// # Arguments
     /// - `engagement_id`   — unique string ID for this engagement
@@ -635,12 +642,26 @@ impl HireSettleContract {
     /// - `recruiter`       — recruiter address (receives payments)
     /// - `arbiters`        — ordered list of arbiter addresses (min 1)
     /// - `quorum`          — number of arbiter approvals required to release on dispute (M of N)
-    /// - `token`           — USDC Stellar Asset Contract address
-    /// - `total_amount`    — total recruiter fee in stroops
+    /// - `token`           — SAC address of the escrow token (USDC or any allowlisted token,
+    ///   see [`Self::add_allowed_token`]). `total_amount` and all amount-based math below are
+    ///   raw integer units in this token's smallest denomination (e.g. stroops for a 7-decimal
+    ///   token) — the contract does not read or adjust for the token's `decimals()`. Callers
+    ///   integrating non-USDC-like tokens are responsible for choosing a `total_amount` (and,
+    ///   for admins, a [`Self::set_min_amount`]) that makes sense for that token's precision.
+    /// - `total_amount`    — total recruiter fee in the token's smallest unit
     /// - `job_title`       — short job title string
     /// - `milestones`      — ordered milestone list
     /// - `retention_days`  — Vec of retention windows in days (one per Retention milestone)
     /// - `config`          — bundled optional config: metadata_hash, co_recruiter, recruiter_split_bps
+    ///
+    /// # Panics
+    /// - `"CompanyRecruiterCollision"` — `company` and `recruiter` are the same address.
+    /// - `"CompanyArbiterCollision"` — `company` also appears in the arbiter set.
+    /// - `"RecruiterArbiterCollision"` — `recruiter` also appears in the arbiter set.
+    ///
+    /// These checks exist so a company cannot name itself (or a colluding address)
+    /// as arbiter and vote on its own disputes, or name itself as recruiter to
+    /// self-confirm milestones. See issue #174.
     pub fn create_engagement(
         env: Env,
         engagement_id: String,
@@ -755,6 +776,22 @@ impl HireSettleContract {
 
         if quorum == 0 || quorum > arbiters.len() {
             panic!("invalid quorum");
+        }
+
+        // Issue #174: reject overlapping company/recruiter/arbiter addresses so a
+        // company cannot name itself (or a colluding address) as arbiter and vote
+        // on its own disputes, or name itself as recruiter to self-confirm milestones.
+        if company == recruiter {
+            panic!("CompanyRecruiterCollision");
+        }
+        for i in 0..arbiters.len() {
+            let a = arbiters.get(i).unwrap();
+            if a == company {
+                panic!("CompanyArbiterCollision");
+            }
+            if a == recruiter {
+                panic!("RecruiterArbiterCollision");
+            }
         }
 
         // Reject empty metadata hash — caller must either omit or provide a real CID.
@@ -1501,6 +1538,15 @@ impl HireSettleContract {
     // REQUEST REPLACEMENT
     // ----------------------------------------------------------
 
+    /// Company requests a replacement candidate after the placement milestone
+    /// was already confirmed. Unconfirmed milestones are reset (Placement →
+    /// `Pending`, Retention → `Locked` with its timer restarted).
+    ///
+    /// A Retention milestone that is currently `Disputed` (a dispute was raised
+    /// but arbiters have not yet reached quorum) is included in this reset: it is
+    /// forced back to `Locked` and its in-flight vote tally and dispute reason
+    /// are cleared, so a future dispute on the same milestone index starts from
+    /// a clean vote count instead of inheriting stale votes. See issue #177.
     pub fn request_replacement(env: Env, company: Address, engagement_id: String, reason: String) {
         Self::assert_not_paused(&env);
         company.require_auth();
@@ -1559,6 +1605,15 @@ impl HireSettleContract {
                     if m.status != MilestoneStatus::Confirmed
                         && m.status != MilestoneStatus::Resolved
                     {
+                        // Issue #177: a Retention milestone can be Disputed (dispute
+                        // raised, arbiters not yet at quorum) when a replacement is
+                        // requested. Resetting it to Locked here must also clear any
+                        // in-flight vote tally and dispute reason — otherwise a stale
+                        // ArbiterVoteRecord (partial votes, or arbiters who already
+                        // "voted") would silently carry over and be read by
+                        // `cast_arbiter_vote` the next time this same milestone index
+                        // is disputed again, corrupting the new dispute's vote count.
+                        let was_disputed = m.status == MilestoneStatus::Disputed;
                         let original_days = (m.valid_after_ledger - engagement.created_at_ledger)
                             / Self::get_ledgers_per_day_internal(&env);
                         m.valid_after_ledger = current_ledger
@@ -1578,6 +1633,15 @@ impl HireSettleContract {
                         env.storage()
                             .persistent()
                             .remove(&DataKey::LastProofAt(engagement_id.clone(), i));
+
+                        if was_disputed {
+                            env.storage()
+                                .persistent()
+                                .remove(&DataKey::ArbiterVotes(engagement_id.clone(), i));
+                            env.storage()
+                                .persistent()
+                                .remove(&DataKey::DisputeReason(engagement_id.clone(), i));
+                        }
                     }
                 }
             }
@@ -1700,6 +1764,20 @@ impl HireSettleContract {
             old_engagement_status,
             engagement.status.clone(),
         );
+
+        // Issue #176: a pending (unexpired) amendment proposal survives a
+        // cancellation unless explicitly cleared here — `accept_amendment` and
+        // `reject_amendment` never check `engagement.status`, so without this a
+        // proposal could still be accepted/rejected after the engagement is
+        // terminal, mutating milestone.payment_percent on a Cancelled engagement.
+        // Clearing on cancel also makes `get_pending_amendment` correctly report
+        // no pending amendment once the engagement is gone.
+        for i in 0..engagement.milestones.len() {
+            let key = DataKey::AmendmentProposal(engagement_id.clone(), i);
+            if env.storage().persistent().has(&key) {
+                env.storage().persistent().remove(&key);
+            }
+        }
 
         Self::decrement_company_active_count(&env, &engagement.company);
 
@@ -2363,6 +2441,16 @@ impl HireSettleContract {
     // ----------------------------------------------------------
 
     /// Add a token SAC address to the allowlist. Admin only.
+    ///
+    /// Note (issue #175): the contract treats `total_amount`, milestone payouts,
+    /// and `MinEngagementAmount` as raw integer units of whichever token is used
+    /// for a given engagement — it never queries or adjusts for that token's
+    /// `decimals()`. Percentage-based math (`amount * payment_percent / 100`) is
+    /// exact integer arithmetic regardless of decimals, but a single admin-wide
+    /// `MinEngagementAmount` (see [`Self::set_min_amount`]) means the effective
+    /// real-world minimum will differ across tokens with different precision.
+    /// Only allowlist tokens whose smallest unit is comparable in scale to what
+    /// `MinEngagementAmount` assumes, or adjust the minimum accordingly.
     pub fn add_allowed_token(env: Env, admin: Address, token: Address) {
         Self::assert_admin(&env, &admin);
         let mut allowed: Vec<Address> = env
