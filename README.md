@@ -287,6 +287,18 @@ Each time an amendment is accepted, an [`AmendmentEntry`](#amendmententry) is ap
 
 ---
 
+## Token Allowlist
+
+The contract supports an optional allowlist to restrict which tokens can be used for escrow.
+
+### Configuration
+- **Toggle Allowlist**: The allowlist is toggled on or off using `set_token_allowlist_enabled(admin, enabled)`.
+- **Add Token**: New tokens are added to the allowlist with `add_allowed_token(admin, token_address)`.
+- **Remove Token**: Tokens are removed with `remove_allowed_token(admin, token_address)`.
+
+### Engagement Creation
+When the token allowlist is enabled, `create_engagement` will panic with `TokenNotAllowed` if the `token` passed is not in the allowed tokens list. If the allowlist is disabled, any valid SAC token is accepted.
+
 ## Public Function Reference
 
 ### Admin
