@@ -43,6 +43,7 @@ pub enum MilestoneKind {
     Retention,
 }
 
+/// A payment and workflow checkpoint belonging to an [`Engagement`]'s `milestones`.
 #[contracttype]
 #[derive(Clone)]
 pub struct Milestone {
