@@ -348,7 +348,87 @@ claim_arbiter()
 Only the nominated address can complete the claim. Once claimed, the successor assumes the arbiter's position for future dispute voting while preserving the integrity of the arbitration panel.
 
 ### Read-Only Queries
-`get_engagement`, `get_engagement_summary`, `get_milestone`, `get_escrow_balance`, `get_total_released`, `get_metadata_hash`, `get_contract_pdf_hash`, `get_version`, `get_min_amount`, `get_platform_fee`, `get_pending_admin`, `get_amendment_ttl`, `get_amendment_log`, `get_pending_amendment`, `get_arbiter_votes`, `get_dispute_reason`, `get_replacement_reason`, `get_replacement_count`, `get_engagement_count`, `get_company_engagement_count`, `get_engagements_by_company`, `is_milestone_unlockable`, `ledgers_until_unlock`, `get_estimated_unlock_seconds`, `get_active_dispute_count`, `get_is_engagement_complete`, `get_unlock_progress`, `is_paused`, `get_ledgers_per_day`, `get_max_retention_days`, `get_max_milestones`, `get_inactivity_timeout_ledgers`, `get_storage_ttl_extend_to`, `get_confirm_window`, `get_dispute_window`, `get_max_proof_hash_length`, `get_arbiter_fee`, `get_upgrade_lock_duration`, `get_allowed_tokens`
+
+All read-only functions are permissionless and require no authentication.
+
+#### Engagement Queries
+
+| Function | Arguments | Return Type |
+|---|---|---|
+| `get_engagement` | `engagement_id: String` | `Engagement` |
+| `get_engagement_summary` | `engagement_id: String` | `EngagementSummary` |
+| `get_is_engagement_complete` | `engagement_id: String` | `bool` |
+| `get_active_dispute_count` | `engagement_id: String` | `u32` |
+| `get_unlock_progress` | `engagement_id: String` | `(u32, u32)` |
+| `get_metadata_hash` | `engagement_id: String` | `Option<String>` |
+| `get_contract_pdf_hash` | `engagement_id: String` | `Option<String>` |
+| `get_total_released` | `engagement_id: String` | `i128` |
+| `get_escrow_balance` | `engagement_id: String` | `i128` |
+
+#### Milestone Queries
+
+| Function | Arguments | Return Type |
+|---|---|---|
+| `get_milestone` | `engagement_id: String`, `milestone_index: u32` | `Milestone` |
+| `get_all_milestone_statuses` | `engagement_id: String` | `Vec<MilestoneStatus>` |
+| `is_milestone_unlockable` | `engagement_id: String`, `milestone_index: u32` | `bool` |
+| `ledgers_until_unlock` | `engagement_id: String`, `milestone_index: u32` | `u32` |
+| `get_estimated_unlock_seconds` | `engagement_id: String`, `milestone_index: u32` | `u64` |
+| `get_arbiter_votes` | `engagement_id: String`, `milestone_index: u32` | `ArbiterVoteCounts` |
+| `get_dispute_reason` | `engagement_id: String`, `milestone_index: u32` | `Option<String>` |
+
+#### Engagement Listing & Counting
+
+| Function | Arguments | Return Type |
+|---|---|---|
+| `get_engagement_count` | — | `u64` |
+| `get_company_engagement_count` | `company: Address` | `u32` |
+| `get_engagements_by_company` | `company: Address`, `page: u32`, `page_size: u32` | `Vec<String>` |
+| `get_company_active_count` | `company: Address` | `u32` |
+
+#### Amendment Queries
+
+| Function | Arguments | Return Type |
+|---|---|---|
+| `get_amendment_log` | `engagement_id: String`, `milestone_index: u32` | `Vec<AmendmentEntry>` |
+| `get_pending_amendment` | `engagement_id: String`, `milestone_index: u32` | `Option<AmendmentProposal>` |
+| `get_amendment_ttl` | — | `u32` |
+
+#### Replacement Queries
+
+| Function | Arguments | Return Type |
+|---|---|---|
+| `get_replacement_reason` | `engagement_id: String`, `replacement_index: u32` | `Option<String>` |
+| `get_replacement_count` | `engagement_id: String` | `u32` |
+
+#### Contract Config Getters
+
+| Function | Arguments | Return Type |
+|---|---|---|
+| `get_version` | — | `String` |
+| `get_min_amount` | — | `i128` |
+| `get_platform_fee` | — | `(u32, Address)` |
+| `get_ledgers_per_day` | — | `u32` |
+| `get_max_retention_days` | — | `u32` |
+| `get_max_milestones` | — | `u32` |
+| `get_max_replacements` | — | `u32` |
+| `get_max_active_per_company` | — | `u32` |
+| `get_inactivity_timeout_ledgers` | — | `u32` |
+| `get_storage_ttl_extend_to` | — | `u32` |
+| `get_confirm_window` | — | `u32` |
+| `get_dispute_window` | — | `u32` |
+| `get_max_proof_hash_length` | — | `u32` |
+| `get_arbiter_fee` | — | `u32` |
+| `get_upgrade_lock_duration` | — | `u32` |
+| `get_allowed_tokens` | — | `Vec<Address>` |
+
+#### Admin & Contract State
+
+| Function | Arguments | Return Type |
+|---|---|---|
+| `is_paused` | — | `bool` |
+| `get_admin` | — | `Address` |
+| `get_pending_admin` | — | `Option<Address>` |
 
 ---
 
