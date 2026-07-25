@@ -138,6 +138,7 @@ fn default_config() -> EngagementConfig {
         metadata_hash: None,
         co_recruiter: None,
         recruiter_split_bps: 10_000,
+        contract_pdf_hash: None,
     }
 }
 
@@ -934,7 +935,7 @@ fn test_metadata_hash_present() {
         &String::from_str(&env, "Engineer"),
         &build_milestones(&env),
         &vec![&env, 30u32, 90u32],
-        &EngagementConfig { metadata_hash: Some(cid.clone()), co_recruiter: None, recruiter_split_bps: 10_000 },
+        &EngagementConfig { metadata_hash: Some(cid.clone()), co_recruiter: None, recruiter_split_bps: 10_000, contract_pdf_hash: None },
     );
 
     let result = client.get_metadata_hash(&String::from_str(&env, "ENG-META"));
@@ -968,7 +969,7 @@ fn test_metadata_hash_empty_string_rejected() {
         &String::from_str(&env, "Engineer"),
         &build_milestones(&env),
         &vec![&env, 30u32, 90u32],
-        &EngagementConfig { metadata_hash: Some(String::from_str(&env, "")), co_recruiter: None, recruiter_split_bps: 10_000 },
+        &EngagementConfig { metadata_hash: Some(String::from_str(&env, "")), co_recruiter: None, recruiter_split_bps: 10_000, contract_pdf_hash: None },
     );
 }
 
@@ -987,6 +988,7 @@ fn test_co_recruiter_60_40_split() {
         metadata_hash: None,
         co_recruiter: Some(co_recruiter.clone()),
         recruiter_split_bps: 6_000,
+        contract_pdf_hash: None,
     };
 
     client.create_engagement(
@@ -1054,6 +1056,7 @@ fn test_split_bps_over_10000_rejected() {
         metadata_hash: None,
         co_recruiter: Some(co_recruiter),
         recruiter_split_bps: 10_001,
+        contract_pdf_hash: None,
     };
 
     client.create_engagement(
@@ -1085,6 +1088,7 @@ fn test_co_recruiter_gets_remainder() {
         metadata_hash: None,
         co_recruiter: Some(co_recruiter.clone()),
         recruiter_split_bps: 3_333,
+        contract_pdf_hash: None,
     };
 
     client.create_engagement(
@@ -1126,6 +1130,7 @@ fn test_co_recruiter_summary_fields() {
         metadata_hash: None,
         co_recruiter: Some(co_recruiter.clone()),
         recruiter_split_bps: 7_000,
+        contract_pdf_hash: None,
     };
 
     client.create_engagement(
@@ -1161,6 +1166,7 @@ fn test_split_bps_10000_accepted() {
         metadata_hash: None,
         co_recruiter: Some(co_recruiter.clone()),
         recruiter_split_bps: 10_000,
+        contract_pdf_hash: None,
     };
 
     client.create_engagement(
