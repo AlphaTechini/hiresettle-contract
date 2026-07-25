@@ -170,6 +170,7 @@ pub struct ArbiterVoteCounts {
     pub reject_votes: u32,
 }
 ```
+```
 
 Returned by `get_arbiter_votes` — lightweight view of the current tally without the voter list.
 
