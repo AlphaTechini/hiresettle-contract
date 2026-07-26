@@ -1,6 +1,8 @@
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, contracttype, token, Address, BytesN, Env, String, Symbol, Vec};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, token, Address, BytesN, Env, String, Symbol, Vec,
+};
 
 const MAX_PLATFORM_FEE_BPS: u32 = 500;
 const MAX_ARBITER_FEE_BPS: u32 = 200;
@@ -1309,6 +1311,36 @@ impl HireSettleContract {
     // RAISE DISPUTE
     // ----------------------------------------------------------
 
+    /// Raise a dispute on a milestone whose proof has been submitted by the
+    /// recruiter, moving it into `Disputed` status so that the contract's
+    /// arbiters can vote on the outcome.
+    ///
+    /// # Caller
+    /// `company` — must match the engagement's company address and sign
+    /// the transaction.
+    ///
+    /// # Behaviour
+    /// - The engagement must be `Active`.
+    /// - The target milestone must be in `ProofSubmitted` status.
+    /// - The dispute must be raised within the dispute window
+    ///   (default 51 840 ledgers ≈ 3 days) counted from
+    ///   `proof_submitted_at`.
+    /// - The milestone transitions to `Disputed` and the supplied `reason`
+    ///   (max 128 bytes) is stored for arbiter review.
+    /// - After this call the arbiter-vote flow can begin:
+    ///   see [`Self::cast_arbiter_vote`].
+    ///
+    /// # Panics
+    /// - `"ReasonTooLong"` — `reason` exceeds 128 bytes.
+    /// - `"engagement is not active"` — engagement is not `Active`.
+    /// - `"unauthorized"` — caller is not the engagement's company.
+    /// - `"can only dispute a submitted proof"` — milestone is not in
+    ///   `ProofSubmitted` status.
+    /// - `"DisputeWindowClosed"` — the dispute window has elapsed.
+    ///
+    /// # Events
+    /// Emits `("dispute_raised", engagement_id)` with
+    /// `(milestone_index, reason)`.
     pub fn raise_dispute(
         env: Env,
         company: Address,
@@ -3003,18 +3035,6 @@ impl HireSettleContract {
             .unwrap_or(0u32)
     }
 
-    fn decrement_company_active_count(env: &Env, company: &Address) {
-        let current: u32 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::CompanyActiveCount(company.clone()))
-            .unwrap_or(0u32);
-        let new_count = current.saturating_sub(1);
-        env.storage()
-            .persistent()
-            .set(&DataKey::CompanyActiveCount(company.clone()), &new_count);
-    }
-
     // ----------------------------------------------------------
     // ISSUE #38 — INACTIVITY TIMEOUT
     // ----------------------------------------------------------
@@ -3249,8 +3269,8 @@ impl HireSettleContract {
                 let prev = engagement.milestones.get(j).unwrap();
                 let done_already = prev.status == MilestoneStatus::Confirmed
                     || prev.status == MilestoneStatus::Resolved;
-                let done_in_batch = (0..milestone_indices.len())
-                    .any(|k| milestone_indices.get(k).unwrap() == j);
+                let done_in_batch =
+                    (0..milestone_indices.len()).any(|k| milestone_indices.get(k).unwrap() == j);
                 if !done_already && !done_in_batch {
                     panic!("PreviousMilestoneNotComplete");
                 }
@@ -3674,9 +3694,7 @@ impl HireSettleContract {
         if bps > MAX_ARBITER_FEE_BPS {
             panic!("ArbiterFeeTooHigh");
         }
-        env.storage()
-            .instance()
-            .set(&DataKey::ArbiterFee, &bps);
+        env.storage().instance().set(&DataKey::ArbiterFee, &bps);
         env.events()
             .publish((Symbol::new(&env, "arbiter_fee_set"),), bps);
     }
@@ -3867,11 +3885,7 @@ impl HireSettleContract {
                     &engagement.recruiter,
                     &primary_payment,
                 );
-                token_client.transfer(
-                    &env.current_contract_address(),
-                    co_recruiter,
-                    &co_payment,
-                );
+                token_client.transfer(&env.current_contract_address(), co_recruiter, &co_payment);
             }
             None => {
                 token_client.transfer(
