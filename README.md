@@ -678,3 +678,9 @@ stellar contract invoke \
 
 MIT
 
+---
+
+## Function: `confirm_milestone`
+
+Called by the hiring **company** to confirm a `ProofSubmitted` milestone. Releases the milestone payment from escrow, splits off the platform fee, and re-checks retention timing. Panics on unauthorized caller or invalid milestone state. Emits `milestone_confirmed`, `platform_fee_collected`, and (on final milestone) `engagement_completed`.
+
