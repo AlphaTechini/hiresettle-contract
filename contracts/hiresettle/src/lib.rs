@@ -43,6 +43,7 @@ pub enum MilestoneKind {
     Retention,
 }
 
+/// A payment and workflow checkpoint belonging to an [`Engagement`]'s `milestones`.
 #[contracttype]
 #[derive(Clone)]
 pub struct Milestone {
@@ -1511,9 +1512,15 @@ impl HireSettleContract {
             let old_status = milestone.status.clone();
             milestone.status = MilestoneStatus::Pending;
             milestone.proof_hash = String::from_str(&env, "");
+            milestone.proof_submitted_at = 0;
             engagement.milestones.set(milestone_index, milestone);
 
             env.storage().persistent().remove(&vote_key);
+            // A rejected proof starts a new submission round, so do not make
+            // the recruiter wait for the cooldown before replacing it.
+            env.storage()
+                .persistent()
+                .remove(&DataKey::LastProofAt(engagement_id.clone(), milestone_index));
             env.storage().persistent().remove(&DataKey::DisputeReason(
                 engagement_id.clone(),
                 milestone_index,
