@@ -1985,10 +1985,25 @@ impl HireSettleContract {
             .unwrap_or(DEFAULT_MIN_ENGAGEMENT_AMOUNT)
     }
 
+    /// Returns the full engagement record for a given engagement ID.
+    ///
+    /// # Returns
+    /// The complete [`Engagement`] struct containing all engagement details.
+    ///
+    /// # Panics
+    /// Panics with `"engagement not found"` if no engagement exists with the given `engagement_id`.
     pub fn get_engagement(env: Env, engagement_id: String) -> Engagement {
         Self::get_engagement_internal(&env, &engagement_id)
     }
 
+    /// Returns a specific milestone from an engagement.
+    ///
+    /// # Returns
+    /// The [`Milestone`] struct at the given index within the engagement's milestone list.
+    ///
+    /// # Panics
+    /// Panics with `"engagement not found"` if no engagement exists with the given `engagement_id`.
+    /// Panics with `"invalid milestone index"` if `milestone_index` is out of bounds for the engagement's milestones.
     pub fn get_milestone(env: Env, engagement_id: String, milestone_index: u32) -> Milestone {
         let engagement = Self::get_engagement_internal(&env, &engagement_id);
         engagement
@@ -2008,6 +2023,14 @@ impl HireSettleContract {
         statuses
     }
 
+    /// Returns the current escrow balance for an engagement.
+    ///
+    /// # Returns
+    /// The remaining escrow balance in the token's smallest unit (e.g., stroops).
+    /// Calculated as `total_amount - released_amount`.
+    ///
+    /// # Panics
+    /// Panics with `"engagement not found"` if no engagement exists with the given `engagement_id`.
     pub fn get_escrow_balance(env: Env, engagement_id: String) -> i128 {
         let engagement = Self::get_engagement_internal(&env, &engagement_id);
         engagement.total_amount - engagement.released_amount
