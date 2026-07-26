@@ -287,6 +287,18 @@ Each time an amendment is accepted, an [`AmendmentEntry`](#amendmententry) is ap
 
 ---
 
+## Token Allowlist
+
+The contract supports an optional allowlist to restrict which tokens can be used for escrow.
+
+### Configuration
+- **Toggle Allowlist**: The allowlist is toggled on or off using `set_token_allowlist_enabled(admin, enabled)`.
+- **Add Token**: New tokens are added to the allowlist with `add_allowed_token(admin, token_address)`.
+- **Remove Token**: Tokens are removed with `remove_allowed_token(admin, token_address)`.
+
+### Engagement Creation
+When the token allowlist is enabled, `create_engagement` will panic with `TokenNotAllowed` if the `token` passed is not in the allowed tokens list. If the allowlist is disabled, any valid SAC token is accepted.
+
 ## Public Function Reference
 
 ### Admin
@@ -348,7 +360,202 @@ claim_arbiter()
 Only the nominated address can complete the claim. Once claimed, the successor assumes the arbiter's position for future dispute voting while preserving the integrity of the arbitration panel.
 
 ### Read-Only Queries
-`get_engagement`, `get_engagement_summary`, `get_milestone`, `get_escrow_balance`, `get_total_released`, `get_metadata_hash`, `get_contract_pdf_hash`, `get_version`, `get_min_amount`, `get_platform_fee`, `get_pending_admin`, `get_amendment_ttl`, `get_amendment_log`, `get_pending_amendment`, `get_arbiter_votes`, `get_dispute_reason`, `get_replacement_reason`, `get_replacement_count`, `get_engagement_count`, `get_company_engagement_count`, `get_engagements_by_company`, `is_milestone_unlockable`, `ledgers_until_unlock`, `get_estimated_unlock_seconds`, `get_active_dispute_count`, `get_is_engagement_complete`, `get_unlock_progress`, `is_paused`, `get_ledgers_per_day`, `get_max_retention_days`, `get_max_milestones`, `get_inactivity_timeout_ledgers`, `get_storage_ttl_extend_to`, `get_confirm_window`, `get_dispute_window`, `get_max_proof_hash_length`, `get_arbiter_fee`, `get_upgrade_lock_duration`, `get_allowed_tokens`
+
+All read-only functions are permissionless and require no authentication.
+
+#### Engagement Queries
+
+| Function | Arguments | Return Type |
+|---|---|---|
+| `get_engagement` | `engagement_id: String` | `Engagement` |
+| `get_engagement_summary` | `engagement_id: String` | `EngagementSummary` |
+| `get_is_engagement_complete` | `engagement_id: String` | `bool` |
+| `get_active_dispute_count` | `engagement_id: String` | `u32` |
+| `get_unlock_progress` | `engagement_id: String` | `(u32, u32)` |
+| `get_metadata_hash` | `engagement_id: String` | `Option<String>` |
+| `get_contract_pdf_hash` | `engagement_id: String` | `Option<String>` |
+| `get_total_released` | `engagement_id: String` | `i128` |
+| `get_escrow_balance` | `engagement_id: String` | `i128` |
+
+#### Milestone Queries
+
+| Function | Arguments | Return Type |
+|---|---|---|
+| `get_milestone` | `engagement_id: String`, `milestone_index: u32` | `Milestone` |
+| `get_all_milestone_statuses` | `engagement_id: String` | `Vec<MilestoneStatus>` |
+| `is_milestone_unlockable` | `engagement_id: String`, `milestone_index: u32` | `bool` |
+| `ledgers_until_unlock` | `engagement_id: String`, `milestone_index: u32` | `u32` |
+| `get_estimated_unlock_seconds` | `engagement_id: String`, `milestone_index: u32` | `u64` |
+| `get_arbiter_votes` | `engagement_id: String`, `milestone_index: u32` | `ArbiterVoteCounts` |
+| `get_dispute_reason` | `engagement_id: String`, `milestone_index: u32` | `Option<String>` |
+
+#### Engagement Listing & Counting
+
+| Function | Arguments | Return Type |
+|---|---|---|
+| `get_engagement_count` | — | `u64` |
+| `get_company_engagement_count` | `company: Address` | `u32` |
+| `get_engagements_by_company` | `company: Address`, `page: u32`, `page_size: u32` | `Vec<String>` |
+| `get_company_active_count` | `company: Address` | `u32` |
+
+#### Amendment Queries
+
+| Function | Arguments | Return Type |
+|---|---|---|
+| `get_amendment_log` | `engagement_id: String`, `milestone_index: u32` | `Vec<AmendmentEntry>` |
+| `get_pending_amendment` | `engagement_id: String`, `milestone_index: u32` | `Option<AmendmentProposal>` |
+| `get_amendment_ttl` | — | `u32` |
+
+#### Replacement Queries
+
+| Function | Arguments | Return Type |
+|---|---|---|
+| `get_replacement_reason` | `engagement_id: String`, `replacement_index: u32` | `Option<String>` |
+| `get_replacement_count` | `engagement_id: String` | `u32` |
+
+#### Contract Config Getters
+
+| Function | Arguments | Return Type |
+|---|---|---|
+| `get_version` | — | `String` |
+| `get_min_amount` | — | `i128` |
+| `get_platform_fee` | — | `(u32, Address)` |
+| `get_ledgers_per_day` | — | `u32` |
+| `get_max_retention_days` | — | `u32` |
+| `get_max_milestones` | — | `u32` |
+| `get_max_replacements` | — | `u32` |
+| `get_max_active_per_company` | — | `u32` |
+| `get_inactivity_timeout_ledgers` | — | `u32` |
+| `get_storage_ttl_extend_to` | — | `u32` |
+| `get_confirm_window` | — | `u32` |
+| `get_dispute_window` | — | `u32` |
+| `get_max_proof_hash_length` | — | `u32` |
+| `get_arbiter_fee` | — | `u32` |
+| `get_upgrade_lock_duration` | — | `u32` |
+| `get_allowed_tokens` | — | `Vec<Address>` |
+
+#### Admin & Contract State
+
+| Function | Arguments | Return Type |
+|---|---|---|
+| `is_paused` | — | `bool` |
+| `get_admin` | — | `Address` |
+| `get_pending_admin` | — | `Option<Address>` |
+
+### Milestone Confirmation Functions
+
+HireSettle provides three milestone confirmation paths with different authorization, preconditions, and semantics. The canonical single-milestone `confirm_milestone` is documented here as a reference point so the two batch / force variants can be contrasted against it.
+
+---
+
+#### `confirm_milestone` — Single Milestone (Reference)
+
+Contract function reference: [confirm_milestone](file:///C:/Users/Shepherd/projects/hiresettle-contract/contracts/hiresettle/src/lib.rs#L1169-L1286)
+
+**Caller**: The engagement's `company` address. Requires authentication (`company.require_auth()`).
+
+**Preconditions**:
+- Engagement status is `Active`.
+- Milestone status is `ProofSubmitted` (recruiter has already submitted a proof hash).
+- **Sequential confirmation** (Issue #67): every milestone with a lower index must already be in `Confirmed` or `Resolved` status. A later milestone cannot leapfrog an earlier unfinished one.
+- For `Retention` milestones: `env.ledger().sequence() >= milestone.valid_after_ledger`. The retention time-gate is re-verified at confirmation time even if `unlock_milestone` was already called, preventing a company from accidentally confirming before the window truly elapses.
+- Contract is not paused.
+
+**Payment / Side effects**:
+- The gross share is `engagement.total_amount × milestone.payment_percent ÷ 100`. From this, `milestone.replacement_paid_out` is subtracted (Issue #183) so escrow topped up *after* a replacement reset still reaches the recruiter rather than getting permanently stuck in the contract.
+- Platform fee (bps × gross share ÷ 10 000) is transferred to the treasury.
+- The net remainder is distributed to the recruiter (and co-recruiter, if configured, per `recruiter_split_bps`).
+- Milestone moves to `Confirmed`; engagement moves to `Completed` if this was the last outstanding milestone.
+- Emits `milestone_confirmed` with `(milestone_index, payment)`.
+
+---
+
+#### `batch_confirm_milestones` — Atomic Multi-Milestone Confirmation
+
+Contract function reference: [batch_confirm_milestones](file:///C:/Users/Shepherd/projects/hiresettle-contract/contracts/hiresettle/src/lib.rs#L3195-L3332)
+
+Confirms several milestones in one transaction with a single company signature and all-or-nothing semantics. Useful when a batch of milestones (e.g. placement + 30-day retention) have proof submitted and the company wants to release them together.
+
+**Caller**: The engagement's `company` address. Requires authentication (`company.require_auth()`).
+
+**Arguments**:
+- `milestone_indices: Vec<u32>` — ordered list of milestone indices to confirm. Must be non-empty (panics with `EmptyIndices` otherwise).
+
+**Preconditions** (validated for every index in the batch *before* any state mutation or transfer):
+- Engagement status is `Active`.
+- Each target milestone is in `ProofSubmitted` status.
+- For each `Retention` milestone in the batch: `current_ledger >= valid_after_ledger`.
+- **Sequential confirmation (Issue #67 / #184)**: For every index `idx` in the batch, *all* milestones with index `< idx` must be either (a) already `Confirmed` or `Resolved` on-chain, *or* (b) present somewhere in `milestone_indices` itself. This allows a single batch to close a contiguous gap of unfinished milestones — e.g. confirming indices `[0, 1, 2]` atomically even if none of them were previously confirmed — while still forbidding index `[2]` without index `[1]`.
+
+**Differences from single `confirm_milestone`**:
+
+| Aspect | `confirm_milestone` | `batch_confirm_milestones` |
+|---|---|---|
+| Scope / signature | One `milestone_index` per tx. | `milestone_indices: Vec<u32>` — arbitrary count per tx. |
+| Atomicity | Single call per milestone. tx failure leaves prior milestones confirmed. | **Validate-all first, then mutate-all.** Any failing precondition in the batch rejects the entire transaction — no partial confirmations and no stuck half-paid batches. |
+| Sequential rule | Only prior on-chain `Confirmed`/`Resolved` milestones count. | Prior milestones may be either on-chain done **or** another entry in the same batch. |
+| Replacement paid-out handling | Deducts `milestone.replacement_paid_out` from the gross share (Issue #183). | **Does not deduct** `replacement_paid_out` — always pays the full `total_amount × payment_percent ÷ 100` gross share. |
+| Completion check | Checked once per call. | Checked once *after* the loop, so a batch that closes the final milestone(s) transitions the engagement to `Completed` and emits exactly one `engagement_completed`. |
+| Events per milestone | One `milestone_confirmed` event. | One `milestone_confirmed` event **per index** in the batch. |
+
+**Payment / Side effects**:
+- Identical per-milestone payout path (platform fee → treasury, net payout → recruiter(s), `released_amount` += gross) but **without** the `replacement_paid_out` subtraction (see above).
+- Milestones move to `Confirmed` in batch order; if the batch exhausts the engagement, engagement → `Completed`.
+
+---
+
+#### `force_confirm_milestone` — Confirm-Window Timeout Override
+
+Contract function reference: [force_confirm_milestone](file:///C:/Users/Shepherd/projects/hiresettle-contract/contracts/hiresettle/src/lib.rs#L3404-L3519)
+
+A permissionless keeper function that force-confirms a milestone whose proof was submitted but the company never acted on it within the configured confirm window. This is the "auto-confirm" safety net advertised in the feature table: it guarantees the recruiter eventually gets paid if the deliverable is not disputed, even if the company goes silent.
+
+**Caller**: **Any** address. `caller.require_auth()` is checked (so a real signature is required) but no role-based restriction is applied. The company, recruiter, an arbiter, or an unaffiliated keeper bot may all invoke it.
+
+**Preconditions**:
+- Engagement status is `Active`.
+- Milestone status is exactly `ProofSubmitted`.
+- **Confirm window has elapsed** — the timeout gate. See "Confirm Window" subsection below.
+- Contract is not paused.
+
+**Preconditions that `confirm_milestone` enforces but `force_confirm_milestone` intentionally skips**:
+- **No sequential-confirmation check**: A later milestone whose own confirm window has elapsed can be force-confirmed even if earlier milestones are still open. This keeps the timeout path usable even if an earlier milestone is stuck in a dispute.
+- **No retention time-gate re-check**: `force_confirm_milestone` does not re-verify `valid_after_ledger`. A `Retention` milestone in `ProofSubmitted` status has, by definition, already been unlocked (either by `unlock_milestone` or because it was a `Placement`), so the time-gate is not re-tested.
+- **No replacement paid-out deduction**: Always pays the full gross share, matching `batch_confirm_milestones` and contrasting with single `confirm_milestone`.
+
+**Confirm Window (Timeout Condition)**
+
+The confirm window is a global admin-configured ledger delta stored under `DataKey::ConfirmWindow`. It is managed by two admin/read functions:
+
+- [set_confirm_window](file:///C:/Users/Shepherd/projects/hiresettle-contract/contracts/hiresettle/src/lib.rs#L3355-L3362) — `set_confirm_window(env, admin, ledgers)`. Admin only. Sets the confirm-window ledger delta and emits `confirm_window_set`.
+- [get_confirm_window](file:///C:/Users/Shepherd/projects/hiresettle-contract/contracts/hiresettle/src/lib.rs#L3365-L3370) — `get_confirm_window(env) -> u32`. Read-only. Returns the active window; defaults to `DEFAULT_CONFIRM_WINDOW_LEDGERS = 86_400` (≈ 5 calendar days at 5 s / ledger) if admin has never set one.
+
+The force-confirm gate inside `force_confirm_milestone` is the **strict greater-than** inequality:
+
+```
+current_ledger  >  milestone.proof_submitted_at  +  confirm_window
+```
+
+If this does not hold, the call panics with `ConfirmWindowNotElapsed`. In particular, equality (`==`) is **not** sufficient: callers must wait one additional ledger past the deadline.
+
+`proof_submitted_at` is populated by `submit_proof` at the moment the recruiter's proof hash is accepted, and is part of the on-chain `Milestone` struct.
+
+**Differences from single `confirm_milestone` (summary)**:
+
+| Aspect | `confirm_milestone` | `force_confirm_milestone` |
+|---|---|---|
+| Caller restriction | `company` only. | **Any** authenticated address (permissionless). |
+| Gate | Company signature. | Confirm-window elapsed since `proof_submitted_at`. |
+| Sequential rule | Enforced. | Skipped. |
+| Retention time-gate re-checked | Yes. | No. |
+| Replacement paid-out handling | Deducted from gross share. | Not deducted. |
+| Authorization path | `company.require_auth()`. | `caller.require_auth()` with no role check. |
+| Emitted event | `milestone_confirmed`. | **`milestone_force_confirmed`** (distinct symbol for off-chain indexers to distinguish timeout-driven payouts from genuine company approvals). |
+
+**Payment / Side effects**:
+- Identical transfer mechanics to `confirm_milestone` (gross share, platform fee deduction, recruiter / co-recruiter distribution) except without the `replacement_paid_out` subtraction.
+- Milestone → `Confirmed`; engagement → `Completed` if this closes the last outstanding milestone.
+- Emits `milestone_force_confirmed` with `(milestone_index, payment)`.
 
 ---
 

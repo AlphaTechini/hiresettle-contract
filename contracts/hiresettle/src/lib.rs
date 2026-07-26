@@ -45,6 +45,7 @@ pub enum MilestoneKind {
     Retention,
 }
 
+/// A payment and workflow checkpoint belonging to an [`Engagement`]'s `milestones`.
 #[contracttype]
 #[derive(Clone)]
 pub struct Milestone {
@@ -275,7 +276,13 @@ pub struct ArbiterVoteCounts {
 #[contracttype]
 #[derive(Clone)]
 pub struct ArbiterNomination {
+    /// The arbiter initiating the handover. Set when `nominate_arbiter_successor`
+    /// is called; used by `claim_arbiter` to locate the correct slot in
+    /// `engagement.arbiters` and replace it with the incoming nominee.
     pub current: Address,
+    /// The address authorised to complete the succession by calling
+    /// `claim_arbiter`. Only this exact address may claim the slot; any other
+    /// caller is rejected with `"unauthorized"`.
     pub nominee: Address,
 }
 
@@ -1537,9 +1544,15 @@ impl HireSettleContract {
             let old_status = milestone.status.clone();
             milestone.status = MilestoneStatus::Pending;
             milestone.proof_hash = String::from_str(&env, "");
+            milestone.proof_submitted_at = 0;
             engagement.milestones.set(milestone_index, milestone);
 
             env.storage().persistent().remove(&vote_key);
+            // A rejected proof starts a new submission round, so do not make
+            // the recruiter wait for the cooldown before replacing it.
+            env.storage()
+                .persistent()
+                .remove(&DataKey::LastProofAt(engagement_id.clone(), milestone_index));
             env.storage().persistent().remove(&DataKey::DisputeReason(
                 engagement_id.clone(),
                 milestone_index,
