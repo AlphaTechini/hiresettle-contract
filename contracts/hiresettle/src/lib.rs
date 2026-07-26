@@ -1847,6 +1847,54 @@ impl HireSettleContract {
     // CANCEL ENGAGEMENT
     // ----------------------------------------------------------
 
+    /// Cancel an engagement and refund any unreleased escrow to the company.
+    ///
+    /// # Caller
+    /// Requires authentication from both `company` and `recruiter` — each
+    /// address is validated against `engagement.company` / `engagement.recruiter`
+    /// and must call `require_auth`. The two addresses together must agree to
+    /// the cancellation; neither party can cancel unilaterally.
+    ///
+    /// # Precondition
+    /// Intended for cancellation **before any milestones have been confirmed**,
+    /// the point at which `released_amount == 0` and the full `total_amount`
+    /// is still refundable to the company. Once the placement milestone has
+    /// already been `Confirmed` / `Resolved`, prefer
+    /// [`Self::request_replacement`] instead — `cancel_engagement` is still
+    /// callable on a `ReplacementRequested` engagement because
+    /// `request_replacement` may have been invoked already, but it will only
+    /// refund the unreleased remainder rather than the full fee.
+    ///
+    /// Strictly enforced: the engagement must be in `Active` or
+    /// `ReplacementRequested` status; any other state (`Completed`,
+    /// `Cancelled`, `Expired`, `ExitRequested`) is rejected. The contract
+    /// must also not be paused, otherwise the call also fails — see
+    /// [`Self::assert_not_paused`].
+    ///
+    /// # Refund behaviour
+    /// Transfers `engagement.total_amount - engagement.released_amount` from
+    /// the contract's escrow back to `engagement.company` using the
+    /// engagement's escrow token.
+    ///
+    /// Side effects after the refund:
+    /// - Engagement status is set to the terminal `Cancelled` state.
+    /// - Any pending `AmendmentProposal`s for the engagement's milestones
+    ///   are cleared, so `accept_amendment` / `reject_amendment` cannot
+    ///   mutate a cancelled engagement (see issue #176).
+    /// - The per-company active engagement counter is decremented.
+    ///
+    /// # Panics
+    /// - `"ContractPaused"` — the contract is paused (raised by
+    ///   [`Self::assert_not_paused`] before authentication).
+    /// - `"engagement is not active"` — engagement is not in `Active` or
+    ///   `ReplacementRequested` status.
+    /// - `"unauthorized"` — `company` does not match `engagement.company`
+    ///   or `recruiter` does not match `engagement.recruiter`.
+    ///
+    /// # Events
+    /// Emits `("engagement_cancelled", engagement_id)` with the `refund`
+    /// amount as the event body, in addition to the usual
+    /// `engagement_status_changed` status transition event.
     pub fn cancel_engagement(
         env: Env,
         company: Address,
