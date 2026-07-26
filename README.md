@@ -663,7 +663,7 @@ stellar contract invoke \
 
 - [x] Core escrow + milestone logic
 - [x] Time-gated retention milestones (ledger-based unlock)
-- [x] Replacement clause with clock reset
+- [x] Replacement clause with clock reset (`request_replacement`: company-only, requires confirmed Placement; resets the Placement milestone, restarts retention clocks, panics on bad preconditions, and emits the `replacement_requested` event)
 - [x] Dispute resolution via arbiter
 - [x] Flexible milestone structure (2-milestone 50/50, 3-milestone, custom)
 - [x] 11 unit tests
