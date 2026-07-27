@@ -907,7 +907,7 @@ impl HireSettleContract {
         let engagement = Engagement {
             id: engagement_id.clone(),
             company: company.clone(),
-            recruiter,
+            recruiter: recruiter.clone(),
             arbiters,
             quorum,
             token,
