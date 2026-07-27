@@ -345,6 +345,8 @@ pub enum DataKey {
     Paused,
     /// Pending admin transfer nomination address (persistent).
     PendingAdmin,
+    /// Proposed new recruiter address awaiting company acceptance (issue #44).
+    ProposedRecruiterTransfer(String),
     /// Admin-configurable proof resubmission cooldown in ledgers (default 2 880).
     ProofCooldown,
     /// Ledger at which the last proof was submitted for (engagement_id, milestone_index).
@@ -905,7 +907,7 @@ impl HireSettleContract {
         let engagement = Engagement {
             id: engagement_id.clone(),
             company: company.clone(),
-            recruiter,
+            recruiter: recruiter.clone(),
             arbiters,
             quorum,
             token,
@@ -1577,9 +1579,10 @@ impl HireSettleContract {
             env.storage().persistent().remove(&vote_key);
             // A rejected proof starts a new submission round, so do not make
             // the recruiter wait for the cooldown before replacing it.
-            env.storage()
-                .persistent()
-                .remove(&DataKey::LastProofAt(engagement_id.clone(), milestone_index));
+            env.storage().persistent().remove(&DataKey::LastProofAt(
+                engagement_id.clone(),
+                milestone_index,
+            ));
             env.storage().persistent().remove(&DataKey::DisputeReason(
                 engagement_id.clone(),
                 milestone_index,
@@ -1867,6 +1870,118 @@ impl HireSettleContract {
                 engagement_id.clone(),
             ),
             (old_company, new_company),
+        );
+    }
+
+    // ----------------------------------------------------------
+    // ISSUE #44 — RECRUITER TRANSFER
+    // ----------------------------------------------------------
+
+    /// Propose a transfer of the recruiter role to a new address.
+    ///
+    /// The current recruiter initiates the transfer by specifying the
+    /// `new_recruiter` address. The company must then call
+    /// [`Self::accept_recruiter_transfer`] for the change to take effect.
+    /// Until accepted, all payouts continue to go to the original recruiter.
+    ///
+    /// # Caller
+    /// `recruiter` — must match `engagement.recruiter` and sign the transaction.
+    ///
+    /// # Panics
+    /// - `"unauthorized"` — caller is not the engagement's current recruiter.
+    /// - `"engagement is not active"` — engagement status is not `Active` or
+    ///   `ReplacementRequested`.
+    pub fn propose_recruiter_transfer(
+        env: Env,
+        recruiter: Address,
+        engagement_id: String,
+        new_recruiter: Address,
+    ) {
+        Self::assert_not_paused(&env);
+        recruiter.require_auth();
+
+        let engagement = Self::get_engagement_internal(&env, &engagement_id);
+
+        if recruiter != engagement.recruiter {
+            panic!("{}", ERR_UNAUTHORIZED);
+        }
+
+        if engagement.status != EngagementStatus::Active
+            && engagement.status != EngagementStatus::ReplacementRequested
+        {
+            panic!("{}", ERR_ENGAGEMENT_NOT_ACTIVE);
+        }
+
+        env.storage().persistent().set(
+            &DataKey::ProposedRecruiterTransfer(engagement_id.clone()),
+            &new_recruiter,
+        );
+
+        let extend_to = Self::get_storage_ttl_extend_to(env.clone());
+        env.storage().persistent().extend_ttl(
+            &DataKey::ProposedRecruiterTransfer(engagement_id),
+            100_000,
+            extend_to,
+        );
+    }
+
+    /// Accept a pending recruiter transfer and update the engagement's recruiter.
+    ///
+    /// The company finalises the transfer that was proposed by the current
+    /// recruiter. After this call, all future payouts go to the new recruiter.
+    ///
+    /// # Caller
+    /// `company` — must match `engagement.company` and sign the transaction.
+    ///
+    /// # Panics
+    /// - `"unauthorized"` — caller is not the engagement's company.
+    /// - `"engagement is not active"` — engagement status is not `Active` or
+    ///   `ReplacementRequested`.
+    /// - `"no pending recruiter transfer"` — there is no active proposal.
+    ///
+    /// # Events
+    /// - `("recruiter_transferred", engagement_id)` with `(old_recruiter, new_recruiter)`.
+    pub fn accept_recruiter_transfer(env: Env, company: Address, engagement_id: String) {
+        Self::assert_not_paused(&env);
+        company.require_auth();
+
+        let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
+
+        if company != engagement.company {
+            panic!("{}", ERR_UNAUTHORIZED);
+        }
+
+        if engagement.status != EngagementStatus::Active
+            && engagement.status != EngagementStatus::ReplacementRequested
+        {
+            panic!("{}", ERR_ENGAGEMENT_NOT_ACTIVE);
+        }
+
+        let new_recruiter: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ProposedRecruiterTransfer(engagement_id.clone()))
+            .unwrap_or_else(|| panic!("no pending recruiter transfer"));
+
+        let old_recruiter = engagement.recruiter.clone();
+        engagement.recruiter = new_recruiter.clone();
+        engagement.last_activity_ledger = env.ledger().sequence();
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::ProposedRecruiterTransfer(engagement_id.clone()));
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Engagement(engagement_id.clone()), &engagement);
+        Self::extend_engagement_ttl(&env, &engagement_id);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "recruiter_transferred"),
+                engagement_id.clone(),
+            ),
+            (old_recruiter, new_recruiter),
         );
     }
 
