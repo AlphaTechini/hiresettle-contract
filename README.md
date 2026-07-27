@@ -46,6 +46,54 @@ HireSettle governs the relationship between a **hiring company** and a **recruit
 - **Escrow** — Funds are transferred from the company to the contract at creation. Milestone payments release proportional amounts to the recruiter (minus platform fees). Remaining escrow is refunded on cancellation or expiry.
 - **Dispute Resolution** — The company raises a dispute on a proof-submitted milestone. Arbiters vote approve/reject; if `approve_votes >= quorum`, payment is released; if `reject_votes > arbiters.len() - quorum`, the proof is cleared and the milestone returns to `Pending`.
 
+### Milestone State Machine
+
+Each milestone transitions through the following states. For `Retention` milestones the initial state is `Locked`; `Placement` milestones start in `Pending`.
+
+```
+
+   ┌────────┐  unlock   ┌─────────┐  submit   ┌───────────────┐
+   │ Locked │ ────────> │ Pending │ ────────> │ ProofSubmitted │
+   └────────┘           └─────────┘            └───────┬───────┘
+                        ^                              │
+                        │          ┌────────────────────┼────────────────┐
+                        │          │                    │                │
+                        │          v                    v                │
+                        │   ┌──────────┐         ┌──────────┐           │
+                        │   │ Resolved │         │ Disputed │           │
+                        │   └──────────┘         └─────┬────┘           │
+                        │                              │                │
+                        │              ┌───────────────┼────────────┐   │
+                        │              │               │            │   │
+                        │              v               v            │   │
+                        │    ┌──────────────────┐ ┌───────────┐     │   │
+                        │    │ Reject quorum    │ │ Approve   │     │   │
+                        │    │ (back to Pending)│ │ quorum    │     │   │
+                        │    └──────────────────┘ │ (released)│     │   │
+                        │                         └─────┬─────┘     │   │
+                        │                               │           │   │
+                        └───────────────────────────────┼───────────┘   │
+                                                         │               │
+                                                         v               │
+                                                    ┌──────────┐         │
+                                                    │ Confirmed│ <───────┘
+                                                    └──────────┘
+
+   force_confirm_milestone can also move ProofSubmitted → Confirmed
+   after the confirm window elapses.
+
+   batch_confirm_milestones can confirm multiple ProofSubmitted
+   milestones atomically.
+```
+
+**Dispute Resolution Flow** (via `cast_arbiter_vote`):
+
+1. Company calls `raise_dispute` → milestone moves to `Disputed`.
+2. Arbiters call `cast_arbiter_vote(approve=true/false)`.
+3. When `approve_votes >= quorum` → payment released, milestone → `Confirmed`.
+4. When `reject_votes > arbiters.len() - quorum` → proof cleared, milestone returns to `Pending`.
+5. Vote tally stored as `ArbiterVoteRecord`; duplicate votes rejected.
+
 ---
 
 ## Key Features
