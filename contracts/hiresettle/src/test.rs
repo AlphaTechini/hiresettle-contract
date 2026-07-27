@@ -3433,6 +3433,26 @@ fn test_get_engagements_by_company_empty_company() {
     assert_eq!(result.len(), 0);
 }
 
+// Issue #172: `page * page_size` and `start + page_size` would overflow u32
+// with naive arithmetic for large inputs. Both `page` and `page_size` here
+// are chosen so their product and sum overflow u32::MAX; the saturating
+// arithmetic in `get_engagements_by_company` must clamp instead of panicking.
+#[test]
+fn test_get_engagements_by_company_large_page_size_does_not_overflow() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    create_standard_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-OVERFLOW",
+    );
+
+    let result = client.get_engagements_by_company(&company, &u32::MAX, &u32::MAX);
+    assert_eq!(result.len(), 0);
+
+    let result = client.get_engagements_by_company(&company, &1, &u32::MAX);
+    assert_eq!(result.len(), 0);
+}
+
 #[test]
 fn test_get_engagements_first_page_ten() {
     let (env, contract_id, token_id, company, recruiter, arbiter) = setup();

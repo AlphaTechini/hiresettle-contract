@@ -438,6 +438,14 @@ const DEFAULT_MAX_ACTIVE_PER_COMPANY: u32 = 50;
 /// Default maximum number of replacements allowed per engagement (issue #31).
 const DEFAULT_MAX_REPLACEMENTS: u32 = 3;
 
+/// Shared panic message constants for the most-repeated error strings
+/// (issue #171). Keeping these as constants means a typo can't silently
+/// create an inconsistent error surface for off-chain consumers matching
+/// on these strings.
+const ERR_UNAUTHORIZED: &str = "unauthorized";
+const ERR_ENGAGEMENT_NOT_ACTIVE: &str = "engagement is not active";
+const ERR_INVALID_MILESTONE_INDEX: &str = "invalid milestone index";
+
 #[contractimpl]
 impl HireSettleContract {
     // ----------------------------------------------------------
@@ -598,7 +606,7 @@ impl HireSettleContract {
             .unwrap_or_else(|| panic!("no pending admin nomination"));
 
         if nominee != pending {
-            panic!("unauthorized");
+            panic!("{}", ERR_UNAUTHORIZED);
         }
 
         env.storage().instance().set(&DataKey::Admin, &nominee);
@@ -624,7 +632,15 @@ impl HireSettleContract {
     /// Set the minimum ledger gap between successive proof submissions on the
     /// same milestone. Only callable by the admin set during `init`.
     pub fn set_proof_cooldown(env: Env, admin: Address, ledgers: u32) {
-        Self::assert_admin(&env, &admin);
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic!("contract not initialised"));
+        if admin != stored_admin {
+            panic!("{}", ERR_UNAUTHORIZED);
+        }
         env.storage()
             .instance()
             .set(&DataKey::ProofCooldown, &ledgers);
@@ -986,10 +1002,10 @@ impl HireSettleContract {
         let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
 
         if engagement.status != EngagementStatus::Active {
-            panic!("engagement is not active");
+            panic!("{}", ERR_ENGAGEMENT_NOT_ACTIVE);
         }
 
-        let mut milestone = engagement.milestones.get(milestone_index).unwrap();
+        let mut milestone = Self::get_milestone_or_panic(&engagement, milestone_index);
 
         if milestone.status != MilestoneStatus::Locked {
             panic!("milestone is not locked");
@@ -1090,14 +1106,14 @@ impl HireSettleContract {
         if engagement.status != EngagementStatus::Active
             && engagement.status != EngagementStatus::ReplacementRequested
         {
-            panic!("engagement is not active");
+            panic!("{}", ERR_ENGAGEMENT_NOT_ACTIVE);
         }
 
         if recruiter != engagement.recruiter {
-            panic!("unauthorized");
+            panic!("{}", ERR_UNAUTHORIZED);
         }
 
-        let mut milestone = engagement.milestones.get(milestone_index).unwrap();
+        let mut milestone = Self::get_milestone_or_panic(&engagement, milestone_index);
 
         if milestone.status != MilestoneStatus::Pending {
             panic!("milestone is not pending");
@@ -1198,14 +1214,14 @@ impl HireSettleContract {
         let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
 
         if engagement.status != EngagementStatus::Active {
-            panic!("engagement is not active");
+            panic!("{}", ERR_ENGAGEMENT_NOT_ACTIVE);
         }
 
         if company != engagement.company {
-            panic!("unauthorized");
+            panic!("{}", ERR_UNAUTHORIZED);
         }
 
-        let mut milestone = engagement.milestones.get(milestone_index).unwrap();
+        let mut milestone = Self::get_milestone_or_panic(&engagement, milestone_index);
 
         if milestone.status != MilestoneStatus::ProofSubmitted {
             panic!("milestone proof not yet submitted");
@@ -1368,14 +1384,14 @@ impl HireSettleContract {
         let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
 
         if engagement.status != EngagementStatus::Active {
-            panic!("engagement is not active");
+            panic!("{}", ERR_ENGAGEMENT_NOT_ACTIVE);
         }
 
         if company != engagement.company {
-            panic!("unauthorized");
+            panic!("{}", ERR_UNAUTHORIZED);
         }
 
-        let mut milestone = engagement.milestones.get(milestone_index).unwrap();
+        let mut milestone = Self::get_milestone_or_panic(&engagement, milestone_index);
 
         if milestone.status != MilestoneStatus::ProofSubmitted {
             panic!("can only dispute a submitted proof");
@@ -1444,16 +1460,16 @@ impl HireSettleContract {
         let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
 
         if engagement.status != EngagementStatus::Active {
-            panic!("engagement is not active");
+            panic!("{}", ERR_ENGAGEMENT_NOT_ACTIVE);
         }
 
         let is_arbiter =
             (0..engagement.arbiters.len()).any(|i| engagement.arbiters.get(i).unwrap() == arbiter);
         if !is_arbiter {
-            panic!("unauthorized");
+            panic!("{}", ERR_UNAUTHORIZED);
         }
 
-        let mut milestone = engagement.milestones.get(milestone_index).unwrap();
+        let mut milestone = Self::get_milestone_or_panic(&engagement, milestone_index);
 
         if milestone.status != MilestoneStatus::Disputed {
             panic!("milestone is not in disputed status");
@@ -1620,11 +1636,11 @@ impl HireSettleContract {
         let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
 
         if engagement.status != EngagementStatus::Active {
-            panic!("engagement is not active");
+            panic!("{}", ERR_ENGAGEMENT_NOT_ACTIVE);
         }
 
         if company != engagement.company {
-            panic!("unauthorized");
+            panic!("{}", ERR_UNAUTHORIZED);
         }
 
         let placement_confirmed = {
@@ -1827,13 +1843,13 @@ impl HireSettleContract {
         let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
 
         if current_company != engagement.company {
-            panic!("unauthorized");
+            panic!("{}", ERR_UNAUTHORIZED);
         }
 
         if engagement.status != EngagementStatus::Active
             && engagement.status != EngagementStatus::ReplacementRequested
         {
-            panic!("engagement is not active");
+            panic!("{}", ERR_ENGAGEMENT_NOT_ACTIVE);
         }
 
         let old_company = engagement.company.clone();
@@ -1858,6 +1874,54 @@ impl HireSettleContract {
     // CANCEL ENGAGEMENT
     // ----------------------------------------------------------
 
+    /// Cancel an engagement and refund any unreleased escrow to the company.
+    ///
+    /// # Caller
+    /// Requires authentication from both `company` and `recruiter` — each
+    /// address is validated against `engagement.company` / `engagement.recruiter`
+    /// and must call `require_auth`. The two addresses together must agree to
+    /// the cancellation; neither party can cancel unilaterally.
+    ///
+    /// # Precondition
+    /// Intended for cancellation **before any milestones have been confirmed**,
+    /// the point at which `released_amount == 0` and the full `total_amount`
+    /// is still refundable to the company. Once the placement milestone has
+    /// already been `Confirmed` / `Resolved`, prefer
+    /// [`Self::request_replacement`] instead — `cancel_engagement` is still
+    /// callable on a `ReplacementRequested` engagement because
+    /// `request_replacement` may have been invoked already, but it will only
+    /// refund the unreleased remainder rather than the full fee.
+    ///
+    /// Strictly enforced: the engagement must be in `Active` or
+    /// `ReplacementRequested` status; any other state (`Completed`,
+    /// `Cancelled`, `Expired`, `ExitRequested`) is rejected. The contract
+    /// must also not be paused, otherwise the call also fails — see
+    /// [`Self::assert_not_paused`].
+    ///
+    /// # Refund behaviour
+    /// Transfers `engagement.total_amount - engagement.released_amount` from
+    /// the contract's escrow back to `engagement.company` using the
+    /// engagement's escrow token.
+    ///
+    /// Side effects after the refund:
+    /// - Engagement status is set to the terminal `Cancelled` state.
+    /// - Any pending `AmendmentProposal`s for the engagement's milestones
+    ///   are cleared, so `accept_amendment` / `reject_amendment` cannot
+    ///   mutate a cancelled engagement (see issue #176).
+    /// - The per-company active engagement counter is decremented.
+    ///
+    /// # Panics
+    /// - `"ContractPaused"` — the contract is paused (raised by
+    ///   [`Self::assert_not_paused`] before authentication).
+    /// - `"engagement is not active"` — engagement is not in `Active` or
+    ///   `ReplacementRequested` status.
+    /// - `"unauthorized"` — `company` does not match `engagement.company`
+    ///   or `recruiter` does not match `engagement.recruiter`.
+    ///
+    /// # Events
+    /// Emits `("engagement_cancelled", engagement_id)` with the `refund`
+    /// amount as the event body, in addition to the usual
+    /// `engagement_status_changed` status transition event.
     pub fn cancel_engagement(
         env: Env,
         company: Address,
@@ -1873,15 +1937,15 @@ impl HireSettleContract {
         if engagement.status != EngagementStatus::Active
             && engagement.status != EngagementStatus::ReplacementRequested
         {
-            panic!("engagement is not active");
+            panic!("{}", ERR_ENGAGEMENT_NOT_ACTIVE);
         }
 
         if company != engagement.company {
-            panic!("unauthorized");
+            panic!("{}", ERR_UNAUTHORIZED);
         }
 
         if recruiter != engagement.recruiter {
-            panic!("unauthorized");
+            panic!("{}", ERR_UNAUTHORIZED);
         }
 
         let refund = engagement.total_amount - engagement.released_amount;
@@ -1946,11 +2010,11 @@ impl HireSettleContract {
         if engagement.status != EngagementStatus::Active
             && engagement.status != EngagementStatus::ReplacementRequested
         {
-            panic!("engagement is not active");
+            panic!("{}", ERR_ENGAGEMENT_NOT_ACTIVE);
         }
 
         if company != engagement.company {
-            panic!("unauthorized");
+            panic!("{}", ERR_UNAUTHORIZED);
         }
 
         if amount <= 0 {
@@ -2017,10 +2081,7 @@ impl HireSettleContract {
     /// Panics with `"invalid milestone index"` if `milestone_index` is out of bounds for the engagement's milestones.
     pub fn get_milestone(env: Env, engagement_id: String, milestone_index: u32) -> Milestone {
         let engagement = Self::get_engagement_internal(&env, &engagement_id);
-        engagement
-            .milestones
-            .get(milestone_index)
-            .unwrap_or_else(|| panic!("invalid milestone index"))
+        Self::get_milestone_or_panic(&engagement, milestone_index)
     }
 
     /// Returns the status of every milestone in the engagement, ordered by
@@ -2052,10 +2113,7 @@ impl HireSettleContract {
     /// it can currently be unlocked via `unlock_milestone`.
     pub fn is_milestone_unlockable(env: Env, engagement_id: String, milestone_index: u32) -> bool {
         let engagement = Self::get_engagement_internal(&env, &engagement_id);
-        let milestone = engagement
-            .milestones
-            .get(milestone_index)
-            .unwrap_or_else(|| panic!("invalid milestone index"));
+        let milestone = Self::get_milestone_or_panic(&engagement, milestone_index);
 
         milestone.status == MilestoneStatus::Locked
             && env.ledger().sequence() >= milestone.valid_after_ledger
@@ -2069,10 +2127,7 @@ impl HireSettleContract {
     /// `env.ledger().sequence() >= milestone.valid_after_ledger` holds.
     pub fn ledgers_until_unlock(env: Env, engagement_id: String, milestone_index: u32) -> u32 {
         let engagement = Self::get_engagement_internal(&env, &engagement_id);
-        let milestone = engagement
-            .milestones
-            .get(milestone_index)
-            .unwrap_or_else(|| panic!("invalid milestone index"));
+        let milestone = Self::get_milestone_or_panic(&engagement, milestone_index);
 
         let current = env.ledger().sequence();
         if current >= milestone.valid_after_ledger {
@@ -2090,10 +2145,7 @@ impl HireSettleContract {
         milestone_index: u32,
     ) -> u64 {
         let engagement = Self::get_engagement_internal(&env, &engagement_id);
-        let milestone = engagement
-            .milestones
-            .get(milestone_index)
-            .unwrap_or_else(|| panic!("invalid milestone index"));
+        let milestone = Self::get_milestone_or_panic(&engagement, milestone_index);
 
         if milestone.kind == MilestoneKind::Placement {
             return 0;
@@ -2210,7 +2262,7 @@ impl HireSettleContract {
         let is_arbiter =
             (0..engagement.arbiters.len()).any(|i| engagement.arbiters.get(i).unwrap() == arbiter);
         if !is_arbiter {
-            panic!("unauthorized");
+            panic!("{}", ERR_UNAUTHORIZED);
         }
 
         let nomination = ArbiterNomination {
@@ -2254,7 +2306,7 @@ impl HireSettleContract {
             .unwrap_or_else(|| panic!("no pending arbiter nomination"));
 
         if nominee != nomination.nominee {
-            panic!("unauthorized");
+            panic!("{}", ERR_UNAUTHORIZED);
         }
 
         let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
@@ -2319,7 +2371,17 @@ impl HireSettleContract {
     /// - `admin`   — must be the contract admin
     /// - `ledgers` — number of ledgers before a proposal expires
     pub fn set_amendment_ttl(env: Env, admin: Address, ledgers: u32) {
-        Self::assert_admin(&env, &admin);
+        admin.require_auth();
+
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic!("admin not set"));
+
+        if admin != stored_admin {
+            panic!("{}", ERR_UNAUTHORIZED);
+        }
 
         env.storage()
             .persistent()
@@ -2360,13 +2422,10 @@ impl HireSettleContract {
         let engagement = Self::get_engagement_internal(&env, &engagement_id);
 
         if proposer != engagement.company && proposer != engagement.recruiter {
-            panic!("unauthorized");
+            panic!("{}", ERR_UNAUTHORIZED);
         }
 
-        let _ = engagement
-            .milestones
-            .get(milestone_index)
-            .unwrap_or_else(|| panic!("invalid milestone index"));
+        let _ = Self::get_milestone_or_panic(&engagement, milestone_index);
 
         if new_payment_percent > 100 {
             panic!("payment percent must be 0-100");
@@ -2431,7 +2490,7 @@ impl HireSettleContract {
         let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
 
         if acceptor != engagement.company && acceptor != engagement.recruiter {
-            panic!("unauthorized");
+            panic!("{}", ERR_UNAUTHORIZED);
         }
 
         let proposal: AmendmentProposal = env
@@ -2468,10 +2527,7 @@ impl HireSettleContract {
             panic!("amendment_expired");
         }
 
-        let mut milestone = engagement
-            .milestones
-            .get(milestone_index)
-            .unwrap_or_else(|| panic!("invalid milestone index"));
+        let mut milestone = Self::get_milestone_or_panic(&engagement, milestone_index);
 
         let old_payment_percent = milestone.payment_percent;
         milestone.payment_percent = proposal.new_payment_percent;
@@ -2554,7 +2610,7 @@ impl HireSettleContract {
         let engagement = Self::get_engagement_internal(&env, &engagement_id);
 
         if rejector != engagement.company && rejector != engagement.recruiter {
-            panic!("unauthorized");
+            panic!("{}", ERR_UNAUTHORIZED);
         }
 
         let proposal: AmendmentProposal = env
@@ -2727,11 +2783,11 @@ impl HireSettleContract {
         let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
 
         if engagement.status != EngagementStatus::Active {
-            panic!("engagement is not active");
+            panic!("{}", ERR_ENGAGEMENT_NOT_ACTIVE);
         }
 
         if recruiter != engagement.recruiter {
-            panic!("unauthorized");
+            panic!("{}", ERR_UNAUTHORIZED);
         }
 
         let old_engagement_status = engagement.status.clone();
@@ -2783,14 +2839,7 @@ impl HireSettleContract {
         company.require_auth();
 
         let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
-
-        if engagement.status != EngagementStatus::ExitRequested {
-            panic!("no exit request pending");
-        }
-
-        if company != engagement.company {
-            panic!("unauthorized");
-        }
+        Self::assert_exit_request_pending(&engagement, &company);
 
         let refund = engagement.total_amount - engagement.released_amount;
         if refund > 0 {
@@ -2851,14 +2900,7 @@ impl HireSettleContract {
         company.require_auth();
 
         let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
-
-        if engagement.status != EngagementStatus::ExitRequested {
-            panic!("no exit request pending");
-        }
-
-        if company != engagement.company {
-            panic!("unauthorized");
-        }
+        Self::assert_exit_request_pending(&engagement, &company);
 
         let old_engagement_status = engagement.status.clone();
         engagement.status = EngagementStatus::Active;
@@ -3312,20 +3354,17 @@ impl HireSettleContract {
         let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
 
         if engagement.status != EngagementStatus::Active {
-            panic!("engagement is not active");
+            panic!("{}", ERR_ENGAGEMENT_NOT_ACTIVE);
         }
 
         if company != engagement.company {
-            panic!("unauthorized");
+            panic!("{}", ERR_UNAUTHORIZED);
         }
 
         // Validate all milestones first (atomic rejection)
         for i in 0..milestone_indices.len() {
             let idx = milestone_indices.get(i).unwrap();
-            let m = engagement
-                .milestones
-                .get(idx)
-                .unwrap_or_else(|| panic!("invalid milestone index"));
+            let m = Self::get_milestone_or_panic(&engagement, idx);
             if m.status != MilestoneStatus::ProofSubmitted {
                 panic!("milestone proof not yet submitted");
             }
@@ -3517,13 +3556,10 @@ impl HireSettleContract {
         let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
 
         if engagement.status != EngagementStatus::Active {
-            panic!("engagement is not active");
+            panic!("{}", ERR_ENGAGEMENT_NOT_ACTIVE);
         }
 
-        let mut milestone = engagement
-            .milestones
-            .get(milestone_index)
-            .unwrap_or_else(|| panic!("invalid milestone index"));
+        let mut milestone = Self::get_milestone_or_panic(&engagement, milestone_index);
 
         if milestone.status != MilestoneStatus::ProofSubmitted {
             panic!("milestone is not in ProofSubmitted status");
@@ -3841,6 +3877,30 @@ impl HireSettleContract {
             .unwrap_or_else(|| panic!("engagement not found"))
     }
 
+    /// Shared "load milestone by index or panic" helper (issue #170) — mirrors
+    /// `get_engagement_internal` for the milestone lookup, so every call site
+    /// panics with the same `"invalid milestone index"` message instead of a
+    /// bare Vec index-out-of-bounds panic.
+    fn get_milestone_or_panic(engagement: &Engagement, milestone_index: u32) -> Milestone {
+        engagement
+            .milestones
+            .get(milestone_index)
+            .unwrap_or_else(|| panic!("{}", ERR_INVALID_MILESTONE_INDEX))
+    }
+
+    /// Shared precondition for the second step of the early-exit protocol —
+    /// the engagement must be `ExitRequested` and `company` must match the
+    /// engagement's company. Used by both `accept_early_exit` and
+    /// `reject_early_exit` (issue #173).
+    fn assert_exit_request_pending(engagement: &Engagement, company: &Address) {
+        if engagement.status != EngagementStatus::ExitRequested {
+            panic!("no exit request pending");
+        }
+        if company != &engagement.company {
+            panic!("{}", ERR_UNAUTHORIZED);
+        }
+    }
+
     fn get_admin_internal(env: &Env) -> Address {
         env.storage()
             .instance()
@@ -3859,7 +3919,7 @@ impl HireSettleContract {
         }
         admin.require_auth();
         if *admin != Self::get_admin_internal(env) {
-            panic!("unauthorized");
+            panic!("{}", ERR_UNAUTHORIZED);
         }
     }
 
