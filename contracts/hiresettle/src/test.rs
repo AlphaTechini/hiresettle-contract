@@ -1573,8 +1573,16 @@ fn test_rejected_proof_can_be_resubmitted_immediately() {
     client.cast_arbiter_vote(&arbiter, &eng_id, &0, &false);
 
     // Second submission immediately within cooldown — must panic
-    client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://proof2"));
-    assert_eq!(client.get_milestone(&eng_id, &0).status, MilestoneStatus::ProofSubmitted);
+    client.submit_proof(
+        &recruiter,
+        &eng_id,
+        &0,
+        &String::from_str(&env, "ipfs://proof2"),
+    );
+    assert_eq!(
+        client.get_milestone(&eng_id, &0).status,
+        MilestoneStatus::ProofSubmitted
+    );
 }
 
 #[test]
@@ -3443,7 +3451,13 @@ fn test_get_engagements_by_company_large_page_size_does_not_overflow() {
     let client = HireSettleContractClient::new(&env, &contract_id);
 
     create_standard_engagement(
-        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-OVERFLOW",
+        &env,
+        &client,
+        &token_id,
+        &company,
+        &recruiter,
+        &arbiter,
+        "ENG-OVERFLOW",
     );
 
     let result = client.get_engagements_by_company(&company, &u32::MAX, &u32::MAX);
@@ -3558,7 +3572,13 @@ fn test_get_engagements_by_recruiter_out_of_range_returns_empty() {
     let client = HireSettleContractClient::new(&env, &contract_id);
 
     create_standard_engagement(
-        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-R-OOR",
+        &env,
+        &client,
+        &token_id,
+        &company,
+        &recruiter,
+        &arbiter,
+        "ENG-R-OOR",
     );
 
     let result = client.get_engagements_by_recruiter(&recruiter, &10, &10);
@@ -6926,7 +6946,13 @@ fn test_top_up_escrow_increases_balance() {
     let client = HireSettleContractClient::new(&env, &contract_id);
     let eng_id = String::from_str(&env, "ENG-TOPUP-OK");
     create_standard_engagement(
-        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-TOPUP-OK",
+        &env,
+        &client,
+        &token_id,
+        &company,
+        &recruiter,
+        &arbiter,
+        "ENG-TOPUP-OK",
     );
 
     let balance_before = client.get_escrow_balance(&eng_id);
@@ -6943,7 +6969,13 @@ fn test_top_up_escrow_non_company_rejected() {
     let client = HireSettleContractClient::new(&env, &contract_id);
     let eng_id = String::from_str(&env, "ENG-TOPUP-NONCO");
     create_standard_engagement(
-        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-TOPUP-NONCO",
+        &env,
+        &client,
+        &token_id,
+        &company,
+        &recruiter,
+        &arbiter,
+        "ENG-TOPUP-NONCO",
     );
 
     client.top_up_escrow(&recruiter, &eng_id, &500_000_000);
@@ -6955,7 +6987,13 @@ fn test_top_up_escrow_emits_event_with_correct_payload() {
     let client = HireSettleContractClient::new(&env, &contract_id);
     let eng_id = String::from_str(&env, "ENG-TOPUP-EVT");
     create_standard_engagement(
-        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-TOPUP-EVT",
+        &env,
+        &client,
+        &token_id,
+        &company,
+        &recruiter,
+        &arbiter,
+        "ENG-TOPUP-EVT",
     );
 
     let total_before = client.get_engagement(&eng_id).total_amount;
@@ -6982,7 +7020,13 @@ fn test_top_up_escrow_zero_amount_rejected() {
     let client = HireSettleContractClient::new(&env, &contract_id);
     let eng_id = String::from_str(&env, "ENG-TOPUP-ZERO");
     create_standard_engagement(
-        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-TOPUP-ZERO",
+        &env,
+        &client,
+        &token_id,
+        &company,
+        &recruiter,
+        &arbiter,
+        "ENG-TOPUP-ZERO",
     );
 
     client.top_up_escrow(&company, &eng_id, &0);
@@ -6995,7 +7039,13 @@ fn test_top_up_escrow_negative_amount_rejected() {
     let client = HireSettleContractClient::new(&env, &contract_id);
     let eng_id = String::from_str(&env, "ENG-TOPUP-NEG");
     create_standard_engagement(
-        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-TOPUP-NEG",
+        &env,
+        &client,
+        &token_id,
+        &company,
+        &recruiter,
+        &arbiter,
+        "ENG-TOPUP-NEG",
     );
 
     client.top_up_escrow(&company, &eng_id, &-100);
@@ -7049,4 +7099,177 @@ fn test_set_min_amount_non_admin_rejected() {
     let client = HireSettleContractClient::new(&env, &contract_id);
 
     client.set_min_amount(&recruiter, &5_000_000);
+}
+
+// ============================================================
+// ISSUE #44 — RECRUITER TRANSFER
+// ============================================================
+
+#[test]
+fn test_recruiter_transfer_happy_path() {
+    let (env, contract_id, _token_id, company, recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let new_recruiter = Address::generate(&env);
+    let eng_id = String::from_str(&env, "ENG-RTR-01");
+
+    create_standard_engagement(
+        &env,
+        &client,
+        &_token_id,
+        &company,
+        &recruiter,
+        &_arbiter,
+        "ENG-RTR-01",
+    );
+
+    client.propose_recruiter_transfer(&recruiter, &eng_id, &new_recruiter);
+    client.accept_recruiter_transfer(&company, &eng_id);
+
+    let engagement = client.get_engagement(&eng_id);
+    assert_eq!(engagement.recruiter, new_recruiter);
+    assert!(has_event(&env, "recruiter_transferred"));
+}
+
+#[test]
+#[should_panic(expected = "unauthorized")]
+fn test_recruiter_transfer_wrong_proposer() {
+    let (env, contract_id, _token_id, company, recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let new_recruiter = Address::generate(&env);
+    let eng_id = String::from_str(&env, "ENG-RTR-WP");
+
+    create_standard_engagement(
+        &env,
+        &client,
+        &_token_id,
+        &company,
+        &recruiter,
+        &_arbiter,
+        "ENG-RTR-WP",
+    );
+
+    // Company tries to propose — only recruiter may propose
+    client.propose_recruiter_transfer(&company, &eng_id, &new_recruiter);
+}
+
+#[test]
+#[should_panic(expected = "unauthorized")]
+fn test_recruiter_transfer_wrong_acceptor() {
+    let (env, contract_id, _token_id, company, recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let new_recruiter = Address::generate(&env);
+    let stranger = Address::generate(&env);
+    let eng_id = String::from_str(&env, "ENG-RTR-WA");
+
+    create_standard_engagement(
+        &env,
+        &client,
+        &_token_id,
+        &company,
+        &recruiter,
+        &_arbiter,
+        "ENG-RTR-WA",
+    );
+
+    client.propose_recruiter_transfer(&recruiter, &eng_id, &new_recruiter);
+    // Stranger tries to accept — only company may accept
+    client.accept_recruiter_transfer(&stranger, &eng_id);
+}
+
+#[test]
+fn test_recruiter_transfer_payout() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_id);
+    let new_recruiter = Address::generate(&env);
+    let eng_id = String::from_str(&env, "ENG-RTR-PO");
+
+    create_standard_engagement(
+        &env,
+        &client,
+        &token_id,
+        &company,
+        &recruiter,
+        &arbiter,
+        "ENG-RTR-PO",
+    );
+
+    // Propose and accept recruiter transfer
+    client.propose_recruiter_transfer(&recruiter, &eng_id, &new_recruiter);
+    client.accept_recruiter_transfer(&company, &eng_id);
+
+    // Confirm a milestone — payout should go to new_recruiter
+    client.submit_proof(
+        &recruiter,
+        &eng_id,
+        &0,
+        &String::from_str(&env, "ipfs://proof"),
+    );
+    client.confirm_milestone(&company, &eng_id, &0);
+
+    let new_recruiter_balance = token_client.balance(&new_recruiter);
+    assert_eq!(new_recruiter_balance, 300_000_000);
+
+    let old_recruiter_balance = token_client.balance(&recruiter);
+    assert_eq!(old_recruiter_balance, 0);
+}
+
+#[test]
+#[should_panic(expected = "no pending recruiter transfer")]
+fn test_recruiter_transfer_no_proposal() {
+    let (env, contract_id, _token_id, company, recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let eng_id = String::from_str(&env, "ENG-RTR-NP");
+
+    create_standard_engagement(
+        &env,
+        &client,
+        &_token_id,
+        &company,
+        &recruiter,
+        &_arbiter,
+        "ENG-RTR-NP",
+    );
+
+    // Company tries to accept without a pending proposal
+    client.accept_recruiter_transfer(&company, &eng_id);
+}
+
+#[test]
+fn test_recruiter_transfer_event() {
+    let (env, contract_id, _token_id, company, recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let new_recruiter = Address::generate(&env);
+    let eng_id = String::from_str(&env, "ENG-RTR-EVT");
+
+    create_standard_engagement(
+        &env,
+        &client,
+        &_token_id,
+        &company,
+        &recruiter,
+        &_arbiter,
+        "ENG-RTR-EVT",
+    );
+
+    client.propose_recruiter_transfer(&recruiter, &eng_id, &new_recruiter);
+    client.accept_recruiter_transfer(&company, &eng_id);
+
+    assert!(has_event(&env, "recruiter_transferred"));
+
+    // Verify event carries the correct old/new recruiter addresses
+    let events = env.events().all();
+    let mut found = false;
+    for i in 0..events.len() {
+        let (_, topics, data) = events.get(i).unwrap();
+        let topic: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+        if topic == Symbol::new(&env, "recruiter_transferred") {
+            let (old_addr, new_addr): (Address, Address) = data.try_into_val(&env).unwrap();
+            assert_eq!(old_addr, recruiter);
+            assert_eq!(new_addr, new_recruiter);
+            found = true;
+            break;
+        }
+    }
+    assert!(found, "recruiter_transferred event not found");
 }
