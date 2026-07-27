@@ -1573,8 +1573,16 @@ fn test_rejected_proof_can_be_resubmitted_immediately() {
     client.cast_arbiter_vote(&arbiter, &eng_id, &0, &false);
 
     // Second submission immediately within cooldown — must panic
-    client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://proof2"));
-    assert_eq!(client.get_milestone(&eng_id, &0).status, MilestoneStatus::ProofSubmitted);
+    client.submit_proof(
+        &recruiter,
+        &eng_id,
+        &0,
+        &String::from_str(&env, "ipfs://proof2"),
+    );
+    assert_eq!(
+        client.get_milestone(&eng_id, &0).status,
+        MilestoneStatus::ProofSubmitted
+    );
 }
 
 #[test]
@@ -3443,7 +3451,13 @@ fn test_get_engagements_by_company_large_page_size_does_not_overflow() {
     let client = HireSettleContractClient::new(&env, &contract_id);
 
     create_standard_engagement(
-        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-OVERFLOW",
+        &env,
+        &client,
+        &token_id,
+        &company,
+        &recruiter,
+        &arbiter,
+        "ENG-OVERFLOW",
     );
 
     let result = client.get_engagements_by_company(&company, &u32::MAX, &u32::MAX);
@@ -3558,7 +3572,13 @@ fn test_get_engagements_by_recruiter_out_of_range_returns_empty() {
     let client = HireSettleContractClient::new(&env, &contract_id);
 
     create_standard_engagement(
-        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-R-OOR",
+        &env,
+        &client,
+        &token_id,
+        &company,
+        &recruiter,
+        &arbiter,
+        "ENG-R-OOR",
     );
 
     let result = client.get_engagements_by_recruiter(&recruiter, &10, &10);
@@ -6926,7 +6946,13 @@ fn test_top_up_escrow_increases_balance() {
     let client = HireSettleContractClient::new(&env, &contract_id);
     let eng_id = String::from_str(&env, "ENG-TOPUP-OK");
     create_standard_engagement(
-        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-TOPUP-OK",
+        &env,
+        &client,
+        &token_id,
+        &company,
+        &recruiter,
+        &arbiter,
+        "ENG-TOPUP-OK",
     );
 
     let balance_before = client.get_escrow_balance(&eng_id);
@@ -6943,7 +6969,13 @@ fn test_top_up_escrow_non_company_rejected() {
     let client = HireSettleContractClient::new(&env, &contract_id);
     let eng_id = String::from_str(&env, "ENG-TOPUP-NONCO");
     create_standard_engagement(
-        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-TOPUP-NONCO",
+        &env,
+        &client,
+        &token_id,
+        &company,
+        &recruiter,
+        &arbiter,
+        "ENG-TOPUP-NONCO",
     );
 
     client.top_up_escrow(&recruiter, &eng_id, &500_000_000);
@@ -6955,7 +6987,13 @@ fn test_top_up_escrow_emits_event_with_correct_payload() {
     let client = HireSettleContractClient::new(&env, &contract_id);
     let eng_id = String::from_str(&env, "ENG-TOPUP-EVT");
     create_standard_engagement(
-        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-TOPUP-EVT",
+        &env,
+        &client,
+        &token_id,
+        &company,
+        &recruiter,
+        &arbiter,
+        "ENG-TOPUP-EVT",
     );
 
     let total_before = client.get_engagement(&eng_id).total_amount;
@@ -6982,7 +7020,13 @@ fn test_top_up_escrow_zero_amount_rejected() {
     let client = HireSettleContractClient::new(&env, &contract_id);
     let eng_id = String::from_str(&env, "ENG-TOPUP-ZERO");
     create_standard_engagement(
-        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-TOPUP-ZERO",
+        &env,
+        &client,
+        &token_id,
+        &company,
+        &recruiter,
+        &arbiter,
+        "ENG-TOPUP-ZERO",
     );
 
     client.top_up_escrow(&company, &eng_id, &0);
@@ -6995,7 +7039,13 @@ fn test_top_up_escrow_negative_amount_rejected() {
     let client = HireSettleContractClient::new(&env, &contract_id);
     let eng_id = String::from_str(&env, "ENG-TOPUP-NEG");
     create_standard_engagement(
-        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-TOPUP-NEG",
+        &env,
+        &client,
+        &token_id,
+        &company,
+        &recruiter,
+        &arbiter,
+        "ENG-TOPUP-NEG",
     );
 
     client.top_up_escrow(&company, &eng_id, &-100);
@@ -7372,4 +7422,516 @@ fn test_updated_lock_duration_applies_to_new_proposal() {
 
     // Must fail: current_ledger (150) < execute_after_ledger (10_100)
     client.execute_upgrade();
+// ISSUE #44 — RECRUITER TRANSFER
+// ============================================================
+
+#[test]
+fn test_recruiter_transfer_happy_path() {
+    let (env, contract_id, _token_id, company, recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let new_recruiter = Address::generate(&env);
+    let eng_id = String::from_str(&env, "ENG-RTR-01");
+
+    create_standard_engagement(
+        &env,
+        &client,
+        &_token_id,
+        &company,
+        &recruiter,
+        &_arbiter,
+        "ENG-RTR-01",
+    );
+
+    client.propose_recruiter_transfer(&recruiter, &eng_id, &new_recruiter);
+    client.accept_recruiter_transfer(&company, &eng_id);
+
+    let engagement = client.get_engagement(&eng_id);
+    assert_eq!(engagement.recruiter, new_recruiter);
+    assert!(has_event(&env, "recruiter_transferred"));
+}
+
+#[test]
+#[should_panic(expected = "unauthorized")]
+fn test_recruiter_transfer_wrong_proposer() {
+    let (env, contract_id, _token_id, company, recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let new_recruiter = Address::generate(&env);
+    let eng_id = String::from_str(&env, "ENG-RTR-WP");
+
+    create_standard_engagement(
+        &env,
+        &client,
+        &_token_id,
+        &company,
+        &recruiter,
+        &_arbiter,
+        "ENG-RTR-WP",
+    );
+
+    // Company tries to propose — only recruiter may propose
+    client.propose_recruiter_transfer(&company, &eng_id, &new_recruiter);
+}
+
+#[test]
+#[should_panic(expected = "unauthorized")]
+fn test_recruiter_transfer_wrong_acceptor() {
+    let (env, contract_id, _token_id, company, recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let new_recruiter = Address::generate(&env);
+    let stranger = Address::generate(&env);
+    let eng_id = String::from_str(&env, "ENG-RTR-WA");
+
+    create_standard_engagement(
+        &env,
+        &client,
+        &_token_id,
+        &company,
+        &recruiter,
+        &_arbiter,
+        "ENG-RTR-WA",
+    );
+
+    client.propose_recruiter_transfer(&recruiter, &eng_id, &new_recruiter);
+    // Stranger tries to accept — only company may accept
+    client.accept_recruiter_transfer(&stranger, &eng_id);
+}
+
+#[test]
+fn test_recruiter_transfer_payout() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_id);
+    let new_recruiter = Address::generate(&env);
+    let eng_id = String::from_str(&env, "ENG-RTR-PO");
+
+    create_standard_engagement(
+        &env,
+        &client,
+        &token_id,
+        &company,
+        &recruiter,
+        &arbiter,
+        "ENG-RTR-PO",
+    );
+
+    // Propose and accept recruiter transfer
+    client.propose_recruiter_transfer(&recruiter, &eng_id, &new_recruiter);
+    client.accept_recruiter_transfer(&company, &eng_id);
+
+    // Confirm a milestone — payout should go to new_recruiter
+    client.submit_proof(
+        &recruiter,
+        &eng_id,
+        &0,
+        &String::from_str(&env, "ipfs://proof"),
+    );
+    client.confirm_milestone(&company, &eng_id, &0);
+
+    let new_recruiter_balance = token_client.balance(&new_recruiter);
+    assert_eq!(new_recruiter_balance, 300_000_000);
+
+    let old_recruiter_balance = token_client.balance(&recruiter);
+    assert_eq!(old_recruiter_balance, 0);
+}
+
+#[test]
+#[should_panic(expected = "no pending recruiter transfer")]
+fn test_recruiter_transfer_no_proposal() {
+    let (env, contract_id, _token_id, company, recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let eng_id = String::from_str(&env, "ENG-RTR-NP");
+
+    create_standard_engagement(
+        &env,
+        &client,
+        &_token_id,
+        &company,
+        &recruiter,
+        &_arbiter,
+        "ENG-RTR-NP",
+    );
+
+    // Company tries to accept without a pending proposal
+    client.accept_recruiter_transfer(&company, &eng_id);
+}
+
+#[test]
+fn test_recruiter_transfer_event() {
+    let (env, contract_id, _token_id, company, recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let new_recruiter = Address::generate(&env);
+    let eng_id = String::from_str(&env, "ENG-RTR-EVT");
+
+    create_standard_engagement(
+        &env,
+        &client,
+        &_token_id,
+        &company,
+        &recruiter,
+        &_arbiter,
+        "ENG-RTR-EVT",
+    );
+
+    client.propose_recruiter_transfer(&recruiter, &eng_id, &new_recruiter);
+    client.accept_recruiter_transfer(&company, &eng_id);
+
+    assert!(has_event(&env, "recruiter_transferred"));
+
+    // Verify event carries the correct old/new recruiter addresses
+    let events = env.events().all();
+    let mut found = false;
+    for i in 0..events.len() {
+        let (_, topics, data) = events.get(i).unwrap();
+        let topic: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+        if topic == Symbol::new(&env, "recruiter_transferred") {
+            let (old_addr, new_addr): (Address, Address) = data.try_into_val(&env).unwrap();
+            assert_eq!(old_addr, recruiter);
+            assert_eq!(new_addr, new_recruiter);
+            found = true;
+            break;
+        }
+    }
+    assert!(found, "recruiter_transferred event not found");
+}
+
+// ============================================================
+// Issue #141 — get_arbiter_votes test coverage
+// ============================================================
+
+#[test]
+fn test_get_arbiter_votes_default_before_any_votes() {
+    // Before a dispute is raised (or before any vote is cast), get_arbiter_votes
+    // must return zeroed counts rather than panicking.
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let eng_id = String::from_str(&env, "ENG-AVOTES-EMPTY");
+
+    create_standard_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-AVOTES-EMPTY",
+    );
+
+    // No vote record exists yet — should return the zero default.
+    let counts = client.get_arbiter_votes(&eng_id, &0);
+    assert_eq!(counts.approve_votes, 0);
+    assert_eq!(counts.reject_votes, 0);
+}
+
+#[test]
+fn test_get_arbiter_votes_after_approve_and_reject_votes() {
+    // Use a 3-arbiter, quorum-2 panel so votes accumulate without resolving
+    // on the first vote, letting us observe intermediate tallies.
+    let (env, contract_id, token_id, company, recruiter, _) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_id);
+
+    let a1 = Address::generate(&env);
+    let a2 = Address::generate(&env);
+    let a3 = Address::generate(&env);
+
+    let eng_id = String::from_str(&env, "ENG-AVOTES-TALLY");
+    client.create_engagement(
+        &eng_id,
+        &company,
+        &recruiter,
+        &ArbiterSetup {
+            arbiters: vec![&env, a1.clone(), a2.clone(), a3.clone()],
+            quorum: 2,
+        },
+        &token_id,
+        &1_000_000_000,
+        &String::from_str(&env, "Engineer"),
+        &build_milestones(&env),
+        &vec![&env, 30u32, 90u32],
+        &default_config(),
+    );
+
+    client.submit_proof(
+        &recruiter,
+        &eng_id,
+        &0,
+        &String::from_str(&env, "ipfs://proof-av"),
+    );
+    client.raise_dispute(&company, &eng_id, &0, &String::from_str(&env, "dispute"));
+
+    // Before any vote, counts are zero.
+    let counts = client.get_arbiter_votes(&eng_id, &0);
+    assert_eq!(counts.approve_votes, 0);
+    assert_eq!(counts.reject_votes, 0);
+
+    // First arbiter approves — 1 approve, 0 reject.
+    client.cast_arbiter_vote(&a1, &eng_id, &0, &true);
+    let counts = client.get_arbiter_votes(&eng_id, &0);
+    assert_eq!(counts.approve_votes, 1);
+    assert_eq!(counts.reject_votes, 0);
+
+    // Second arbiter rejects — 1 approve, 1 reject.
+    // Quorum of 2 approves not yet reached; reject threshold (>1) not met
+    // either, so the dispute remains open.
+    client.cast_arbiter_vote(&a2, &eng_id, &0, &false);
+    let counts = client.get_arbiter_votes(&eng_id, &0);
+    assert_eq!(counts.approve_votes, 1);
+    assert_eq!(counts.reject_votes, 1);
+
+    // Third arbiter approves — 2 approves reach quorum; dispute resolved.
+    // The vote record is cleared on resolution, so get_arbiter_votes reverts
+    // to its default zero state.
+    client.cast_arbiter_vote(&a3, &eng_id, &0, &true);
+    let m0 = client.get_milestone(&eng_id, &0);
+    assert_eq!(m0.status, MilestoneStatus::Resolved);
+    assert_eq!(token_client.balance(&recruiter), 300_000_000);
+
+    // Vote record cleared — back to default zeros.
+    let counts = client.get_arbiter_votes(&eng_id, &0);
+    assert_eq!(counts.approve_votes, 0);
+    assert_eq!(counts.reject_votes, 0);
+}
+
+// ============================================================
+// Issue #142 — set_max_retention_days / get_max_retention_days
+// ============================================================
+
+#[test]
+fn test_set_get_max_retention_days_admin_can_update() {
+    // Admin sets a new cap; the getter must reflect the updated value.
+    let (env, contract_id, _token_id, company, _recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    let new_cap: u32 = 180;
+    client.set_max_retention_days(&company, &new_cap);
+
+    assert_eq!(client.get_max_retention_days(), new_cap);
+}
+
+#[test]
+fn test_set_max_retention_days_raise_cap_reflected_by_getter() {
+    // Raising the cap and then lowering it — getter always mirrors the last set.
+    let (env, contract_id, _token_id, company, _recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    client.set_max_retention_days(&company, &730u32);
+    assert_eq!(client.get_max_retention_days(), 730u32);
+
+    client.set_max_retention_days(&company, &60u32);
+    assert_eq!(client.get_max_retention_days(), 60u32);
+}
+
+#[test]
+#[should_panic(expected = "RetentionDaysTooLarge")]
+fn test_create_engagement_over_max_retention_days_rejected() {
+    // Lower the cap to 10 days, then try to create an engagement with a
+    // 30-day retention window — must be rejected.
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    client.set_max_retention_days(&company, &10u32);
+
+    // 30-day retention exceeds the new 10-day cap.
+    client.create_engagement(
+        &String::from_str(&env, "ENG-MAXRET-OVER"),
+        &company,
+        &recruiter,
+        &ArbiterSetup {
+            arbiters: vec![&env, arbiter.clone()],
+            quorum: 1,
+        },
+        &token_id,
+        &1_000_000_000,
+        &String::from_str(&env, "Engineer"),
+        &build_milestones(&env),
+        &vec![&env, 30u32, 90u32], // both windows exceed the 10-day cap
+        &default_config(),
+    );
+}
+
+#[test]
+#[should_panic(expected = "unauthorized")]
+fn test_set_max_retention_days_non_admin_rejected() {
+    let (env, contract_id, _token_id, _company, recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    client.set_max_retention_days(&recruiter, &100u32);
+}
+
+// ============================================================
+// Issue #143 — set_inactivity_timeout_ledgers / get_inactivity_timeout_ledgers
+// ============================================================
+
+#[test]
+fn test_set_get_inactivity_timeout_ledgers_admin_can_update() {
+    // Admin sets the timeout; the getter must reflect it immediately.
+    let (env, contract_id, _token_id, company, _recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    let new_timeout: u32 = 500_000;
+    client.set_inactivity_timeout_ledgers(&company, &new_timeout);
+
+    assert_eq!(client.get_inactivity_timeout_ledgers(), new_timeout);
+}
+
+#[test]
+fn test_set_inactivity_timeout_ledgers_multiple_updates_reflected() {
+    // Verify that subsequent calls overwrite the previous value correctly.
+    let (env, contract_id, _token_id, company, _recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    client.set_inactivity_timeout_ledgers(&company, &100_000u32);
+    assert_eq!(client.get_inactivity_timeout_ledgers(), 100_000u32);
+
+    client.set_inactivity_timeout_ledgers(&company, &200_000u32);
+    assert_eq!(client.get_inactivity_timeout_ledgers(), 200_000u32);
+}
+
+#[test]
+#[should_panic(expected = "unauthorized")]
+fn test_set_inactivity_timeout_ledgers_non_admin_rejected() {
+    let (env, contract_id, _token_id, _company, recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    client.set_inactivity_timeout_ledgers(&recruiter, &100_000u32);
+}
+
+// ============================================================
+// Issue #144 — expire_engagement test coverage
+// ============================================================
+
+#[test]
+fn test_expire_engagement_success_refunds_after_timeout() {
+    // Set a short inactivity timeout, advance past it, and verify:
+    //   - the engagement transitions to Expired
+    //   - the unreleased escrow is returned to the company
+    //   - the contract escrow account is fully drained
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_id);
+
+    let eng_id = String::from_str(&env, "ENG-EXPIRE-OK");
+    create_standard_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-EXPIRE-OK",
+    );
+
+    let company_balance_before = token_client.balance(&company);
+
+    // Set a short timeout of 1 000 ledgers so the test can advance past it.
+    client.set_inactivity_timeout_ledgers(&company, &1_000u32);
+
+    // Advance 1 001 ledgers so current_ledger > last_activity_ledger + timeout.
+    advance_ledger(&env, 1_001);
+
+    client.expire_engagement(&eng_id);
+
+    // Status must be Expired.
+    let eng = client.get_engagement(&eng_id);
+    assert_eq!(eng.status, EngagementStatus::Expired);
+
+    // Full escrow (total_amount - released_amount = 1_000_000_000) refunded.
+    let expected_refund = 1_000_000_000i128;
+    assert_eq!(
+        token_client.balance(&company),
+        company_balance_before + expected_refund
+    );
+
+    // Contract escrow account is fully drained.
+    assert_eq!(token_client.balance(&contract_id), 0);
+}
+
+#[test]
+#[should_panic(expected = "Inactivity timeout not reached")]
+fn test_expire_engagement_rejected_before_timeout() {
+    // Calling expire_engagement before the inactivity timeout has elapsed
+    // must panic with "Inactivity timeout not reached".
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    let eng_id = String::from_str(&env, "ENG-EXPIRE-EARLY");
+    create_standard_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-EXPIRE-EARLY",
+    );
+
+    // Set timeout to 1 000 ledgers and advance only 500 — timeout not yet elapsed.
+    client.set_inactivity_timeout_ledgers(&company, &1_000u32);
+    advance_ledger(&env, 500);
+
+    client.expire_engagement(&eng_id);
+}
+
+#[test]
+#[should_panic(expected = "Cannot expire completed engagement")]
+fn test_expire_engagement_rejected_on_completed_engagement() {
+    // An already-completed engagement must not be expirable.
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_id);
+
+    let eng_id = String::from_str(&env, "ENG-EXPIRE-DONE");
+    create_standard_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-EXPIRE-DONE",
+    );
+
+    // Confirm all three milestones to complete the engagement.
+    // Milestone 0 (Placement) — submit proof and confirm.
+    client.submit_proof(
+        &recruiter,
+        &eng_id,
+        &0,
+        &String::from_str(&env, "ipfs://proof-m0"),
+    );
+    client.confirm_milestone(&company, &eng_id, &0);
+
+    // Advance past the retention time-gate for milestone 1.
+    let m1 = client.get_milestone(&eng_id, &1);
+    let ledgers_needed = m1.valid_after_ledger - env.ledger().sequence() + 1;
+    advance_ledger(&env, ledgers_needed);
+    client.unlock_milestone(&eng_id, &1);
+    client.submit_proof(
+        &recruiter,
+        &eng_id,
+        &1,
+        &String::from_str(&env, "ipfs://proof-m1"),
+    );
+    client.confirm_milestone(&company, &eng_id, &1);
+
+    // Advance past retention time-gate for milestone 2.
+    let m2 = client.get_milestone(&eng_id, &2);
+    let ledgers_needed = m2.valid_after_ledger - env.ledger().sequence() + 1;
+    advance_ledger(&env, ledgers_needed);
+    client.unlock_milestone(&eng_id, &2);
+    client.submit_proof(
+        &recruiter,
+        &eng_id,
+        &2,
+        &String::from_str(&env, "ipfs://proof-m2"),
+    );
+    client.confirm_milestone(&company, &eng_id, &2);
+
+    // Engagement is now Completed.
+    let eng = client.get_engagement(&eng_id);
+    assert_eq!(eng.status, EngagementStatus::Completed);
+    let _ = token_client.balance(&recruiter); // silence unused-variable warning
+
+    // Advance well past any timeout — should still panic because Completed.
+    advance_ledger(&env, 2_000_000);
+
+    client.expire_engagement(&eng_id);
+}
+
+#[test]
+#[should_panic(expected = "Inactivity timeout not reached")]
+fn test_expire_engagement_rejected_on_cancelled_engagement_before_timeout() {
+    // A cancelled engagement before the inactivity window is still rejected —
+    // the contract only gates on Completed for the status check; the timeout
+    // guard fires first when the window hasn't elapsed.
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    let eng_id = String::from_str(&env, "ENG-EXPIRE-CANC");
+    create_standard_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-EXPIRE-CANC",
+    );
+
+    // Cancel the engagement — requires both company and recruiter auth.
+    client.cancel_engagement(&company, &recruiter, &eng_id);
+
+    // With the default inactivity timeout (~1 036 800 ledgers) not yet
+    // elapsed, expire_engagement must panic.
+    client.expire_engagement(&eng_id);
 }
