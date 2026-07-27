@@ -7050,3 +7050,55 @@ fn test_set_min_amount_non_admin_rejected() {
 
     client.set_min_amount(&recruiter, &5_000_000);
 }
+
+// ============================================================
+// Issue #145 — set_storage_ttl_extend_to / get_storage_ttl_extend_to
+// ============================================================
+
+/// Default storage TTL extension is 1_036_800 ledgers (~60 days).
+#[test]
+fn test_get_storage_ttl_extend_to_default() {
+    let (env, contract_id, _token_id, _company, _recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    assert_eq!(client.get_storage_ttl_extend_to(), 1_036_800);
+}
+
+/// Admin can set a new value and get_storage_ttl_extend_to reflects it immediately.
+#[test]
+fn test_set_storage_ttl_extend_to_admin_update() {
+    let (env, contract_id, _token_id, company, _recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    client.set_storage_ttl_extend_to(&company, &500_000u32);
+    assert_eq!(client.get_storage_ttl_extend_to(), 500_000);
+
+    client.set_storage_ttl_extend_to(&company, &2_000_000u32);
+    assert_eq!(client.get_storage_ttl_extend_to(), 2_000_000);
+}
+
+/// Non-admin caller must be rejected with "unauthorized".
+#[test]
+#[should_panic(expected = "unauthorized")]
+fn test_set_storage_ttl_extend_to_non_admin_rejected() {
+    let (env, contract_id, _token_id, _company, recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    client.set_storage_ttl_extend_to(&recruiter, &500_000u32);
+}
+
+/// Setting to zero is allowed (admin's call to make).
+#[test]
+fn test_set_storage_ttl_extend_to_zero_accepted() {
+    let (env, contract_id, _token_id, company, _recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    client.set_storage_ttl_extend_to(&company, &0u32);
+    assert_eq!(client.get_storage_ttl_extend_to(), 0);
+}
+
+/// Setting to u32::MAX is accepted.
+#[test]
+fn test_set_storage_ttl_extend_to_max_u32_accepted() {
+    let (env, contract_id, _token_id, company, _recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    client.set_storage_ttl_extend_to(&company, &u32::MAX);
+    assert_eq!(client.get_storage_ttl_extend_to(), u32::MAX);
+}
