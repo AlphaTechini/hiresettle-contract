@@ -7373,3 +7373,159 @@ fn test_updated_lock_duration_applies_to_new_proposal() {
     // Must fail: current_ledger (150) < execute_after_ledger (10_100)
     client.execute_upgrade();
 }
+
+// ============================================================
+// Issue #148 — set_max_proof_hash_length / get_max_proof_hash_length
+// ============================================================
+
+/// Default max proof hash length is 200 characters.
+#[test]
+fn test_get_max_proof_hash_length_default() {
+    let (env, contract_id, _token_id, _company, _recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    assert_eq!(client.get_max_proof_hash_length(), 200);
+}
+
+/// Admin can tighten the cap; get_max_proof_hash_length reflects it immediately.
+#[test]
+fn test_set_max_proof_hash_length_admin_tighten() {
+    let (env, contract_id, _token_id, company, _recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    client.set_max_proof_hash_length(&company, &50u32);
+    assert_eq!(client.get_max_proof_hash_length(), 50);
+}
+
+/// Admin can loosen the cap up to 500.
+#[test]
+fn test_set_max_proof_hash_length_admin_loosen() {
+    let (env, contract_id, _token_id, company, _recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    client.set_max_proof_hash_length(&company, &500u32);
+    assert_eq!(client.get_max_proof_hash_length(), 500);
+}
+
+/// Non-admin caller is rejected.
+#[test]
+#[should_panic(expected = "unauthorized")]
+fn test_set_max_proof_hash_length_non_admin_rejected() {
+    let (env, contract_id, _token_id, _company, recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    client.set_max_proof_hash_length(&recruiter, &100u32);
+}
+
+/// Value 0 is rejected with "InvalidMaxProofHashLength".
+#[test]
+#[should_panic(expected = "InvalidMaxProofHashLength")]
+fn test_set_max_proof_hash_length_zero_rejected() {
+    let (env, contract_id, _token_id, company, _recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    client.set_max_proof_hash_length(&company, &0u32);
+}
+
+/// Value > 500 is rejected with "InvalidMaxProofHashLength".
+#[test]
+#[should_panic(expected = "InvalidMaxProofHashLength")]
+fn test_set_max_proof_hash_length_over_500_rejected() {
+    let (env, contract_id, _token_id, company, _recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    client.set_max_proof_hash_length(&company, &501u32);
+}
+
+/// submit_proof with a hash exactly at the current cap succeeds.
+#[test]
+fn test_submit_proof_at_cap_succeeds() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    // Set cap to 10 characters
+    client.set_max_proof_hash_length(&company, &10u32);
+
+    let eng_id = String::from_str(&env, "ENG-PHLEN-AT");
+    create_standard_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-PHLEN-AT",
+    );
+
+    // Exactly 10 characters
+    let proof = String::from_str(&env, "1234567890");
+    client.submit_proof(&recruiter, &eng_id, &0, &proof);
+    assert_eq!(
+        client.get_milestone(&eng_id, &0).status,
+        MilestoneStatus::ProofSubmitted
+    );
+}
+
+/// submit_proof with a hash one character over the current cap is rejected.
+#[test]
+#[should_panic(expected = "ProofHashTooLong")]
+fn test_submit_proof_over_cap_rejected() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    // Set cap to 10 characters
+    client.set_max_proof_hash_length(&company, &10u32);
+
+    let eng_id = String::from_str(&env, "ENG-PHLEN-OVER");
+    create_standard_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-PHLEN-OVER",
+    );
+
+    // 11 characters — one over the 10-character cap
+    let too_long = String::from_str(&env, "12345678901");
+    client.submit_proof(&recruiter, &eng_id, &0, &too_long);
+}
+
+/// Loosening the cap allows proofs that were previously too long.
+#[test]
+fn test_loosening_cap_allows_longer_proofs() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    // Start with a tight cap of 5
+    client.set_max_proof_hash_length(&company, &5u32);
+
+    let eng_id = String::from_str(&env, "ENG-PHLEN-LOOSEN");
+    create_standard_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-PHLEN-LOOSEN",
+    );
+
+    // Verify a 10-char proof is rejected with the tight cap
+    let long_proof = String::from_str(&env, "1234567890");
+    let result = client.try_submit_proof(&recruiter, &eng_id, &0, &long_proof);
+    assert!(result.is_err(), "expected submit_proof to fail with cap=5");
+
+    // Admin loosens cap to 50
+    client.set_max_proof_hash_length(&company, &50u32);
+
+    // Now the same 10-char proof must succeed
+    client.submit_proof(&recruiter, &eng_id, &0, &long_proof);
+    assert_eq!(
+        client.get_milestone(&eng_id, &0).status,
+        MilestoneStatus::ProofSubmitted
+    );
+}
+
+/// Tightening the cap below the default (200) still blocks long proofs.
+#[test]
+#[should_panic(expected = "ProofHashTooLong")]
+fn test_tightening_cap_blocks_previously_valid_proofs() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    let eng_id = String::from_str(&env, "ENG-PHLEN-TIGHT");
+    create_standard_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-PHLEN-TIGHT",
+    );
+
+    // Tighten cap to 5
+    client.set_max_proof_hash_length(&company, &5u32);
+
+    // A 10-char proof that would be valid at the default cap (200) is now rejected
+    client.submit_proof(
+        &recruiter,
+        &eng_id,
+        &0,
+        &String::from_str(&env, "1234567890"),
+    );
+}
