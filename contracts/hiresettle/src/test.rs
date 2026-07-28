@@ -7789,6 +7789,109 @@ fn test_get_arbiter_votes_after_approve_and_reject_votes() {
         &eng_id,
         &company,
         &recruiter,
+        &ArbiterSetup { arbiters: vec![&env, a1.clone(), a2.clone()], quorum: 2 },
+        &token_id,
+        &1_000_000_000,
+        &String::from_str(&env, "Engineer"),
+        &two_milestones,
+        &vec![&env],
+        &default_config(),
+    );
+
+    assert_eq!(client.get_active_dispute_count(&eng_id), 0);
+
+    client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://proof-a"));
+    client.raise_dispute(&company, &eng_id, &0, &String::from_str(&env, "dispute_a"));
+    assert_eq!(client.get_active_dispute_count(&eng_id), 1);
+
+    client.submit_proof(&recruiter, &eng_id, &1, &String::from_str(&env, "ipfs://proof-b"));
+    client.raise_dispute(&company, &eng_id, &1, &String::from_str(&env, "dispute_b"));
+    assert_eq!(client.get_active_dispute_count(&eng_id), 2);
+}
+
+/// Count decreases once a dispute is resolved by arbiter approval.
+#[test]
+fn test_get_active_dispute_count_decreases_after_resolution_approve() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let eng_id = String::from_str(&env, "ENG-DISP-COUNT-RESOLVE");
+    create_standard_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-DISP-COUNT-RESOLVE",
+    );
+
+    client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://proof"));
+    client.raise_dispute(&company, &eng_id, &0, &String::from_str(&env, "dispute"));
+    assert_eq!(client.get_active_dispute_count(&eng_id), 1);
+
+    client.cast_arbiter_vote(&arbiter, &eng_id, &0, &true);
+    assert_eq!(client.get_active_dispute_count(&eng_id), 0);
+}
+
+/// Count decreases once a dispute is resolved by arbiter rejection.
+#[test]
+fn test_get_active_dispute_count_decreases_after_resolution_reject() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let eng_id = String::from_str(&env, "ENG-DISP-COUNT-REJECT");
+    create_standard_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-DISP-COUNT-REJECT",
+    );
+
+    client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://proof"));
+    client.raise_dispute(&company, &eng_id, &0, &String::from_str(&env, "dispute"));
+    assert_eq!(client.get_active_dispute_count(&eng_id), 1);
+
+    client.cast_arbiter_vote(&arbiter, &eng_id, &0, &false);
+    assert_eq!(client.get_active_dispute_count(&eng_id), 0);
+}
+
+// ============================================================
+// STORAGE TTL EXTENSION — Issue #40
+// ============================================================
+
+/// Default value is returned before any admin update.
+#[test]
+fn test_get_storage_ttl_extend_to_default() {
+    let (env, contract_id, _token_id, _company, _recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    // DEFAULT_STORAGE_TTL_EXTEND_TO = 1_036_800
+    assert_eq!(client.get_storage_ttl_extend_to(), 1_036_800u32);
+}
+
+/// Admin can update the TTL-extension target and the getter reflects the new value.
+#[test]
+fn test_admin_can_set_storage_ttl_extend_to() {
+    let (env, contract_id, _token_id, company, _recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    let new_ttl: u32 = 500_000;
+    client.set_storage_ttl_extend_to(&company, &new_ttl);
+
+    assert_eq!(client.get_storage_ttl_extend_to(), new_ttl);
+}
+
+/// Admin can update the TTL-extension target multiple times; the latest value wins.
+#[test]
+fn test_admin_can_update_storage_ttl_extend_to_multiple_times() {
+    let (env, contract_id, _token_id, company, _recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    client.set_storage_ttl_extend_to(&company, &100_000u32);
+    assert_eq!(client.get_storage_ttl_extend_to(), 100_000u32);
+
+    client.set_storage_ttl_extend_to(&company, &200_000u32);
+    assert_eq!(client.get_storage_ttl_extend_to(), 200_000u32);
+}
+
+/// Non-admin caller is rejected with "unauthorized".
+#[test]
+#[should_panic(expected = "unauthorized")]
+fn test_non_admin_cannot_set_storage_ttl_extend_to() {
+    let (env, contract_id, _token_id, _company, recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    client.set_storage_ttl_extend_to(&recruiter, &500_000u32);
         &ArbiterSetup {
             arbiters: vec![&env, a1.clone(), a2.clone(), a3.clone()],
             quorum: 2,
