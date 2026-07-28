@@ -244,7 +244,26 @@ pub struct UpgradeProposal {
 
 Pending contract WASM upgrade proposal; subject to an admin-configurable time-lock (default 17,280 ledgers ≈ 1 day).
 
-### `PlatformFee`
+## `PlatformFee`
+
+The contract can deduct a configurable fee from every milestone payout before the recruiter is paid.
+
+### Configuration
+- **Set Fee**: `set_platform_fee(admin, bps, treasury)` — admin only. `bps` is capped at 500 (5%); exceeding it panics with `FeeTooHigh`.
+- **Read Fee**: `get_platform_fee()` — returns `(bps, treasury)`. Permissionless.
+- **Default**: 0 bps, treasury = admin, set at `init`. No fee is taken until an admin raises it.
+
+### How it's applied
+On `confirm_milestone`, `batch_confirm_milestones`, and `force_confirm_milestone`:
+
+Platform fee is deducted from each milestone payment before release to the recruiter.
+
+gross_share = total_amount × payment_percent ÷ 100
+fee_amount = gross_share × platform_fee_bps ÷ 10_000
+net_payment = gross_share − fee_amount // this is what the recruiter actually receives
+
+`fee_amount` is transferred to `treasury`; a `platform_fee_collected` event `(milestone_index, fee_amount, treasury)` is emitted whenever `fee_amount > 0` (no event when the fee is 0). Disputes resolved via `cast_arbiter_vote` do **not** deduct the platform fee — they deduct a separate, arbiter-only fee instead (see `set_arbiter_fee`).
+
 
 ```rust
 pub struct PlatformFee {
@@ -252,8 +271,6 @@ pub struct PlatformFee {
     pub treasury: Address,           // fee recipient
 }
 ```
-
-Platform fee deducted from each milestone payment before release to the recruiter.
 
 ### `DataKey`
 
@@ -511,7 +528,7 @@ Contract function reference: [confirm_milestone](file:///C:/Users/Shepherd/proje
 
 **Payment / Side effects**:
 - The gross share is `engagement.total_amount × milestone.payment_percent ÷ 100`. From this, `milestone.replacement_paid_out` is subtracted (Issue #183) so escrow topped up *after* a replacement reset still reaches the recruiter rather than getting permanently stuck in the contract.
-- Platform fee (bps × gross share ÷ 10 000) is transferred to the treasury.
+- Platform fee (bps × gross share ÷ 10 000) is transferred to the treasury. See [Platform Fee](#platform-fee) for how `bps` is configured and its 5% cap.
 - The net remainder is distributed to the recruiter (and co-recruiter, if configured, per `recruiter_split_bps`).
 - Milestone moves to `Confirmed`; engagement moves to `Completed` if this was the last outstanding milestone.
 - Emits `milestone_confirmed` with `(milestone_index, payment)`.
@@ -690,6 +707,8 @@ stellar contract invoke \
 ```
 
 > USDC SAC on Testnet: `CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA`
+
+> **Note:** the payout amounts in the examples above assume the default 0 bps platform fee. If `set_platform_fee` has been called, the recruiter (and co-recruiter, if configured) receives `gross_share − platform_fee`, not the full gross share. See [Platform Fee](#platform-fee).
 
 ---
 
