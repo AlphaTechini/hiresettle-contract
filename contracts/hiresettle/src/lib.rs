@@ -790,6 +790,28 @@ impl HireSettleContract {
     // UNLOCK RETENTION MILESTONE
     // ----------------------------------------------------------
 
+    /// Unlock a locked retention milestone once its ledger window has elapsed.
+    ///
+    /// # Caller
+    /// Anyone — this function is permissionless.
+    ///
+    /// # Behaviour
+    /// - The engagement must be `Active`.
+    /// - The target milestone must be `Locked` and of kind `Retention`.
+    /// - The current ledger sequence must be at least `valid_after_ledger`; otherwise
+    ///   the function panics and the milestone remains locked.
+    /// - On success, the milestone transitions to `Pending`, the engagement's
+    ///   `last_activity_ledger` is updated, and a `milestone_unlocked` event is
+    ///   emitted with the milestone index, the original `valid_after_ledger`, and
+    ///   the ledger where the unlock occurred.
+    ///
+    /// # Panics
+    /// - `"engagement is not active"` — the engagement is not active.
+    /// - `"milestone is not locked"` — the milestone is not currently locked.
+    /// - `"only retention milestones can be unlocked this way"` — the milestone is
+    ///   not a retention milestone.
+    /// - `"retention window has not elapsed yet"` — the current ledger is still
+    ///   before `valid_after_ledger`.
     pub fn unlock_milestone(env: Env, engagement_id: String, milestone_index: u32) {
         Self::assert_not_paused(&env);
         let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
