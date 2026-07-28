@@ -366,8 +366,25 @@ When the token allowlist is enabled, `create_engagement` will panic with `TokenN
 
 ## Public Function Reference
 
-### Admin
-`init`, `set_platform_fee`, `set_version`, `set_min_amount`, `pause`, `unpause`, `nominate_admin`, `claim_admin`, `renounce_admin`, `set_proof_cooldown`, `set_ledgers_per_day`, `set_max_retention_days`, `set_max_milestones`, `set_inactivity_timeout_ledgers`, `set_storage_ttl_extend_to`, `set_confirm_window`, `set_dispute_window`, `set_max_proof_hash_length`, `set_arbiter_fee`, `set_amendment_ttl`, `set_upgrade_lock_duration`, `propose_upgrade`, `add_allowed_token`, `remove_allowed_token`, `set_token_allowlist_enabled`
+### Admin & Configuration
+
+Functions that manage contract-wide settings, admin succession, and operational state. All state-changing admin functions require the caller to authenticate as the current admin via `require_auth()`.
+
+| Function | Caller | Purpose | Panics |
+|---|---|---|---|
+| `set_platform_fee(admin, bps, treasury)` | Admin | Set platform fee in basis points (max 500 = 5%) and recipient treasury. | `ContractPaused`, `NoAdmin`, `unauthorized`, `FeeTooHigh` |
+| `get_platform_fee()` → `(u32, Address)` | Anyone | Return current `(bps, treasury)`; defaults to `(0, admin)`. | — |
+| `set_version(admin, version)` | Admin | Set contract version string (max 32 chars). | `NoAdmin`, `unauthorized`, `VersionTooLong` |
+| `set_min_amount(admin, amount)` | Admin | Set minimum engagement amount in raw token units. | `NoAdmin`, `unauthorized` |
+| `pause(admin)` | Admin | Pause all state-changing operations. | `NoAdmin`, `unauthorized` |
+| `unpause(admin)` | Admin | Resume state-changing operations. | `NoAdmin`, `unauthorized` |
+| `is_paused()` → `bool` | Anyone | Return `true` if contract is currently paused. | — |
+| `nominate_admin(current_admin, new_admin)` | Admin | Nominate an admin successor. The nominee must call `claim_admin` to finalize. | `ContractPaused`, `NoAdmin`, `unauthorized` |
+| `claim_admin(nominee)` | Nominee | Claim admin rights after nomination. | `ContractPaused`, `no pending admin nomination`, `unauthorized` |
+| `get_pending_admin()` → `Option<Address>` | Anyone | Return the pending admin nominee, if any. | — |
+| `set_proof_cooldown(admin, ledgers)` | Admin | Set minimum ledger gap between proof resubmissions on the same milestone. Works even when paused. | `contract not initialised`, `unauthorized` |
+
+Additional admin functions (documented elsewhere): `init`, `renounce_admin`, `set_ledgers_per_day`, `set_max_retention_days`, `set_max_milestones`, `set_inactivity_timeout_ledgers`, `set_storage_ttl_extend_to`, `set_confirm_window`, `set_dispute_window`, `set_max_proof_hash_length`, `set_arbiter_fee`, `set_amendment_ttl`, `set_upgrade_lock_duration`, `propose_upgrade`, `add_allowed_token`, `remove_allowed_token`, `set_token_allowlist_enabled`.
 
 ### Engagement Lifecycle
 `create_engagement`, `unlock_milestone`, `submit_proof`, `confirm_milestone`, `batch_confirm_milestones`, `force_confirm_milestone`, `raise_dispute`, `cast_arbiter_vote`, `request_replacement`, `cancel_engagement`, `top_up_escrow`, `request_early_exit`, `accept_early_exit`, `reject_early_exit`, `expire_engagement`
