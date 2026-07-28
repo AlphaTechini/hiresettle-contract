@@ -643,7 +643,104 @@ If this does not hold, the call panics with `ConfirmWindowNotElapsed`. In partic
 
 ## Events
 
-The contract emits Soroban events for all state transitions: `engagement_created`, `milestone_unlocked`, `proof_submitted`, `proof_resubmitted`, `milestone_confirmed`, `engagement_completed`, `dispute_raised`, `arbiter_voted`, `dispute_resolved`, `replacement_requested`, `engagement_cancelled`, `early_exit_requested`, `early_exit_accepted`, `early_exit_rejected`, `engagement_expired`, `escrow_topped_up`, `amendment_proposed`, `amendment_accepted`, `amendment_rejected`, `platform_fee_collected`, `upgrade_proposed`, `upgrade_executed`, and admin configuration events.
+The contract emits Soroban events for all state transitions. Events are grouped by feature area below. Each event's first topic is its symbol name; `engagement_id` appears as a second topic for engagement-scoped events.
+
+### Admin & Contract Config
+
+| Event | Topics | Payload | Trigger |
+|---|---|---|---|
+| `platform_fee_set` | — | `(bps, treasury)` | `set_platform_fee` |
+| `version_set` | — | `version` | `set_version` |
+| `min_amount_set` | — | `amount` | `set_min_amount` |
+| `paused` | — | `admin` | `pause` |
+| `unpaused` | — | `admin` | `unpause` |
+| `admin_nominated` | — | `new_admin` | `nominate_admin` |
+| `admin_claimed` | — | `nominee` | `claim_admin` |
+| `admin_renounced` | — | `final_ledger` | `renounce_admin` |
+| `max_replacements_set` | — | `count` | `set_max_replacements` |
+| `ledgers_per_day_set` | — | `value` | `set_ledgers_per_day` |
+| `max_retention_days_set` | — | `days` | `set_max_retention_days` |
+| `max_milestones_set` | — | `count` | `set_max_milestones` |
+| `max_active_per_company_set` | — | `count` | `set_max_active_per_company` |
+| `inactivity_timeout_set` | — | `ledgers` | `set_inactivity_timeout_ledgers` |
+| `storage_ttl_extend_to_set` | — | `ledgers` | `set_storage_ttl_extend_to` |
+| `confirm_window_set` | — | `ledgers` | `set_confirm_window` |
+| `dispute_window_set` | — | `ledgers` | `set_dispute_window` |
+| `upgrade_lock_duration_set` | — | `ledgers` | `set_upgrade_lock_duration` |
+| `max_proof_hash_length_set` | — | `len` | `set_max_proof_hash_length` |
+| `arbiter_fee_set` | — | `bps` | `set_arbiter_fee` |
+| `token_allowlisted` | — | `token` | `add_allowed_token` |
+| `token_removed` | — | `token` | `remove_allowed_token` |
+| `allowlist_enabled_set` | — | `enabled` | `set_token_allowlist_enabled` |
+
+### Upgrade
+
+| Event | Topics | Payload | Trigger |
+|---|---|---|---|
+| `upgrade_proposed` | — | `(new_wasm_hash, execute_after_ledger)` | `propose_upgrade` |
+| `upgrade_executed` | — | `new_wasm_hash` | `execute_upgrade` (permissionless after lock) |
+
+### Engagement Lifecycle
+
+| Event | Topics | Payload | Trigger |
+|---|---|---|---|
+| `engagement_created` | `engagement_id` | `engagement_id` | `create_engagement` |
+| `engagement_cancelled` | `engagement_id` | `refund` | `cancel_engagement` (company + recruiter) |
+| `engagement_expired` | `engagement_id` | `refund` | `expire_engagement` (permissionless keeper) |
+| `engagement_completed` | `engagement_id` | `(engagement_id, released_amount, ledger)` | Final milestone confirmed |
+| `escrow_topped_up` | `engagement_id` | `(amount, total_amount)` | `top_up_escrow` |
+| `company_transferred` | `engagement_id` | `(old_company, new_company)` | `transfer_company_role` |
+| `recruiter_transferred` | `engagement_id` | `(old_recruiter, new_recruiter)` | `accept_recruiter_transfer` |
+| `status_changed` | `engagement_id` | `(old_status, new_status)` | Any engagement status transition |
+
+### Milestone
+
+| Event | Topics | Payload | Trigger |
+|---|---|---|---|
+| `milestone_unlocked` | `engagement_id` | `(milestone_index, valid_after_ledger, unlocked_at_ledger)` | `unlock_milestone` |
+| `proof_submitted` | `engagement_id` | `milestone_index` | `submit_proof` (first submission) |
+| `proof_resubmitted` | `engagement_id` | `(milestone_index, old_hash, proof_hash)` | `submit_proof` (resubmission) |
+| `milestone_confirmed` | `engagement_id` | `(milestone_index, payment)` | `confirm_milestone` / `batch_confirm_milestones` |
+| `milestone_force_confirmed` | `engagement_id` | `(milestone_index, payment)` | `force_confirm_milestone` (permissionless after window) |
+| `milestone_status_changed` | `engagement_id` | `(milestone_index, old_status, new_status)` | Any milestone status transition |
+| `platform_fee_collected` | `engagement_id` | `(milestone_index, fee_amount, treasury)` | Milestone confirmation when fee > 0 |
+
+### Dispute
+
+| Event | Topics | Payload | Trigger |
+|---|---|---|---|
+| `dispute_raised` | `engagement_id` | `(milestone_index, reason)` | `raise_dispute` |
+| `arbiter_voted` | `engagement_id` | `(milestone_index, approve)` | `cast_arbiter_vote` |
+| `dispute_resolved` | `engagement_id` | `(milestone_index, approved)` | Quorum reached in `cast_arbiter_vote` |
+
+### Amendment
+
+| Event | Topics | Payload | Trigger |
+|---|---|---|---|
+| `amendment_proposed` | `engagement_id` | `(milestone_index, proposer, new_payment_percent, expires_at_ledger)` | `propose_amendment` |
+| `amendment_accepted` | `engagement_id` | `(milestone_index, acceptor, old_payment_percent, new_payment_percent)` | `accept_amendment` |
+| `amendment_rejected` | `engagement_id` | `(milestone_index, rejector, reason)` | `reject_amendment` or expired proposal on `accept_amendment` |
+
+### Arbiter Succession
+
+| Event | Topics | Payload | Trigger |
+|---|---|---|---|
+| `arbiter_nominated` | `engagement_id` | `successor` | `nominate_arbiter_successor` |
+| `arbiter_claimed` | `engagement_id` | `nominee` | `claim_arbiter` |
+
+### Early Exit
+
+| Event | Topics | Payload | Trigger |
+|---|---|---|---|
+| `early_exit_requested` | `engagement_id` | `recruiter` | `request_early_exit` |
+| `early_exit_accepted` | `engagement_id` | `refund` | `accept_early_exit` |
+| `early_exit_rejected` | `engagement_id` | `company` | `reject_early_exit` |
+
+### Replacement
+
+| Event | Topics | Payload | Trigger |
+|---|---|---|---|
+| `replacement_requested` | `engagement_id` | `(replacement_index, reason)` | `request_replacement` |
 
 ---
 
