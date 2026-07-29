@@ -369,6 +369,22 @@ Every proposal carries an expiry ledger computed as `proposed_at_ledger + amendm
   - `get_pending_amendment` automatically treats expired proposals as non-existent and returns `None`.
 - Expired proposals do **not** auto-clean from storage on ledger tick; they are lazily cleared on the next `accept_amendment`, `reject_amendment`, or overwritten by the next `propose_amendment` for the same milestone.
 
+### Withdrawing a Proposal
+
+`accept_amendment` and `reject_amendment` are both restricted to the
+counterparty, so before issue #238 a proposer who changed their mind had to wait
+out the TTL. `withdraw_amendment_proposal(proposer, engagement_id,
+milestone_index)` lets the **original proposer** clear their own pending proposal
+immediately.
+
+Only the address recorded on the proposal may withdraw it — being the
+engagement's company or recruiter is not sufficient. Afterwards
+`get_pending_amendment` reports `None` and a fresh proposal can be made for the
+same milestone. The amendment log is untouched: a withdrawn proposal was never
+applied, so it is not part of the milestone's amendment history. An
+expired-but-uncleared proposal can still be withdrawn, since that is exactly the
+storage cleanup the caller intends.
+
 ### What an Amendment Can Change
 
 Only one field is mutable via the amendment system:
@@ -388,6 +404,32 @@ Each time an amendment is accepted, an [`AmendmentEntry`](#amendmententry) is ap
 - The pending proposal itself is not part of the log until it is accepted; use `get_pending_amendment` to inspect a live proposal.
 
 ---
+
+## Feedback Ratings
+
+Once an engagement reaches `Completed`, each side may rate the other once:
+
+- `submit_recruiter_rating(company, engagement_id, rating)` — the company rates
+  the recruiter (issue #242).
+- `submit_company_rating(recruiter, engagement_id, rating)` — the recruiter
+  rates the company (issue #243).
+
+`rating` must be 1–5; anything else panics with `InvalidRating`. Ratings are
+folded into a running tally keyed by the rated party's **address**, not the
+engagement, so reputation accumulates across every engagement that address
+completes. Query with `get_recruiter_rating(recruiter)` /
+`get_company_rating(company)` (issue #244).
+
+Each engagement contributes at most one rating per side — a second submission
+panics with `AlreadyRated`, so neither party can inflate or bury a counterparty's
+score by rating a single job repeatedly. The two sides are independent: both may
+rate each other for the same engagement. Use `is_recruiter_rated` /
+`is_company_rated` to hide a rating prompt instead of surfacing the failure.
+
+Ratings are credited to whoever holds the role at completion time. If the
+recruiter role was transferred mid-engagement via `accept_recruiter_transfer`,
+the incoming address receives the rating — matching where the milestone payouts
+went.
 
 ## Token Allowlist
 
@@ -481,7 +523,7 @@ is not engagement activity, and bumping it would let a keeper postpone
 `expire_engagement` indefinitely.
 
 ### Amendments
-`propose_amendment`, `accept_amendment`, `reject_amendment`
+`propose_amendment`, `accept_amendment`, `reject_amendment`, `withdraw_amendment_proposal`
 
 ### Arbiter Succession
 `nominate_arbiter_successor`, `claim_arbiter`
@@ -637,6 +679,20 @@ function was deployed are not enumerated (their records stay readable via
 | `get_amendment_log` | `engagement_id: String`, `milestone_index: u32` | `Vec<AmendmentEntry>` |
 | `get_pending_amendment` | `engagement_id: String`, `milestone_index: u32` | `Option<AmendmentProposal>` |
 | `get_amendment_ttl` | — | `u32` |
+
+#### Feedback Rating Queries
+
+| Function | Arguments | Return Type |
+|---|---|---|
+| `get_recruiter_rating` | `recruiter: Address` | `RatingSummary` |
+| `get_company_rating` | `company: Address` | `RatingSummary` |
+| `is_recruiter_rated` | `engagement_id: String` | `bool` |
+| `is_company_rated` | `engagement_id: String` | `bool` |
+
+An address that has never been rated returns a zeroed summary rather than
+panicking, so new recruiters and companies render without a prior existence
+check. Always check `count` before presenting `average_x100` — a `0` average
+means "no ratings yet", not "rated zero".
 
 #### Replacement Queries
 
@@ -885,6 +941,14 @@ The contract emits Soroban events for all state transitions. Events are grouped 
 | `amendment_proposed` | `engagement_id` | `(milestone_index, proposer, new_payment_percent, expires_at_ledger)` | `propose_amendment` |
 | `amendment_accepted` | `engagement_id` | `(milestone_index, acceptor, old_payment_percent, new_payment_percent)` | `accept_amendment` |
 | `amendment_rejected` | `engagement_id` | `(milestone_index, rejector, reason)` | `reject_amendment` or expired proposal on `accept_amendment` |
+| `amendment_withdrawn` | `engagement_id` | `(milestone_index, proposer, new_payment_percent)` | `withdraw_amendment_proposal` |
+
+### Feedback Ratings
+
+| Event | Topics | Payload | Trigger |
+|---|---|---|---|
+| `recruiter_rated` | `engagement_id` | `(recruiter, rating, new_count)` | `submit_recruiter_rating` |
+| `company_rated` | `engagement_id` | `(company, rating, new_count)` | `submit_company_rating` |
 
 ### Arbiter Succession
 

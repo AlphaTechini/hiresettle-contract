@@ -3870,6 +3870,256 @@ impl HireSettleContract {
         );
     }
 
+    /// Withdraw a pending amendment proposal (issue #238).
+    ///
+    /// Lets the original proposer cancel their own proposal before the
+    /// counterparty responds, instead of leaving stale terms on the table until
+    /// the TTL expires. Complements `accept_amendment` / `reject_amendment`,
+    /// which are both restricted to the *other* party.
+    ///
+    /// # Caller
+    /// `proposer` — must be the address recorded on the pending proposal and
+    /// sign the transaction. Being the engagement's company or recruiter is not
+    /// sufficient; only whoever actually made this proposal may withdraw it.
+    ///
+    /// # Behaviour
+    /// Clears the pending proposal, after which `get_pending_amendment` reports
+    /// `None` and a fresh proposal can be made for the same milestone. The
+    /// amendment log is untouched — a withdrawn proposal was never applied, so
+    /// it is not part of the milestone's amendment history.
+    ///
+    /// An expired-but-uncleared proposal can still be withdrawn: doing so is
+    /// exactly the storage cleanup the caller intends, and refusing would leave
+    /// the entry stranded.
+    ///
+    /// # Panics
+    /// - `"no pending amendment proposal"` — no proposal exists for this milestone.
+    /// - `"unauthorized"` — caller is not the proposal's original proposer.
+    ///
+    /// # Events
+    /// Emits `("amendment_withdrawn", engagement_id)` with
+    /// `(milestone_index, proposer, new_payment_percent)`. The proposed percent
+    /// is included so indexers can retire the pending change they were tracking
+    /// without a prior read.
+    pub fn withdraw_amendment_proposal(
+        env: Env,
+        proposer: Address,
+        engagement_id: String,
+        milestone_index: u32,
+    ) {
+        proposer.require_auth();
+
+        let proposal_key = DataKey::AmendmentProposal(engagement_id.clone(), milestone_index);
+        let proposal: AmendmentProposal = env
+            .storage()
+            .persistent()
+            .get(&proposal_key)
+            .unwrap_or_else(|| panic!("no pending amendment proposal"));
+
+        if proposer != proposal.proposer {
+            panic!("{}", ERR_UNAUTHORIZED);
+        }
+
+        env.storage().persistent().remove(&proposal_key);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "amendment_withdrawn"),
+                engagement_id.clone(),
+            ),
+            (milestone_index, proposer, proposal.new_payment_percent),
+        );
+    }
+
+    // ----------------------------------------------------------
+    // ISSUES #242, #243, #244 — FEEDBACK RATINGS
+    // ----------------------------------------------------------
+
+    /// Company submits a 1–5 feedback rating for the recruiter after the
+    /// engagement completes (issue #242).
+    ///
+    /// # Caller
+    /// `company` — must match the engagement's company and sign the transaction.
+    ///
+    /// # Behaviour
+    /// The rating is folded into a running tally keyed by the **recruiter's
+    /// address**, not the engagement, so reputation accumulates across every
+    /// engagement that recruiter completes. Query it with
+    /// `get_recruiter_rating`.
+    ///
+    /// Each engagement contributes at most one rating: a second call for the
+    /// same engagement is rejected, so a company cannot inflate or bury a
+    /// recruiter's score by rating one job repeatedly.
+    ///
+    /// The rating is credited to whoever is the recruiter at completion time.
+    /// If the recruiter role was transferred mid-engagement (see
+    /// `accept_recruiter_transfer`), the incoming address receives it, matching
+    /// where the milestone payouts went.
+    ///
+    /// # Panics
+    /// - `"ContractPaused"` — the contract is paused.
+    /// - `"engagement not found"` — no engagement with this ID.
+    /// - `"EngagementNotCompleted"` — the engagement has not reached `Completed`.
+    /// - `"unauthorized"` — caller is not the engagement's company.
+    /// - `"InvalidRating"` — `rating` is outside 1–5.
+    /// - `"AlreadyRated"` — this engagement's recruiter rating was already submitted.
+    ///
+    /// # Events
+    /// Emits `("recruiter_rated", engagement_id)` with
+    /// `(recruiter, rating, new_count)`.
+    pub fn submit_recruiter_rating(env: Env, company: Address, engagement_id: String, rating: u32) {
+        Self::assert_not_paused(&env);
+        company.require_auth();
+
+        let engagement = Self::get_engagement_internal(&env, &engagement_id);
+
+        if engagement.status != EngagementStatus::Completed {
+            panic!("EngagementNotCompleted");
+        }
+
+        if company != engagement.company {
+            panic!("{}", ERR_UNAUTHORIZED);
+        }
+
+        Self::assert_valid_rating(rating);
+
+        let rated_key = DataKey::RecruiterRated(engagement_id.clone());
+        if env
+            .storage()
+            .persistent()
+            .get::<DataKey, bool>(&rated_key)
+            .unwrap_or(false)
+        {
+            panic!("AlreadyRated");
+        }
+
+        let new_count = Self::record_rating(
+            &env,
+            &DataKey::RecruiterRating(engagement.recruiter.clone()),
+            rating,
+        );
+
+        env.storage().persistent().set(&rated_key, &true);
+        env.storage()
+            .persistent()
+            .extend_ttl(&rated_key, 100_000, 6_300_000);
+
+        env.events().publish(
+            (Symbol::new(&env, "recruiter_rated"), engagement_id.clone()),
+            (engagement.recruiter, rating, new_count),
+        );
+    }
+
+    /// Recruiter submits a 1–5 feedback rating for the company after the
+    /// engagement completes (issue #243). Mirror of
+    /// [`Self::submit_recruiter_rating`].
+    ///
+    /// # Caller
+    /// `recruiter` — must match the engagement's recruiter and sign the
+    /// transaction.
+    ///
+    /// # Behaviour
+    /// The rating is folded into a running tally keyed by the **company's
+    /// address**, accumulating across every engagement that company completes.
+    /// Query it with `get_company_rating`. Each engagement contributes at most
+    /// one company rating, independent of the recruiter rating for the same
+    /// engagement — both sides may rate each other exactly once.
+    ///
+    /// # Panics
+    /// - `"ContractPaused"` — the contract is paused.
+    /// - `"engagement not found"` — no engagement with this ID.
+    /// - `"EngagementNotCompleted"` — the engagement has not reached `Completed`.
+    /// - `"unauthorized"` — caller is not the engagement's recruiter.
+    /// - `"InvalidRating"` — `rating` is outside 1–5.
+    /// - `"AlreadyRated"` — this engagement's company rating was already submitted.
+    ///
+    /// # Events
+    /// Emits `("company_rated", engagement_id)` with
+    /// `(company, rating, new_count)`.
+    pub fn submit_company_rating(env: Env, recruiter: Address, engagement_id: String, rating: u32) {
+        Self::assert_not_paused(&env);
+        recruiter.require_auth();
+
+        let engagement = Self::get_engagement_internal(&env, &engagement_id);
+
+        if engagement.status != EngagementStatus::Completed {
+            panic!("EngagementNotCompleted");
+        }
+
+        if recruiter != engagement.recruiter {
+            panic!("{}", ERR_UNAUTHORIZED);
+        }
+
+        Self::assert_valid_rating(rating);
+
+        let rated_key = DataKey::CompanyRated(engagement_id.clone());
+        if env
+            .storage()
+            .persistent()
+            .get::<DataKey, bool>(&rated_key)
+            .unwrap_or(false)
+        {
+            panic!("AlreadyRated");
+        }
+
+        let new_count = Self::record_rating(
+            &env,
+            &DataKey::CompanyRating(engagement.company.clone()),
+            rating,
+        );
+
+        env.storage().persistent().set(&rated_key, &true);
+        env.storage()
+            .persistent()
+            .extend_ttl(&rated_key, 100_000, 6_300_000);
+
+        env.events().publish(
+            (Symbol::new(&env, "company_rated"), engagement_id.clone()),
+            (engagement.company, rating, new_count),
+        );
+    }
+
+    /// Return a recruiter's aggregate feedback rating (issue #244).
+    ///
+    /// An address that has never been rated returns a zeroed summary
+    /// (`average_x100: 0, count: 0, total_score: 0`) rather than panicking, so
+    /// callers can render new recruiters without a prior existence check.
+    /// Always check `count` before presenting `average_x100` — a `0` average
+    /// means "no ratings yet", not "rated zero".
+    ///
+    /// Read-only and permissionless.
+    pub fn get_recruiter_rating(env: Env, recruiter: Address) -> RatingSummary {
+        Self::rating_summary(&env, &DataKey::RecruiterRating(recruiter))
+    }
+
+    /// Return a company's aggregate feedback rating (issue #244).
+    /// Mirror of [`Self::get_recruiter_rating`]; the same zeroed-summary and
+    /// `count`-before-`average_x100` notes apply.
+    ///
+    /// Read-only and permissionless.
+    pub fn get_company_rating(env: Env, company: Address) -> RatingSummary {
+        Self::rating_summary(&env, &DataKey::CompanyRating(company))
+    }
+
+    /// Return whether the recruiter has already been rated for this engagement
+    /// (issue #242), so a UI can hide the rating prompt instead of surfacing an
+    /// `"AlreadyRated"` failure.
+    pub fn is_recruiter_rated(env: Env, engagement_id: String) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::RecruiterRated(engagement_id))
+            .unwrap_or(false)
+    }
+
+    /// Return whether the company has already been rated for this engagement
+    /// (issue #243). Companion to [`Self::is_recruiter_rated`].
+    pub fn is_company_rated(env: Env, engagement_id: String) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::CompanyRated(engagement_id))
+            .unwrap_or(false)
+    }
+
     // ----------------------------------------------------------
     // AMENDMENT LOG QUERIES
     // ----------------------------------------------------------
@@ -5737,6 +5987,58 @@ impl HireSettleContract {
             status,
             EngagementStatus::Completed | EngagementStatus::Cancelled | EngagementStatus::Expired
         )
+    }
+
+    /// Shared 1–5 bounds check for both feedback-rating entry points
+    /// (issues #242, #243).
+    fn assert_valid_rating(rating: u32) {
+        if rating < 1 || rating > 5 {
+            panic!("InvalidRating");
+        }
+    }
+
+    /// Fold one rating into the running tally at `key`, returning the new
+    /// rating count. Shared by both rating entry points so recruiter and
+    /// company tallies can never diverge in how they accumulate.
+    fn record_rating(env: &Env, key: &DataKey, rating: u32) -> u32 {
+        let mut record: RatingRecord =
+            env.storage().persistent().get(key).unwrap_or(RatingRecord {
+                total_score: 0,
+                count: 0,
+            });
+
+        record.total_score += rating;
+        record.count += 1;
+        let new_count = record.count;
+
+        env.storage().persistent().set(key, &record);
+        env.storage()
+            .persistent()
+            .extend_ttl(key, 100_000, 6_300_000);
+
+        new_count
+    }
+
+    /// Build the read-only summary for a rating tally (issue #244), returning a
+    /// zeroed summary for an address that has never been rated.
+    fn rating_summary(env: &Env, key: &DataKey) -> RatingSummary {
+        let record: RatingRecord = env.storage().persistent().get(key).unwrap_or(RatingRecord {
+            total_score: 0,
+            count: 0,
+        });
+
+        // Scale before dividing so the two decimal places survive integer
+        // truncation; an unrated address has no average, so count == 0 falls
+        // back to 0 rather than dividing.
+        let average_x100 = (record.total_score * 100)
+            .checked_div(record.count)
+            .unwrap_or(0);
+
+        RatingSummary {
+            average_x100,
+            count: record.count,
+            total_score: record.total_score,
+        }
     }
 
     fn get_platform_fee_internal(env: &Env) -> PlatformFee {
