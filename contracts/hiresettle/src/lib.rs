@@ -196,6 +196,10 @@ pub struct Engagement {
     /// Optional off-chain attestation hash (e.g. SHA-256 of the contract PDF).
     /// Stored at engagement creation for audit and verification purposes.
     pub contract_pdf_hash: Option<String>,
+    /// Optional referrer address set at creation time (issue #251).
+    /// If present and recognised by the admin-configured referral list,
+    /// a configurable fee discount is applied to every milestone payout.
+    pub referrer: Option<Address>,
 }
 
 /// A lightweight read-only view of an engagement, suitable for list/dashboard APIs.
@@ -230,6 +234,8 @@ pub struct EngagementSummary {
     pub recruiter_split_bps: u32,
     /// Optional off-chain attestation hash (e.g. SHA-256 of the contract PDF).
     pub contract_pdf_hash: Option<String>,
+    /// Optional referrer address (issue #251).
+    pub referrer: Option<Address>,
 }
 
 /// Per-dispute, per-milestone vote tally stored on-chain until the dispute resolves.
@@ -323,6 +329,9 @@ pub struct EngagementConfig {
     /// Optional off-chain attestation hash (e.g. SHA-256 of the contract PDF).
     /// Must be non-empty if provided.
     pub contract_pdf_hash: Option<String>,
+    /// Optional referrer address (issue #251). If present and in the
+    /// admin-configured referral list, the engagement receives a fee discount.
+    pub referrer: Option<Address>,
 }
 
 // ============================================================
@@ -411,6 +420,10 @@ pub enum DataKey {
     CompanyActiveCount(Address),
     /// Admin-configurable maximum number of replacements allowed per engagement (issue #31, default 3).
     MaxReplacements,
+    /// Admin-configured list of recognised referrer addresses (issue #251).
+    Referrers,
+    /// Admin-configured referral discount in basis points (issue #251).
+    ReferralDiscountBps,
 }
 
 // ============================================================
@@ -527,6 +540,93 @@ impl HireSettleContract {
     pub fn get_platform_fee(env: Env) -> (u32, Address) {
         let fee = Self::get_platform_fee_internal(&env);
         (fee.bps, fee.treasury)
+    }
+
+    /// Admin adds a referrer address to the recognised referral list (issue #251).
+    pub fn add_referrer(env: Env, admin: Address, referrer: Address) {
+        Self::assert_not_paused(&env);
+        Self::assert_admin(&env, &admin);
+
+        let mut list: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Referrers)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        // Prevent duplicates.
+        for i in 0..list.len() {
+            if list.get(i).unwrap() == referrer {
+                panic!("referrer already exists");
+            }
+        }
+        list.push_back(referrer.clone());
+        env.storage().persistent().set(&DataKey::Referrers, &list);
+        env.events()
+            .publish((Symbol::new(&env, "referrer_added"),), referrer);
+    }
+
+    /// Admin removes a referrer address from the recognised referral list.
+    pub fn remove_referrer(env: Env, admin: Address, referrer: Address) {
+        Self::assert_not_paused(&env);
+        Self::assert_admin(&env, &admin);
+
+        let list: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Referrers)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut new_list: Vec<Address> = Vec::new(&env);
+        let mut found = false;
+        for i in 0..list.len() {
+            let addr = list.get(i).unwrap();
+            if addr == referrer {
+                found = true;
+            } else {
+                new_list.push_back(addr);
+            }
+        }
+        if !found {
+            panic!("referrer not found");
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::Referrers, &new_list);
+        env.events()
+            .publish((Symbol::new(&env, "referrer_removed"),), referrer);
+    }
+
+    /// Return the list of recognised referrer addresses.
+    pub fn get_referrers(env: Env) -> Vec<Address> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Referrers)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Admin sets the referral discount in basis points (issue #251).
+    /// When a recognised referrer is attached to an engagement, the platform
+    /// fee is reduced by this amount (but never below 0).
+    /// Maximum 500 bps (same as max platform fee).
+    pub fn set_referral_discount_bps(env: Env, admin: Address, bps: u32) {
+        Self::assert_not_paused(&env);
+        Self::assert_admin(&env, &admin);
+        if bps > MAX_PLATFORM_FEE_BPS {
+            panic!("discount too high");
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::ReferralDiscountBps, &bps);
+        env.events()
+            .publish((Symbol::new(&env, "referral_discount_set"),), bps);
+    }
+
+    /// Return the current referral discount in basis points (default 0).
+    pub fn get_referral_discount_bps(env: Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ReferralDiscountBps)
+            .unwrap_or(0u32)
     }
 
     /// Admin sets the contract version string (issue #16).
@@ -922,6 +1022,7 @@ impl HireSettleContract {
             co_recruiter: config.co_recruiter,
             recruiter_split_bps: config.recruiter_split_bps,
             contract_pdf_hash: config.contract_pdf_hash,
+            referrer: config.referrer,
         };
 
         env.storage()
@@ -1276,7 +1377,9 @@ impl HireSettleContract {
         let payment = full_share - milestone.replacement_paid_out;
         if payment > 0 {
             let platform_fee = Self::get_platform_fee_internal(&env);
-            let fee_amount = (payment * platform_fee.bps as i128) / 10_000;
+            let effective_bps =
+                Self::apply_referral_discount(&env, platform_fee.bps, &engagement.referrer);
+            let fee_amount = (payment * effective_bps as i128) / 10_000;
             let net_payment = payment - fee_amount;
             engagement.released_amount += payment;
 
@@ -2360,6 +2463,7 @@ impl HireSettleContract {
             co_recruiter: engagement.co_recruiter,
             recruiter_split_bps: engagement.recruiter_split_bps,
             contract_pdf_hash: engagement.contract_pdf_hash,
+            referrer: engagement.referrer,
         }
     }
 
@@ -3525,6 +3629,8 @@ impl HireSettleContract {
         }
 
         let platform_fee = Self::get_platform_fee_internal(&env);
+        let effective_bps =
+            Self::apply_referral_discount(&env, platform_fee.bps, &engagement.referrer);
         let token_client = token::Client::new(&env, &engagement.token);
 
         for i in 0..milestone_indices.len() {
@@ -3532,7 +3638,7 @@ impl HireSettleContract {
             let mut m = engagement.milestones.get(idx).unwrap();
 
             let payment = (engagement.total_amount * m.payment_percent as i128) / 100;
-            let fee_amount = (payment * platform_fee.bps as i128) / 10_000;
+            let fee_amount = (payment * effective_bps as i128) / 10_000;
             let net_payment = payment - fee_amount;
             engagement.released_amount += payment;
 
@@ -3716,7 +3822,9 @@ impl HireSettleContract {
         // Release payment identically to confirm_milestone.
         let payment = (engagement.total_amount * milestone.payment_percent as i128) / 100;
         let platform_fee = Self::get_platform_fee_internal(&env);
-        let fee_amount = (payment * platform_fee.bps as i128) / 10_000;
+        let effective_bps =
+            Self::apply_referral_discount(&env, platform_fee.bps, &engagement.referrer);
+        let fee_amount = (payment * effective_bps as i128) / 10_000;
         let net_payment = payment - fee_amount;
         engagement.released_amount += payment;
 
@@ -4089,6 +4197,33 @@ impl HireSettleContract {
                 bps: 0,
                 treasury: Self::get_admin_internal(env),
             })
+    }
+
+    /// If the engagement has a recognised referrer, reduce the given bps
+    /// by the admin-configured referral discount (never below 0).
+    fn apply_referral_discount(env: &Env, bps: u32, referrer: &Option<Address>) -> u32 {
+        if let Some(ref_addr) = referrer {
+            let referrers: Option<Vec<Address>> =
+                env.storage().persistent().get(&DataKey::Referrers);
+            if let Some(list) = referrers {
+                let mut recognised = false;
+                for i in 0..list.len() {
+                    if list.get(i).unwrap() == *ref_addr {
+                        recognised = true;
+                        break;
+                    }
+                }
+                if recognised {
+                    let discount: u32 = env
+                        .storage()
+                        .persistent()
+                        .get(&DataKey::ReferralDiscountBps)
+                        .unwrap_or(0u32);
+                    return if discount >= bps { 0 } else { bps - discount };
+                }
+            }
+        }
+        bps
     }
 
     fn get_ledgers_per_day_internal(env: &Env) -> u32 {
