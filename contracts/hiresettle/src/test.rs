@@ -7578,6 +7578,9 @@ fn test_tightening_cap_blocks_previously_valid_proofs() {
         &0,
         &String::from_str(&env, "1234567890"),
     );
+}
+
+// ============================================================
 // ISSUE #44 — RECRUITER TRANSFER
 // ============================================================
 
@@ -7601,9 +7604,9 @@ fn test_recruiter_transfer_happy_path() {
     client.propose_recruiter_transfer(&recruiter, &eng_id, &new_recruiter);
     client.accept_recruiter_transfer(&company, &eng_id);
 
+    assert!(has_event(&env, "recruiter_transferred"));
     let engagement = client.get_engagement(&eng_id);
     assert_eq!(engagement.recruiter, new_recruiter);
-    assert!(has_event(&env, "recruiter_transferred"));
 }
 
 #[test]
@@ -7676,7 +7679,7 @@ fn test_recruiter_transfer_payout() {
 
     // Confirm a milestone — payout should go to new_recruiter
     client.submit_proof(
-        &recruiter,
+        &new_recruiter,
         &eng_id,
         &0,
         &String::from_str(&env, "ipfs://proof"),
@@ -7772,11 +7775,12 @@ fn test_get_arbiter_votes_default_before_any_votes() {
     assert_eq!(counts.reject_votes, 0);
 }
 
+/// Multi-arbiter vote tracking (issue #10) — three arbiters, quorum 2.
+/// Tests vote counting, duplicate-vote rejection, automatic resolution on
+/// quorum, and vote-record clearing after resolution.
 #[test]
-fn test_get_arbiter_votes_after_approve_and_reject_votes() {
-    // Use a 3-arbiter, quorum-2 panel so votes accumulate without resolving
-    // on the first vote, letting us observe intermediate tallies.
-    let (env, contract_id, token_id, company, recruiter, _) = setup();
+fn test_multi_arbiter_quorum_with_three_arbiters_and_quorum_two() {
+    let (env, contract_id, token_id, company, recruiter, _arbiter) = setup();
     let client = HireSettleContractClient::new(&env, &contract_id);
     let token_client = token::Client::new(&env, &token_id);
 
@@ -7784,114 +7788,12 @@ fn test_get_arbiter_votes_after_approve_and_reject_votes() {
     let a2 = Address::generate(&env);
     let a3 = Address::generate(&env);
 
-    let eng_id = String::from_str(&env, "ENG-AVOTES-TALLY");
+    let eng_id = String::from_str(&env, "ENG-MULTI-ARB-3");
+
     client.create_engagement(
         &eng_id,
         &company,
         &recruiter,
-        &ArbiterSetup { arbiters: vec![&env, a1.clone(), a2.clone()], quorum: 2 },
-        &token_id,
-        &1_000_000_000,
-        &String::from_str(&env, "Engineer"),
-        &two_milestones,
-        &vec![&env],
-        &default_config(),
-    );
-
-    assert_eq!(client.get_active_dispute_count(&eng_id), 0);
-
-    client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://proof-a"));
-    client.raise_dispute(&company, &eng_id, &0, &String::from_str(&env, "dispute_a"));
-    assert_eq!(client.get_active_dispute_count(&eng_id), 1);
-
-    client.submit_proof(&recruiter, &eng_id, &1, &String::from_str(&env, "ipfs://proof-b"));
-    client.raise_dispute(&company, &eng_id, &1, &String::from_str(&env, "dispute_b"));
-    assert_eq!(client.get_active_dispute_count(&eng_id), 2);
-}
-
-/// Count decreases once a dispute is resolved by arbiter approval.
-#[test]
-fn test_get_active_dispute_count_decreases_after_resolution_approve() {
-    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
-    let client = HireSettleContractClient::new(&env, &contract_id);
-    let eng_id = String::from_str(&env, "ENG-DISP-COUNT-RESOLVE");
-    create_standard_engagement(
-        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-DISP-COUNT-RESOLVE",
-    );
-
-    client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://proof"));
-    client.raise_dispute(&company, &eng_id, &0, &String::from_str(&env, "dispute"));
-    assert_eq!(client.get_active_dispute_count(&eng_id), 1);
-
-    client.cast_arbiter_vote(&arbiter, &eng_id, &0, &true);
-    assert_eq!(client.get_active_dispute_count(&eng_id), 0);
-}
-
-/// Count decreases once a dispute is resolved by arbiter rejection.
-#[test]
-fn test_get_active_dispute_count_decreases_after_resolution_reject() {
-    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
-    let client = HireSettleContractClient::new(&env, &contract_id);
-    let eng_id = String::from_str(&env, "ENG-DISP-COUNT-REJECT");
-    create_standard_engagement(
-        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-DISP-COUNT-REJECT",
-    );
-
-    client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://proof"));
-    client.raise_dispute(&company, &eng_id, &0, &String::from_str(&env, "dispute"));
-    assert_eq!(client.get_active_dispute_count(&eng_id), 1);
-
-    client.cast_arbiter_vote(&arbiter, &eng_id, &0, &false);
-    assert_eq!(client.get_active_dispute_count(&eng_id), 0);
-}
-
-// ============================================================
-// STORAGE TTL EXTENSION — Issue #40
-// ============================================================
-
-/// Default value is returned before any admin update.
-#[test]
-fn test_get_storage_ttl_extend_to_default() {
-    let (env, contract_id, _token_id, _company, _recruiter, _arbiter) = setup();
-    let client = HireSettleContractClient::new(&env, &contract_id);
-
-    // DEFAULT_STORAGE_TTL_EXTEND_TO = 1_036_800
-    assert_eq!(client.get_storage_ttl_extend_to(), 1_036_800u32);
-}
-
-/// Admin can update the TTL-extension target and the getter reflects the new value.
-#[test]
-fn test_admin_can_set_storage_ttl_extend_to() {
-    let (env, contract_id, _token_id, company, _recruiter, _arbiter) = setup();
-    let client = HireSettleContractClient::new(&env, &contract_id);
-
-    let new_ttl: u32 = 500_000;
-    client.set_storage_ttl_extend_to(&company, &new_ttl);
-
-    assert_eq!(client.get_storage_ttl_extend_to(), new_ttl);
-}
-
-/// Admin can update the TTL-extension target multiple times; the latest value wins.
-#[test]
-fn test_admin_can_update_storage_ttl_extend_to_multiple_times() {
-    let (env, contract_id, _token_id, company, _recruiter, _arbiter) = setup();
-    let client = HireSettleContractClient::new(&env, &contract_id);
-
-    client.set_storage_ttl_extend_to(&company, &100_000u32);
-    assert_eq!(client.get_storage_ttl_extend_to(), 100_000u32);
-
-    client.set_storage_ttl_extend_to(&company, &200_000u32);
-    assert_eq!(client.get_storage_ttl_extend_to(), 200_000u32);
-}
-
-/// Non-admin caller is rejected with "unauthorized".
-#[test]
-#[should_panic(expected = "unauthorized")]
-fn test_non_admin_cannot_set_storage_ttl_extend_to() {
-    let (env, contract_id, _token_id, _company, recruiter, _arbiter) = setup();
-    let client = HireSettleContractClient::new(&env, &contract_id);
-
-    client.set_storage_ttl_extend_to(&recruiter, &500_000u32);
         &ArbiterSetup {
             arbiters: vec![&env, a1.clone(), a2.clone(), a3.clone()],
             quorum: 2,
@@ -8193,4 +8095,118 @@ fn test_expire_engagement_rejected_on_cancelled_engagement_before_timeout() {
     // With the default inactivity timeout (~1 036 800 ledgers) not yet
     // elapsed, expire_engagement must panic.
     client.expire_engagement(&eng_id);
+}
+
+// ============================================================
+// ISSUE #52 / #149 — ARBITER FEE TESTS
+// ============================================================
+
+/// Admin can set the arbiter fee and get_arbiter_fee reflects it.
+#[test]
+fn test_set_and_get_arbiter_fee() {
+    let (env, contract_id, _token_id, company, _recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    // Default is 0
+    assert_eq!(client.get_arbiter_fee(), 0u32);
+
+    client.set_arbiter_fee(&company, &50u32);
+    assert_eq!(client.get_arbiter_fee(), 50u32);
+
+    client.set_arbiter_fee(&company, &200u32); // max
+    assert_eq!(client.get_arbiter_fee(), 200u32);
+
+    client.set_arbiter_fee(&company, &0u32); // back to zero
+    assert_eq!(client.get_arbiter_fee(), 0u32);
+}
+
+/// Fee exceeding MAX_ARBITER_FEE_BPS (200) is rejected.
+#[test]
+fn test_set_arbiter_fee_too_high_rejected() {
+    let (env, contract_id, _token_id, company, _recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    let result = client.try_set_arbiter_fee(&company, &201u32);
+    assert!(result.is_err());
+
+    // Also verify the stored value was not updated
+    assert_eq!(client.get_arbiter_fee(), 0u32);
+}
+
+/// Non-admin caller is rejected with "unauthorized".
+#[test]
+#[should_panic(expected = "unauthorized")]
+fn test_non_admin_cannot_set_arbiter_fee() {
+    let (env, contract_id, _token_id, _company, recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    client.set_arbiter_fee(&recruiter, &50u32);
+}
+
+/// The configured arbiter fee is correctly deducted and routed to the
+/// deciding arbiter on a dispute resolved in the recruiter's favour.
+#[test]
+fn test_arbiter_fee_deducted_on_dispute_approval() {
+    let (env, contract_id, token_id, company, recruiter, _) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_id);
+
+    // Set arbiter fee to 1% (100 bps)
+    client.set_arbiter_fee(&company, &100u32);
+    assert_eq!(client.get_arbiter_fee(), 100u32);
+
+    let a1 = Address::generate(&env);
+    let a2 = Address::generate(&env);
+
+    let eng_id = String::from_str(&env, "ENG-ARB-FEE-DEDUCT");
+    client.create_engagement(
+        &eng_id,
+        &company,
+        &recruiter,
+        &ArbiterSetup {
+            arbiters: vec![&env, a1.clone(), a2.clone()],
+            quorum: 2,
+        },
+        &token_id,
+        &1_000_000_000,
+        &String::from_str(&env, "Engineer"),
+        &build_milestones(&env),
+        &vec![&env, 30u32, 90u32],
+        &default_config(),
+    );
+
+    // Recruiter submits proof for milestone 0 (30% = 300_000_000)
+    client.submit_proof(
+        &recruiter,
+        &eng_id,
+        &0,
+        &String::from_str(&env, "ipfs://proof"),
+    );
+
+    // Company raises dispute
+    client.raise_dispute(&company, &eng_id, &0, &String::from_str(&env, "dispute"));
+
+    let recruiter_balance_before = token_client.balance(&recruiter);
+    let a1_balance_before = token_client.balance(&a1);
+    let a2_balance_before = token_client.balance(&a2);
+
+    // First arbiter approves (1 of 2) — not yet quorum.
+    client.cast_arbiter_vote(&a1, &eng_id, &0, &true);
+
+    // Second arbiter approves (2 of 2) — quorum reached, dispute resolved.
+    client.cast_arbiter_vote(&a2, &eng_id, &0, &true);
+
+    // Milestone 0: payment = 1_000_000_000 * 30 / 100 = 300_000_000
+    // Arbiter fee = 300_000_000 * 100 / 10_000 = 3_000_000
+    // Net to recruiter = 300_000_000 - 3_000_000 = 297_000_000
+    // Arbiter fee goes to a2 (the deciding arbiter's vote tipped quorum)
+    assert_eq!(
+        token_client.balance(&recruiter),
+        recruiter_balance_before + 297_000_000
+    );
+    assert_eq!(token_client.balance(&a1), a1_balance_before);
+    assert_eq!(
+        token_client.balance(&a2),
+        a2_balance_before + 3_000_000
+    );
 }

@@ -325,6 +325,16 @@ pub struct EngagementConfig {
     pub contract_pdf_hash: Option<String>,
 }
 
+/// Returned by `get_contract_health` for quick off-chain diagnostics (issue #256).
+#[contracttype]
+#[derive(Clone)]
+pub struct ContractHealth {
+    pub paused: bool,
+    pub admin: Address,
+    pub version: String,
+    pub total_engagement_count: u64,
+}
+
 // ============================================================
 // STORAGE KEYS
 // ============================================================
@@ -411,6 +421,10 @@ pub enum DataKey {
     CompanyActiveCount(Address),
     /// Admin-configurable maximum number of replacements allowed per engagement (issue #31, default 3).
     MaxReplacements,
+    /// Per-tag list of engagement IDs (issue #249).
+    EngagementTag(String),
+    /// Optional co-signer address authorized to perform company-gated actions (issue #254).
+    CompanyCosigner(Address),
 }
 
 // ============================================================
@@ -625,6 +639,25 @@ impl HireSettleContract {
     /// Return the current contract admin.
     pub fn get_admin(env: Env) -> Address {
         Self::get_admin_internal(&env)
+    }
+
+    /// Return a single diagnostic snapshot of the contract's health (issue #256).
+    /// Returns paused state, admin, version, and total engagement count in one call.
+    pub fn get_contract_health(env: Env) -> ContractHealth {
+        ContractHealth {
+            paused: Self::is_paused_internal(&env),
+            admin: Self::get_admin_internal(&env),
+            version: env
+                .storage()
+                .persistent()
+                .get(&DataKey::Version)
+                .unwrap_or_else(|| String::from_str(&env, DEFAULT_VERSION)),
+            total_engagement_count: env
+                .storage()
+                .instance()
+                .get(&DataKey::EngagementCount)
+                .unwrap_or(0u64),
+        }
     }
 
     // ----------------------------------------------------------
@@ -1241,7 +1274,7 @@ impl HireSettleContract {
             panic!("{}", ERR_ENGAGEMENT_NOT_ACTIVE);
         }
 
-        if company != engagement.company {
+        if !Self::is_authorized_company(&env, &company, &engagement.company) {
             panic!("{}", ERR_UNAUTHORIZED);
         }
 
@@ -1411,7 +1444,7 @@ impl HireSettleContract {
             panic!("{}", ERR_ENGAGEMENT_NOT_ACTIVE);
         }
 
-        if company != engagement.company {
+        if !Self::is_authorized_company(&env, &company, &engagement.company) {
             panic!("{}", ERR_UNAUTHORIZED);
         }
 
@@ -1664,7 +1697,7 @@ impl HireSettleContract {
             panic!("{}", ERR_ENGAGEMENT_NOT_ACTIVE);
         }
 
-        if company != engagement.company {
+        if !Self::is_authorized_company(&env, &company, &engagement.company) {
             panic!("{}", ERR_UNAUTHORIZED);
         }
 
@@ -1840,6 +1873,48 @@ impl HireSettleContract {
     }
 
     // ----------------------------------------------------------
+    // ISSUE #254 — COMPANY MULTI-SIGNER SUPPORT
+    // ----------------------------------------------------------
+
+    /// Register a co-signer address that is also authorized to perform
+    /// company-gated actions (confirm, dispute, cancel, etc.) on behalf
+    /// of this company. Only the company address itself can set the cosigner.
+    pub fn set_company_cosigner(env: Env, company: Address, cosigner: Address) {
+        company.require_auth();
+        env.storage().persistent().set(
+            &DataKey::CompanyCosigner(company.clone()),
+            &cosigner,
+        );
+        env.events().publish(
+            (Symbol::new(&env, "company_cosigner_set"),),
+            (company, cosigner),
+        );
+    }
+
+    /// Return the registered co-signer for a company, or `None` if none set.
+    pub fn get_company_cosigner(env: Env, company: Address) -> Option<Address> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::CompanyCosigner(company))
+    }
+
+    /// Internal helper: check if `caller` is either the engagement's company
+    /// or the company's registered co-signer.
+    fn is_authorized_company(env: &Env, caller: &Address, engagement_company: &Address) -> bool {
+        if caller == engagement_company {
+            return true;
+        }
+        let cosigner: Option<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CompanyCosigner(engagement_company.clone()));
+        match cosigner {
+            Some(c) => caller == &c,
+            None => false,
+        }
+    }
+
+    // ----------------------------------------------------------
     // ISSUE #43 — COMPANY TRANSFER
     // ----------------------------------------------------------
 
@@ -1969,7 +2044,7 @@ impl HireSettleContract {
 
         let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
 
-        if company != engagement.company {
+        if !Self::is_authorized_company(&env, &company, &engagement.company) {
             panic!("{}", ERR_UNAUTHORIZED);
         }
 
@@ -2077,7 +2152,7 @@ impl HireSettleContract {
             panic!("{}", ERR_ENGAGEMENT_NOT_ACTIVE);
         }
 
-        if company != engagement.company {
+        if !Self::is_authorized_company(&env, &company, &engagement.company) {
             panic!("{}", ERR_UNAUTHORIZED);
         }
 
@@ -2150,7 +2225,7 @@ impl HireSettleContract {
             panic!("{}", ERR_ENGAGEMENT_NOT_ACTIVE);
         }
 
-        if company != engagement.company {
+        if !Self::is_authorized_company(&env, &company, &engagement.company) {
             panic!("{}", ERR_UNAUTHORIZED);
         }
 
@@ -2558,7 +2633,9 @@ impl HireSettleContract {
 
         let engagement = Self::get_engagement_internal(&env, &engagement_id);
 
-        if proposer != engagement.company && proposer != engagement.recruiter {
+        if !Self::is_authorized_company(&env, &proposer, &engagement.company)
+            && proposer != engagement.recruiter
+        {
             panic!("{}", ERR_UNAUTHORIZED);
         }
 
@@ -2626,7 +2703,9 @@ impl HireSettleContract {
 
         let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
 
-        if acceptor != engagement.company && acceptor != engagement.recruiter {
+        if !Self::is_authorized_company(&env, &acceptor, &engagement.company)
+            && acceptor != engagement.recruiter
+        {
             panic!("{}", ERR_UNAUTHORIZED);
         }
 
@@ -2746,7 +2825,9 @@ impl HireSettleContract {
 
         let engagement = Self::get_engagement_internal(&env, &engagement_id);
 
-        if rejector != engagement.company && rejector != engagement.recruiter {
+        if !Self::is_authorized_company(&env, &rejector, &engagement.company)
+            && rejector != engagement.recruiter
+        {
             panic!("{}", ERR_UNAUTHORIZED);
         }
 
@@ -2976,7 +3057,7 @@ impl HireSettleContract {
         company.require_auth();
 
         let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
-        Self::assert_exit_request_pending(&engagement, &company);
+        Self::assert_exit_request_pending(&env, &company, &engagement);
 
         let refund = engagement.total_amount - engagement.released_amount;
         if refund > 0 {
@@ -3037,7 +3118,7 @@ impl HireSettleContract {
         company.require_auth();
 
         let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
-        Self::assert_exit_request_pending(&engagement, &company);
+        Self::assert_exit_request_pending(&env, &company, &engagement);
 
         let old_engagement_status = engagement.status.clone();
         engagement.status = EngagementStatus::Active;
@@ -3164,6 +3245,124 @@ impl HireSettleContract {
             .storage()
             .persistent()
             .get(&DataKey::RecruiterEngagements(recruiter))
+            .unwrap_or_else(|| Vec::new(&env));
+        ids.len()
+    }
+
+    // ----------------------------------------------------------
+    // ISSUE #249 — ENGAGEMENT TAGS
+    // ----------------------------------------------------------
+
+    /// Add a tag to an engagement. Only the engagement's company (or its
+    /// registered co-signer) may tag the engagement.
+    /// Duplicate tags are silently ignored.
+    pub fn add_engagement_tag(
+        env: Env,
+        caller: Address,
+        engagement_id: String,
+        tag: String,
+    ) {
+        caller.require_auth();
+        let engagement = Self::get_engagement_internal(&env, &engagement_id);
+        if !Self::is_authorized_company(&env, &caller, &engagement.company) {
+            panic!("{}", ERR_UNAUTHORIZED);
+        }
+
+        let key = DataKey::EngagementTag(tag.clone());
+        let mut ids: Vec<String> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        for i in 0..ids.len() {
+            if ids.get(i).unwrap() == engagement_id {
+                return;
+            }
+        }
+        ids.push_back(engagement_id.clone());
+        env.storage().persistent().set(&key, &ids);
+        env.events().publish(
+            (Symbol::new(&env, "engagement_tag_added"), tag),
+            engagement_id,
+        );
+    }
+
+    /// Remove a tag from an engagement. Only the engagement's company (or its
+    /// registered co-signer) may remove a tag.
+    /// No-op if the tag was not present.
+    pub fn remove_engagement_tag(
+        env: Env,
+        caller: Address,
+        engagement_id: String,
+        tag: String,
+    ) {
+        caller.require_auth();
+        let engagement = Self::get_engagement_internal(&env, &engagement_id);
+        if !Self::is_authorized_company(&env, &caller, &engagement.company) {
+            panic!("{}", ERR_UNAUTHORIZED);
+        }
+
+        let key = DataKey::EngagementTag(tag.clone());
+        let ids: Vec<String> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut new_ids = Vec::new(&env);
+        let mut found = false;
+        for i in 0..ids.len() {
+            let id = ids.get(i).unwrap();
+            if id == engagement_id {
+                found = true;
+            } else {
+                new_ids.push_back(id);
+            }
+        }
+        if found {
+            env.storage().persistent().set(&key, &new_ids);
+            env.events().publish(
+                (Symbol::new(&env, "engagement_tag_removed"), tag),
+                engagement_id,
+            );
+        }
+    }
+
+    /// Return a paginated slice of engagement IDs for a given tag.
+    /// `page` is 0-indexed; out-of-range pages return an empty vec.
+    pub fn get_engagements_by_tag(
+        env: Env,
+        tag: String,
+        page: u32,
+        page_size: u32,
+    ) -> Vec<String> {
+        let ids: Vec<String> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EngagementTag(tag))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let total = ids.len();
+        if page_size == 0 {
+            return Vec::new(&env);
+        }
+        let start = page.saturating_mul(page_size);
+        if start >= total {
+            return Vec::new(&env);
+        }
+        let end = start.saturating_add(page_size).min(total);
+        let mut result = Vec::new(&env);
+        for i in start..end {
+            result.push_back(ids.get(i).unwrap());
+        }
+        result
+    }
+
+    /// Return the total number of engagements tagged with a given tag.
+    pub fn get_engagement_tag_count(env: Env, tag: String) -> u32 {
+        let ids: Vec<String> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EngagementTag(tag))
             .unwrap_or_else(|| Vec::new(&env));
         ids.len()
     }
@@ -3494,7 +3693,7 @@ impl HireSettleContract {
             panic!("{}", ERR_ENGAGEMENT_NOT_ACTIVE);
         }
 
-        if company != engagement.company {
+        if !Self::is_authorized_company(&env, &company, &engagement.company) {
             panic!("{}", ERR_UNAUTHORIZED);
         }
 
@@ -4029,11 +4228,11 @@ impl HireSettleContract {
     /// the engagement must be `ExitRequested` and `company` must match the
     /// engagement's company. Used by both `accept_early_exit` and
     /// `reject_early_exit` (issue #173).
-    fn assert_exit_request_pending(engagement: &Engagement, company: &Address) {
+    fn assert_exit_request_pending(env: &Env, company: &Address, engagement: &Engagement) {
         if engagement.status != EngagementStatus::ExitRequested {
             panic!("no exit request pending");
         }
-        if company != &engagement.company {
+        if !Self::is_authorized_company(env, company, &engagement.company) {
             panic!("{}", ERR_UNAUTHORIZED);
         }
     }
