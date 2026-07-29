@@ -161,25 +161,42 @@ pub struct EngagementSummary {
 
 Lightweight read-only view returned by `get_engagement_summary`, omitting the milestone vector for efficient dashboard listing.
 
-### `RatingRecord` / `RatingSummary`
+### `ConfigSnapshot`
 
 ```rust
-pub struct RatingRecord {     // stored tally
-    pub total_score: u32,     // sum of every rating received
-    pub count: u32,           // number of ratings received
-}
-
-pub struct RatingSummary {    // returned by the rating queries
-    pub average_x100: u32,    // average * 100, e.g. 425 = 4.25 stars
-    pub count: u32,
-    pub total_score: u32,
+pub struct ConfigSnapshot {
+    pub version: String,
+    pub admin: Address,
+    pub admin_renounced: bool,
+    pub paused: bool,
+    pub platform_fee_bps: u32,
+    pub platform_fee_treasury: Address,
+    pub arbiter_fee_bps: u32,
+    pub super_arbiter: Option<Address>,
+    pub confirm_window_ledgers: u32,
+    pub dispute_window_ledgers: u32,
+    pub proof_cooldown_ledgers: u32,
+    pub due_soon_window_ledgers: u32,
+    pub amendment_ttl_ledgers: u32,
+    pub extension_ttl_ledgers: u32,
+    pub inactivity_timeout_ledgers: u32,
+    pub storage_ttl_extend_to: u32,
+    pub upgrade_lock_duration_ledgers: u32,
+    pub ledgers_per_day: u32,
+    pub max_milestones: u32,
+    pub max_retention_days: u32,
+    pub max_replacements: u32,
+    pub max_active_per_company: u32,
+    pub max_proof_hash_length: u32,
+    pub min_engagement_amount: i128,
+    pub token_allowlist_enabled: bool,
 }
 ```
 
-Feedback ratings are stored as a running sum plus a count rather than a stored
-average, so each new rating is an O(1) update with no precision drift from
-repeatedly re-averaging. The average is scaled by 100 to keep two decimal places
-without floating point.
+Every admin-configurable contract parameter in one read-only struct, returned by
+`get_config_snapshot`. Each field mirrors the value its dedicated getter would
+return at the same ledger, including the defaults applied to parameters that were
+never explicitly set.
 
 ### `AmendmentEntry`
 
@@ -441,6 +458,10 @@ Functions that manage contract-wide settings, admin succession, and operational 
 | `pause(admin)` | Admin | Pause all state-changing operations. | `NoAdmin`, `unauthorized` |
 | `unpause(admin)` | Admin | Resume state-changing operations. | `NoAdmin`, `unauthorized` |
 | `is_paused()` → `bool` | Anyone | Return `true` if contract is currently paused. | — |
+| `pause_engagement(admin, engagement_id)` | Admin | Quarantine a single engagement, blocking its state-changing operations without halting the contract. Works even when globally paused. | `NoAdmin`, `unauthorized`, `engagement not found` |
+| `unpause_engagement(admin, engagement_id)` | Admin | Lift the quarantine on a single engagement. | `NoAdmin`, `unauthorized`, `engagement not found` |
+| `is_engagement_paused(engagement_id)` → `bool` | Anyone | Return `true` if this specific engagement is quarantined. Unknown IDs return `false`. | — |
+| `set_due_soon_window(admin, ledgers)` | Admin | Set how many ledgers before a retention deadline a milestone counts as "due soon" (default 17 280 ≈ 1 day). | `NoAdmin`, `unauthorized`, `InvalidDueSoonWindow` |
 | `nominate_admin(current_admin, new_admin)` | Admin | Nominate an admin successor. The nominee must call `claim_admin` to finalize. | `ContractPaused`, `NoAdmin`, `unauthorized` |
 | `claim_admin(nominee)` | Nominee | Claim admin rights after nomination. | `ContractPaused`, `no pending admin nomination`, `unauthorized` |
 | `get_pending_admin()` → `Option<Address>` | Anyone | Return the pending admin nominee, if any. | — |
@@ -449,7 +470,57 @@ Functions that manage contract-wide settings, admin succession, and operational 
 Additional admin functions (documented elsewhere): `init`, `renounce_admin`, `set_ledgers_per_day`, `set_max_retention_days`, `set_max_milestones`, `set_inactivity_timeout_ledgers`, `set_storage_ttl_extend_to`, `set_confirm_window`, `set_dispute_window`, `set_max_proof_hash_length`, `set_arbiter_fee`, `set_amendment_ttl`, `set_upgrade_lock_duration`, `propose_upgrade`, `add_allowed_token`, `remove_allowed_token`, `set_token_allowlist_enabled`.
 
 ### Engagement Lifecycle
-`create_engagement`, `unlock_milestone`, `submit_proof`, `confirm_milestone`, `batch_confirm_milestones`, `force_confirm_milestone`, `raise_dispute`, `cast_arbiter_vote`, `request_replacement`, `cancel_engagement`, `top_up_escrow`, `request_early_exit`, `accept_early_exit`, `reject_early_exit`, `expire_engagement`
+`create_engagement`, `unlock_milestone`, `notify_milestone_due_soon`, `submit_proof`, `confirm_milestone`, `batch_confirm_milestones`, `force_confirm_milestone`, `raise_dispute`, `cast_arbiter_vote`, `request_replacement`, `cancel_engagement`, `top_up_escrow`, `request_early_exit`, `accept_early_exit`, `reject_early_exit`, `expire_engagement`
+
+### Per-Engagement Pause (Quarantine)
+
+Beyond the contract-wide `pause` / `unpause`, an admin can freeze a **single**
+engagement with `pause_engagement(admin, engagement_id)`. This lets an admin
+quarantine one problematic engagement without halting every other engagement in
+the contract.
+
+While an engagement is quarantined, every lifecycle call for that ID is rejected
+with `EngagementPaused`: milestone unlock, proof submission, confirmation
+(including `batch_confirm_milestones` and `force_confirm_milestone`), disputes
+and arbiter voting, escalation, replacements, amendments, milestone extensions,
+role transfers, escrow top-ups, early exit, cancellation, and expiry.
+
+Deliberately still permitted:
+
+- **Read-only queries** — quarantine must not blind indexers or the parties to
+  the engagement's own state.
+- **`admin_replace_arbiter`** — an engagement is frequently quarantined *because*
+  its arbiter panel is the problem, so the admin keeps the tool to fix it.
+- **`pause_engagement` / `unpause_engagement`** themselves, so the admin can
+  always lift the freeze — including while the contract is globally paused,
+  which is exactly when triage is needed.
+
+The two pause mechanisms are orthogonal and both must pass for a call to
+proceed: an engagement can be quarantined while the contract runs normally, and
+calling `unpause` on the contract does **not** lift a per-engagement quarantine.
+
+### Milestone Due-Soon Notifications
+
+Soroban contracts cannot schedule their own work, so the due-soon signal follows
+the same permissionless-keeper shape as `unlock_milestone` and
+`escalate_dispute`. Once a `Locked` retention milestone is within
+`get_due_soon_window()` ledgers of its `valid_after_ledger`, anyone may call
+`notify_milestone_due_soon(engagement_id, milestone_index)` to emit a
+`milestone_due_soon` event. Off-chain notification services subscribe to that
+single event stream instead of polling `ledgers_until_unlock` for every locked
+milestone.
+
+The event fires **at most once per deadline** — a second call panics with
+`DueSoonAlreadyNotified`. The record is cleared whenever the deadline itself
+moves (an accepted milestone extension, or a replacement restarting the
+retention timer) or the milestone unlocks, so a rescheduled milestone is
+announced again for its new deadline. Use `is_milestone_due_soon` to test the
+window condition and `is_milestone_due_soon_notified` to skip milestones that
+have already been announced.
+
+The call deliberately does **not** touch `last_activity_ledger`: a notification
+is not engagement activity, and bumping it would let a keeper postpone
+`expire_engagement` indefinitely.
 
 ### Amendments
 `propose_amendment`, `accept_amendment`, `reject_amendment`, `withdraw_amendment_proposal`
@@ -503,6 +574,52 @@ claim_arbiter()
 
 Only the nominated address can complete the claim. Once claimed, the successor assumes the arbiter's position for future dispute voting while preserving the integrity of the arbitration panel.
 
+### Early Exit
+
+The early-exit protocol allows a **recruiter** to request a graceful exit from an engagement before all milestones are completed. It is a three-step flow involving both the recruiter and the company.
+
+#### Step 1 -- Recruiter requests early exit
+
+```text
+request_early_exit(recruiter, engagement_id)
+```
+
+**Caller:** Recruiter (must match the engagement's recruiter and sign the transaction).
+
+The engagement must be in `Active` status. On success, the engagement transitions to `ExitRequested`. No funds are moved at this stage.
+
+#### Step 2a -- Company accepts
+
+```text
+accept_early_exit(company, engagement_id)
+```
+
+**Caller:** Company (must match the engagement's company and sign the transaction).
+
+On acceptance:
+
+- The recruiter **keeps** all payments already released for confirmed or resolved milestones (`released_amount`).
+- The remaining escrow balance (`total_amount - released_amount`) is **refunded** to the company.
+- The engagement status moves to `Cancelled` (terminal).
+
+#### Step 2b -- Company rejects
+
+```text
+reject_early_exit(company, engagement_id)
+```
+
+**Caller:** Company.
+
+On rejection, the engagement returns to `Active` and the recruiter must continue working through the remaining milestones. No funds are moved.
+
+#### Payment split summary
+
+| Scenario | Recruiter receives | Company receives |
+|---|---|---|
+| Accepted (partial progress) | `released_amount` (already paid) | `total_amount - released_amount` (refund) |
+| Accepted (no milestones done) | Nothing | Full `total_amount` refund |
+| Rejected | N/A -- engagement continues | N/A -- engagement continues |
+
 ### Read-Only Queries
 
 All read-only functions are permissionless and require no authentication.
@@ -530,6 +647,8 @@ All read-only functions are permissionless and require no authentication.
 | `is_milestone_unlockable` | `engagement_id: String`, `milestone_index: u32` | `bool` |
 | `ledgers_until_unlock` | `engagement_id: String`, `milestone_index: u32` | `u32` |
 | `get_estimated_unlock_seconds` | `engagement_id: String`, `milestone_index: u32` | `u64` |
+| `is_milestone_due_soon` | `engagement_id: String`, `milestone_index: u32` | `bool` |
+| `is_milestone_due_soon_notified` | `engagement_id: String`, `milestone_index: u32` | `bool` |
 | `get_arbiter_votes` | `engagement_id: String`, `milestone_index: u32` | `ArbiterVoteCounts` |
 | `get_dispute_reason` | `engagement_id: String`, `milestone_index: u32` | `Option<String>` |
 
@@ -541,6 +660,17 @@ All read-only functions are permissionless and require no authentication.
 | `get_company_engagement_count` | `company: Address` | `u32` |
 | `get_engagements_by_company` | `company: Address`, `page: u32`, `page_size: u32` | `Vec<String>` |
 | `get_company_active_count` | `company: Address` | `u32` |
+| `get_engagement_ids_by_status` | `status: EngagementStatus`, `page: u32`, `page_size: u32` | `Vec<String>` |
+| `get_engagement_count_by_status` | `status: EngagementStatus` | `u32` |
+
+`get_engagement_ids_by_status` paginates the **filtered** result, so page 0 always
+holds the first `page_size` matches regardless of how many non-matching
+engagements they are interleaved with. It scans every engagement record, since
+status lives on the engagement rather than in a per-status index — prefer the
+per-company / per-recruiter queries when the party is already known. Its backing
+index is populated at `create_engagement`, so engagements created before this
+function was deployed are not enumerated (their records stay readable via
+`get_engagement`).
 
 #### Amendment Queries
 
@@ -590,13 +720,24 @@ means "no ratings yet", not "rated zero".
 | `get_max_proof_hash_length` | — | `u32` |
 | `get_arbiter_fee` | — | `u32` |
 | `get_upgrade_lock_duration` | — | `u32` |
+| `get_due_soon_window` | — | `u32` |
 | `get_allowed_tokens` | — | `Vec<Address>` |
+| `get_config_snapshot` | — | `ConfigSnapshot` |
+
+`get_config_snapshot` returns every admin-configurable parameter above in a
+single read-only call, so off-chain indexers do not need ~20 separate
+round-trips to reconstruct the current configuration. Each field is sourced from
+the same accessor its dedicated getter uses — including the defaults applied to
+parameters that were never explicitly set — and because the whole struct is read
+within one invocation the values are mutually consistent, with no window for an
+admin transaction to land between two reads and yield a torn view.
 
 #### Admin & Contract State
 
 | Function | Arguments | Return Type |
 |---|---|---|
 | `is_paused` | — | `bool` |
+| `is_engagement_paused` | `engagement_id: String` | `bool` |
 | `get_admin` | — | `Address` |
 | `get_pending_admin` | — | `Option<Address>` |
 
@@ -745,6 +886,9 @@ The contract emits Soroban events for all state transitions. Events are grouped 
 | `upgrade_lock_duration_set` | — | `ledgers` | `set_upgrade_lock_duration` |
 | `max_proof_hash_length_set` | — | `len` | `set_max_proof_hash_length` |
 | `arbiter_fee_set` | — | `bps` | `set_arbiter_fee` |
+| `due_soon_window_set` | — | `ledgers` | `set_due_soon_window` |
+| `engagement_paused` | `engagement_id` | `admin` | `pause_engagement` |
+| `engagement_unpaused` | `engagement_id` | `admin` | `unpause_engagement` |
 | `token_allowlisted` | — | `token` | `add_allowed_token` |
 | `token_removed` | — | `token` | `remove_allowed_token` |
 | `allowlist_enabled_set` | — | `enabled` | `set_token_allowlist_enabled` |
@@ -774,6 +918,7 @@ The contract emits Soroban events for all state transitions. Events are grouped 
 | Event | Topics | Payload | Trigger |
 |---|---|---|---|
 | `milestone_unlocked` | `engagement_id` | `(milestone_index, valid_after_ledger, unlocked_at_ledger)` | `unlock_milestone` |
+| `milestone_due_soon` | `engagement_id` | `(milestone_index, valid_after_ledger, ledgers_remaining, window)` | `notify_milestone_due_soon` (permissionless keeper) |
 | `proof_submitted` | `engagement_id` | `milestone_index` | `submit_proof` (first submission) |
 | `proof_resubmitted` | `engagement_id` | `(milestone_index, old_hash, proof_hash)` | `submit_proof` (resubmission) |
 | `milestone_confirmed` | `engagement_id` | `(milestone_index, payment)` | `confirm_milestone` / `batch_confirm_milestones` |

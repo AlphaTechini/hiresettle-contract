@@ -212,6 +212,10 @@ pub struct Engagement {
     /// Optional off-chain attestation hash (e.g. SHA-256 of the contract PDF).
     /// Stored at engagement creation for audit and verification purposes.
     pub contract_pdf_hash: Option<String>,
+    /// Optional referrer address set at creation time (issue #251).
+    /// If present and recognised by the admin-configured referral list,
+    /// a configurable fee discount is applied to every milestone payout.
+    pub referrer: Option<Address>,
     /// Optional list of short string tags for categorization (issue #248, #249).
     pub tags: Option<Vec<String>>,
 }
@@ -248,6 +252,8 @@ pub struct EngagementSummary {
     pub recruiter_split_bps: u32,
     /// Optional off-chain attestation hash (e.g. SHA-256 of the contract PDF).
     pub contract_pdf_hash: Option<String>,
+    /// Optional referrer address (issue #251).
+    pub referrer: Option<Address>,
     /// Optional list of short string tags for categorization (issue #248, #249).
     pub tags: Option<Vec<String>>,
 }
@@ -326,34 +332,16 @@ pub struct PlatformFee {
     pub treasury: Address,
 }
 
-/// Running feedback-rating tally for a single address (issues #242, #243).
-///
-/// Stored per recruiter and per company. Kept as a running sum plus a count
-/// rather than a stored average so each new rating is an O(1) update with no
-/// precision drift from repeatedly re-averaging.
+/// A single fee-tier bracket: engagements whose `total_amount` is at or above
+/// `threshold` pay `bps` instead of the default platform-fee rate.
+/// Configured via `set_fee_tiers` (issue #250).
 #[contracttype]
 #[derive(Clone)]
-pub struct RatingRecord {
-    /// Sum of every rating received. Each rating is 1–5, so this cannot
-    /// realistically overflow `u32`.
-    pub total_score: u32,
-    /// Number of ratings received.
-    pub count: u32,
-}
-
-/// Read-only reputation summary returned by `get_recruiter_rating` and
-/// `get_company_rating` (issue #244).
-#[contracttype]
-#[derive(Clone)]
-pub struct RatingSummary {
-    /// Average rating scaled by 100 to keep two decimal places without
-    /// floating point — e.g. `425` means 4.25 stars. `0` when `count` is 0.
-    pub average_x100: u32,
-    /// Number of ratings received. `0` for an address that has never been rated.
-    pub count: u32,
-    /// Sum of every rating received, so callers can re-derive the average at a
-    /// different precision or merge tallies off-chain.
-    pub total_score: u32,
+pub struct FeeTier {
+    /// Minimum `total_amount` (inclusive) to qualify for this tier.
+    pub threshold: i128,
+    /// Platform fee in basis points applied to engagements in this tier.
+    pub bps: u32,
 }
 
 /// Bundled optional configuration passed as the last argument of `create_engagement`.
@@ -373,8 +361,21 @@ pub struct EngagementConfig {
     /// Optional off-chain attestation hash (e.g. SHA-256 of the contract PDF).
     /// Must be non-empty if provided.
     pub contract_pdf_hash: Option<String>,
+    /// Optional referrer address (issue #251). If present and in the
+    /// admin-configured referral list, the engagement receives a fee discount.
+    pub referrer: Option<Address>,
     /// Optional list of short string tags for off-chain categorization (issue #248, #249).
     pub tags: Option<Vec<String>>,
+}
+
+/// Returned by `get_contract_health` for quick off-chain diagnostics (issue #256).
+#[contracttype]
+#[derive(Clone)]
+pub struct ContractHealth {
+    pub paused: bool,
+    pub admin: Address,
+    pub version: String,
+    pub total_engagement_count: u64,
 }
 
 // ============================================================
@@ -463,6 +464,10 @@ pub enum DataKey {
     CompanyActiveCount(Address),
     /// Admin-configurable maximum number of replacements allowed per engagement (issue #31, default 3).
     MaxReplacements,
+    /// Per-tag list of engagement IDs (issue #249).
+    EngagementTag(String),
+    /// Optional co-signer address authorized to perform company-gated actions (issue #254).
+    CompanyCosigner(Address),
     /// Active milestone extension proposal for a Locked retention milestone,
     /// awaiting company approval (issue #247).
     MilestoneExtensionProposal(String, u32),
@@ -479,16 +484,19 @@ pub enum DataKey {
     EscalatedDispute(String, u32),
     /// Per-tag index mapping tag string to list of engagement IDs (issue #248, #249).
     TagEngagements(String),
-    /// Running feedback-rating tally for a recruiter address (issue #242).
-    RecruiterRating(Address),
-    /// Running feedback-rating tally for a company address (issue #243).
-    CompanyRating(Address),
-    /// Set once the company has rated the recruiter for an engagement (issue
-    /// #242), so each completed engagement contributes at most one rating.
-    RecruiterRated(String),
-    /// Set once the recruiter has rated the company for an engagement (issue
-    /// #243), so each completed engagement contributes at most one rating.
-    CompanyRated(String),
+    /// Admin-configurable due-soon notification window in ledgers (issue #241,
+    /// default 17_280 — ~1 day).
+    DueSoonWindow,
+    /// Set once a `milestone_due_soon` event has been emitted for
+    /// (engagement_id, milestone_index), so the notification fires at most once
+    /// per unlock deadline (issue #241).
+    DueSoonNotified(String, u32),
+    /// Whether a single engagement is quarantined by the admin (issue #239).
+    /// Independent of the global `Paused` flag.
+    EngagementPaused(String),
+    /// Global ordered list of every engagement ID ever created (issue #237).
+    /// Backs `get_engagement_ids_by_status`.
+    AllEngagements,
 }
 
 // ============================================================
@@ -521,6 +529,10 @@ const DEFAULT_MAX_REPLACEMENTS: u32 = 3;
 /// Default TTL, in ledgers, for a pending milestone extension proposal (issue #247).
 /// Mirrors `AmendmentTTL`'s default.
 const DEFAULT_EXTENSION_TTL: u32 = 17_280;
+/// Default due-soon notification window in ledgers (issue #241): a Retention
+/// milestone becomes "due soon" once it is within this many ledgers of its
+/// `valid_after_ledger`. ~1 day at 5 s/ledger.
+const DEFAULT_DUE_SOON_WINDOW_LEDGERS: u32 = 17_280;
 /// Maximum number of tags stored on an engagement (issue #248).
 const MAX_TAGS: u32 = 10;
 /// Maximum length, in characters, of a single engagement tag (issue #248).
@@ -533,6 +545,10 @@ const MAX_TAG_LENGTH: u32 = 32;
 const ERR_UNAUTHORIZED: &str = "unauthorized";
 const ERR_ENGAGEMENT_NOT_ACTIVE: &str = "engagement is not active";
 const ERR_INVALID_MILESTONE_INDEX: &str = "invalid milestone index";
+/// Raised when an operation targets an engagement the admin has quarantined
+/// via `pause_engagement` (issue #239). Distinct from `"ContractPaused"` so
+/// off-chain callers can tell a single-engagement freeze from a global halt.
+const ERR_ENGAGEMENT_PAUSED: &str = "EngagementPaused";
 
 #[contractimpl]
 impl HireSettleContract {
@@ -615,6 +631,55 @@ impl HireSettleContract {
         (fee.bps, fee.treasury)
     }
 
+    /// Admin sets fee tiers that scale the platform fee down for larger
+    /// engagements (issue #250). Each tier specifies a `threshold`
+    /// (minimum `total_amount`) and the `bps` rate that applies. Tiers
+    /// must be sorted by ascending threshold, each `bps` must be ≤ the
+    /// base platform fee, and at most 10 tiers are allowed.
+    ///
+    /// At fee-calculation time the contract walks the tiers from highest
+    /// threshold to lowest and uses the first matching tier's `bps`.
+    /// If no tier matches, the base `platform_fee.bps` applies.
+    ///
+    /// Pass an empty vector to clear all tiers (flat fee for every size).
+    pub fn set_fee_tiers(env: Env, admin: Address, tiers: Vec<FeeTier>) {
+        Self::assert_not_paused(&env);
+        Self::assert_admin(&env, &admin);
+
+        if tiers.len() > 10 {
+            panic!("too many fee tiers");
+        }
+
+        let base_bps = Self::get_platform_fee_internal(&env).bps;
+        for i in 0..tiers.len() {
+            let t = tiers.get(i).unwrap();
+            if t.bps > base_bps {
+                panic!("tier bps exceeds base platform fee");
+            }
+            if t.threshold <= 0 {
+                panic!("tier threshold must be positive");
+            }
+            if i > 0 {
+                let prev = tiers.get(i - 1).unwrap();
+                if t.threshold <= prev.threshold {
+                    panic!("tiers must be sorted by ascending threshold");
+                }
+            }
+        }
+
+        env.storage().persistent().set(&DataKey::FeeTiers, &tiers);
+        env.events()
+            .publish((Symbol::new(&env, "fee_tiers_set"),), tiers.len());
+    }
+
+    /// Return the current fee tiers. Empty vector means no tiering (flat fee).
+    pub fn get_fee_tiers(env: Env) -> Vec<FeeTier> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::FeeTiers)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
     /// Admin sets the contract version string (issue #16).
     /// `version` must be ≤ 32 characters.
     /// Panics with "VersionTooLong" if version exceeds 32 chars.
@@ -670,6 +735,111 @@ impl HireSettleContract {
         Self::is_paused_internal(&env)
     }
 
+    // ----------------------------------------------------------
+    // ISSUE #239 — PER-ENGAGEMENT PAUSE (QUARANTINE)
+    // ----------------------------------------------------------
+
+    /// Quarantine a single engagement, blocking its state-changing operations
+    /// without halting the rest of the contract (issue #239).
+    ///
+    /// # Caller
+    /// `admin` — must be the current contract admin.
+    ///
+    /// # Scope
+    /// While quarantined, every engagement-lifecycle call for this ID is
+    /// rejected with `"EngagementPaused"`: milestone unlock / proof submission /
+    /// confirmation (including batch and force-confirm), disputes and arbiter
+    /// voting, escalation, replacements, amendments, milestone extensions,
+    /// role transfers, escrow top-ups, early exit, cancellation, and expiry.
+    ///
+    /// Deliberately still permitted:
+    /// - **Read-only queries** — quarantine must not blind indexers or the
+    ///   parties to the engagement's state.
+    /// - **`admin_replace_arbiter`** — quarantine is frequently *because* the
+    ///   arbiter panel is the problem; the admin keeps the tool to fix it.
+    /// - **`pause_engagement` / `unpause_engagement`** themselves, so the admin
+    ///   can always lift the freeze.
+    ///
+    /// This is orthogonal to the global [`Self::pause`]: an engagement can be
+    /// quarantined while the contract runs normally, and unpausing the contract
+    /// does not lift a per-engagement quarantine. Both guards must pass for a
+    /// call to proceed.
+    ///
+    /// Pausing an already-paused engagement is a no-op that still emits the
+    /// event, so the admin can re-assert quarantine idempotently.
+    ///
+    /// # Panics
+    /// - `"unauthorized"` — caller is not the contract admin.
+    /// - `"engagement not found"` — no engagement exists with this ID.
+    ///
+    /// # Events
+    /// Emits `("engagement_paused", engagement_id)` with the acting admin.
+    pub fn pause_engagement(env: Env, admin: Address, engagement_id: String) {
+        Self::assert_admin(&env, &admin);
+
+        // Reject unknown IDs so a typo cannot silently create a quarantine
+        // record that later blocks a legitimately created engagement.
+        let _ = Self::get_engagement_internal(&env, &engagement_id);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::EngagementPaused(engagement_id.clone()), &true);
+        env.storage().persistent().extend_ttl(
+            &DataKey::EngagementPaused(engagement_id.clone()),
+            100_000,
+            6_300_000,
+        );
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "engagement_paused"),
+                engagement_id.clone(),
+            ),
+            admin,
+        );
+    }
+
+    /// Lift the quarantine on a single engagement (issue #239), returning it to
+    /// normal operation. Unpausing an engagement that is not paused is a no-op
+    /// that still emits the event.
+    ///
+    /// Note this has no bearing on the global pause — if the contract itself is
+    /// paused, the engagement stays blocked by `"ContractPaused"`.
+    ///
+    /// # Panics
+    /// - `"unauthorized"` — caller is not the contract admin.
+    /// - `"engagement not found"` — no engagement exists with this ID.
+    ///
+    /// # Events
+    /// Emits `("engagement_unpaused", engagement_id)` with the acting admin.
+    pub fn unpause_engagement(env: Env, admin: Address, engagement_id: String) {
+        Self::assert_admin(&env, &admin);
+
+        let _ = Self::get_engagement_internal(&env, &engagement_id);
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::EngagementPaused(engagement_id.clone()));
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "engagement_unpaused"),
+                engagement_id.clone(),
+            ),
+            admin,
+        );
+    }
+
+    /// Return `true` if this specific engagement is quarantined (issue #239).
+    ///
+    /// Independent of [`Self::is_paused`] — check both to know whether a
+    /// state-changing call will be accepted. Read-only and permissionless;
+    /// unknown engagement IDs return `false` rather than panicking, so callers
+    /// can probe without a prior existence check.
+    pub fn is_engagement_paused(env: Env, engagement_id: String) -> bool {
+        Self::is_engagement_paused_internal(&env, &engagement_id)
+    }
+
     /// Nominate a new admin. The nominee must call `claim_admin` to complete rotation.
     pub fn nominate_admin(env: Env, current_admin: Address, new_admin: Address) {
         Self::assert_not_paused(&env);
@@ -711,6 +881,25 @@ impl HireSettleContract {
     /// Return the current contract admin.
     pub fn get_admin(env: Env) -> Address {
         Self::get_admin_internal(&env)
+    }
+
+    /// Return a single diagnostic snapshot of the contract's health (issue #256).
+    /// Returns paused state, admin, version, and total engagement count in one call.
+    pub fn get_contract_health(env: Env) -> ContractHealth {
+        ContractHealth {
+            paused: Self::is_paused_internal(&env),
+            admin: Self::get_admin_internal(&env),
+            version: env
+                .storage()
+                .persistent()
+                .get(&DataKey::Version)
+                .unwrap_or_else(|| String::from_str(&env, DEFAULT_VERSION)),
+            total_engagement_count: env
+                .storage()
+                .instance()
+                .get(&DataKey::EngagementCount)
+                .unwrap_or(0u64),
+        }
     }
 
     // ----------------------------------------------------------
@@ -1025,6 +1214,7 @@ impl HireSettleContract {
             co_recruiter: config.co_recruiter,
             recruiter_split_bps: config.recruiter_split_bps,
             contract_pdf_hash: config.contract_pdf_hash,
+            referrer: config.referrer,
             tags: config.tags.clone(),
         };
 
@@ -1054,6 +1244,22 @@ impl HireSettleContract {
         env.storage()
             .instance()
             .set(&DataKey::EngagementCount, &(count + 1));
+
+        // Issue #237: append engagement_id to the global index that backs
+        // `get_engagement_ids_by_status`. Kept separate from `EngagementCount`
+        // because that counter is a scalar and cannot be enumerated.
+        let mut all_ids: Vec<String> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AllEngagements)
+            .unwrap_or_else(|| Vec::new(&env));
+        all_ids.push_back(engagement_id.clone());
+        env.storage()
+            .persistent()
+            .set(&DataKey::AllEngagements, &all_ids);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::AllEngagements, 100_000, 6_300_000);
 
         // Issue #35: append engagement_id to the per-company index.
         let mut company_ids: Vec<String> = env
@@ -1155,6 +1361,7 @@ impl HireSettleContract {
     ///   before `valid_after_ledger`.
     pub fn unlock_milestone(env: Env, engagement_id: String, milestone_index: u32) {
         Self::assert_not_paused(&env);
+        Self::assert_engagement_not_paused(&env, &engagement_id);
         let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
 
         if engagement.status != EngagementStatus::Active {
@@ -1189,6 +1396,12 @@ impl HireSettleContract {
             .persistent()
             .set(&DataKey::Engagement(engagement_id.clone()), &engagement);
         Self::extend_engagement_ttl(&env, &engagement_id);
+
+        // The due-soon flag only guards against duplicate notifications for a
+        // pending deadline; once unlocked that deadline is spent, so drop the
+        // entry rather than leave it occupying storage. See issue #241.
+        Self::clear_due_soon_flag(&env, &engagement_id, milestone_index);
+
         Self::emit_milestone_status_changed(
             &env,
             &engagement_id,
@@ -1206,6 +1419,185 @@ impl HireSettleContract {
                 engagement_id.clone(),
             ),
             (milestone_index, valid_after_ledger, unlocked_at_ledger),
+        );
+    }
+
+    // ----------------------------------------------------------
+    // ISSUE #241 — MILESTONE DUE-SOON NOTIFICATION
+    // ----------------------------------------------------------
+
+    /// Admin sets the due-soon notification window in ledgers (issue #241).
+    ///
+    /// A `Locked` retention milestone becomes "due soon" once it is within this
+    /// many ledgers of its `valid_after_ledger`. Defaults to 17 280 (~1 day).
+    ///
+    /// Changing the window takes effect immediately for every engagement, but
+    /// does **not** retract notifications already emitted — a milestone that was
+    /// notified under a wider window stays flagged until its deadline moves or
+    /// it unlocks.
+    ///
+    /// # Panics
+    /// - `"unauthorized"` — caller is not the contract admin.
+    /// - `"InvalidDueSoonWindow"` — `ledgers` is 0, which would leave no lead
+    ///   time and make the notification useless.
+    pub fn set_due_soon_window(env: Env, admin: Address, ledgers: u32) {
+        Self::assert_admin(&env, &admin);
+        if ledgers == 0 {
+            panic!("InvalidDueSoonWindow");
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::DueSoonWindow, &ledgers);
+        env.events()
+            .publish((Symbol::new(&env, "due_soon_window_set"),), ledgers);
+    }
+
+    /// Return the current due-soon notification window in ledgers (issue #241).
+    /// Defaults to 17 280 (~1 day) when not configured.
+    pub fn get_due_soon_window(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::DueSoonWindow)
+            .unwrap_or(DEFAULT_DUE_SOON_WINDOW_LEDGERS)
+    }
+
+    /// Returns `true` when a milestone is inside its due-soon window: it is a
+    /// `Locked` `Retention` milestone whose `valid_after_ledger` is still in the
+    /// future but no more than `due_soon_window` ledgers away (issue #241).
+    ///
+    /// Returns `false` for `Placement` milestones, for milestones that already
+    /// progressed past `Locked`, and for milestones that are already unlockable
+    /// (use `is_milestone_unlockable` for that case).
+    ///
+    /// Read-only and permissionless.
+    pub fn is_milestone_due_soon(env: Env, engagement_id: String, milestone_index: u32) -> bool {
+        let engagement = Self::get_engagement_internal(&env, &engagement_id);
+        let milestone = Self::get_milestone_or_panic(&engagement, milestone_index);
+
+        if milestone.kind != MilestoneKind::Retention || milestone.status != MilestoneStatus::Locked
+        {
+            return false;
+        }
+
+        let current = env.ledger().sequence();
+        if current >= milestone.valid_after_ledger {
+            return false;
+        }
+
+        milestone.valid_after_ledger - current <= Self::get_due_soon_window(env.clone())
+    }
+
+    /// Returns `true` once `notify_milestone_due_soon` has fired for this
+    /// milestone's current deadline (issue #241). Keepers can poll this to skip
+    /// engagements that have already been announced.
+    ///
+    /// Resets to `false` whenever the deadline itself moves — an accepted
+    /// milestone extension, a replacement restarting the retention timer, or the
+    /// milestone unlocking.
+    pub fn is_milestone_due_soon_notified(
+        env: Env,
+        engagement_id: String,
+        milestone_index: u32,
+    ) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::DueSoonNotified(engagement_id, milestone_index))
+            .unwrap_or(false)
+    }
+
+    /// Emit a `milestone_due_soon` event for a retention milestone that is
+    /// approaching its unlock deadline (issue #241).
+    ///
+    /// # Caller
+    /// Anyone — this is a permissionless keeper function, mirroring
+    /// `unlock_milestone` and `escalate_dispute`. It exists so off-chain
+    /// notification services can subscribe to a single event stream instead of
+    /// polling `ledgers_until_unlock` for every locked milestone.
+    ///
+    /// # Behaviour
+    /// Fires at most **once per deadline**: the emission is recorded under
+    /// `DataKey::DueSoonNotified` and a second call panics. The record is
+    /// cleared whenever the deadline moves (extension accepted, replacement
+    /// requested) or the milestone unlocks, so a rescheduled milestone is
+    /// announced again for its new deadline.
+    ///
+    /// This call deliberately does **not** touch `last_activity_ledger`: it is a
+    /// notification, not engagement activity, and bumping it would let a keeper
+    /// postpone `expire_engagement` indefinitely.
+    ///
+    /// # Panics
+    /// - `"ContractPaused"` / `"EngagementPaused"` — contract or engagement is paused.
+    /// - `"engagement is not active"` — the engagement is not `Active`.
+    /// - `"only retention milestones can be due soon"` — milestone is a `Placement`.
+    /// - `"milestone is not locked"` — milestone already progressed past `Locked`.
+    /// - `"milestone is already unlockable"` — the deadline has passed; call
+    ///   `unlock_milestone` instead.
+    /// - `"DueSoonWindowNotReached"` — the milestone is further out than the
+    ///   configured window.
+    /// - `"DueSoonAlreadyNotified"` — this deadline was already announced.
+    ///
+    /// # Events
+    /// Emits `("milestone_due_soon", engagement_id)` with
+    /// `(milestone_index, valid_after_ledger, ledgers_remaining, window)`.
+    /// `ledgers_remaining` and `window` are included so a consumer can rank
+    /// urgency and reproduce the trigger condition without extra queries.
+    pub fn notify_milestone_due_soon(env: Env, engagement_id: String, milestone_index: u32) {
+        Self::assert_not_paused(&env);
+        Self::assert_engagement_not_paused(&env, &engagement_id);
+
+        let engagement = Self::get_engagement_internal(&env, &engagement_id);
+
+        if engagement.status != EngagementStatus::Active {
+            panic!("{}", ERR_ENGAGEMENT_NOT_ACTIVE);
+        }
+
+        let milestone = Self::get_milestone_or_panic(&engagement, milestone_index);
+
+        if milestone.kind != MilestoneKind::Retention {
+            panic!("only retention milestones can be due soon");
+        }
+
+        if milestone.status != MilestoneStatus::Locked {
+            panic!("milestone is not locked");
+        }
+
+        let current_ledger = env.ledger().sequence();
+        if current_ledger >= milestone.valid_after_ledger {
+            panic!("milestone is already unlockable");
+        }
+
+        let window = Self::get_due_soon_window(env.clone());
+        let ledgers_remaining = milestone.valid_after_ledger - current_ledger;
+        if ledgers_remaining > window {
+            panic!("DueSoonWindowNotReached");
+        }
+
+        let notified_key = DataKey::DueSoonNotified(engagement_id.clone(), milestone_index);
+        if env
+            .storage()
+            .persistent()
+            .get::<DataKey, bool>(&notified_key)
+            .unwrap_or(false)
+        {
+            panic!("DueSoonAlreadyNotified");
+        }
+
+        env.storage().persistent().set(&notified_key, &true);
+        env.storage()
+            .persistent()
+            .extend_ttl(&notified_key, 100_000, 6_300_000);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "milestone_due_soon"),
+                engagement_id.clone(),
+            ),
+            (
+                milestone_index,
+                milestone.valid_after_ledger,
+                ledgers_remaining,
+                window,
+            ),
         );
     }
 
@@ -1245,6 +1637,7 @@ impl HireSettleContract {
         proof_hash: String,
     ) {
         Self::assert_not_paused(&env);
+        Self::assert_engagement_not_paused(&env, &engagement_id);
 
         // Issue #20: Proof hash format validation (before require_auth for fail-fast)
         if proof_hash.len() == 0 {
@@ -1365,6 +1758,7 @@ impl HireSettleContract {
         milestone_index: u32,
     ) {
         Self::assert_not_paused(&env);
+        Self::assert_engagement_not_paused(&env, &engagement_id);
         company.require_auth();
 
         let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
@@ -1373,7 +1767,7 @@ impl HireSettleContract {
             panic!("{}", ERR_ENGAGEMENT_NOT_ACTIVE);
         }
 
-        if company != engagement.company {
+        if !Self::is_authorized_company(&env, &company, &engagement.company) {
             panic!("{}", ERR_UNAUTHORIZED);
         }
 
@@ -1408,7 +1802,10 @@ impl HireSettleContract {
         let payment = full_share - milestone.replacement_paid_out;
         if payment > 0 {
             let platform_fee = Self::get_platform_fee_internal(&env);
-            let fee_amount = (payment * platform_fee.bps as i128) / 10_000;
+            let effective_bps =
+                Self::apply_referral_discount(&env, platform_fee.bps, &engagement.referrer);
+                Self::resolve_platform_fee_bps(&env, platform_fee.bps, engagement.total_amount);
+            let fee_amount = (payment * effective_bps as i128) / 10_000;
             let net_payment = payment - fee_amount;
             engagement.released_amount += payment;
 
@@ -1531,6 +1928,7 @@ impl HireSettleContract {
         milestone_index: u32,
         reason: String,
     ) {
+        Self::assert_engagement_not_paused(&env, &engagement_id);
         company.require_auth();
 
         if reason.len() > 128 {
@@ -1543,7 +1941,7 @@ impl HireSettleContract {
             panic!("{}", ERR_ENGAGEMENT_NOT_ACTIVE);
         }
 
-        if company != engagement.company {
+        if !Self::is_authorized_company(&env, &company, &engagement.company) {
             panic!("{}", ERR_UNAUTHORIZED);
         }
 
@@ -1618,6 +2016,7 @@ impl HireSettleContract {
         approve: bool,
     ) {
         Self::assert_not_paused(&env);
+        Self::assert_engagement_not_paused(&env, &engagement_id);
         arbiter.require_auth();
 
         let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
@@ -1840,6 +2239,7 @@ impl HireSettleContract {
     /// - `"no super arbiter configured"` — the admin has not set a super arbiter.
     pub fn escalate_dispute(env: Env, engagement_id: String, milestone_index: u32) {
         Self::assert_not_paused(&env);
+        Self::assert_engagement_not_paused(&env, &engagement_id);
 
         let engagement = Self::get_engagement_internal(&env, &engagement_id);
 
@@ -1847,6 +2247,14 @@ impl HireSettleContract {
             panic!("{}", ERR_ENGAGEMENT_NOT_ACTIVE);
         }
 
+        if !Self::is_authorized_company(&env, &company, &engagement.company) {
+            panic!("{}", ERR_UNAUTHORIZED);
+        }
+
+        let placement_confirmed = {
+            let m0 = engagement.milestones.get(0).unwrap();
+            m0.status == MilestoneStatus::Confirmed || m0.status == MilestoneStatus::Resolved
+        };
         let milestone = Self::get_milestone_or_panic(&engagement, milestone_index);
 
         if milestone.status != MilestoneStatus::Disputed {
@@ -1934,6 +2342,7 @@ impl HireSettleContract {
         approve: bool,
     ) {
         Self::assert_not_paused(&env);
+        Self::assert_engagement_not_paused(&env, &engagement_id);
         super_arbiter.require_auth();
 
         let configured: Address = env
@@ -2104,6 +2513,7 @@ impl HireSettleContract {
     /// a clean vote count instead of inheriting stale votes. See issue #177.
     pub fn request_replacement(env: Env, company: Address, engagement_id: String, reason: String) {
         Self::assert_not_paused(&env);
+        Self::assert_engagement_not_paused(&env, &engagement_id);
         company.require_auth();
 
         // Bound reason length so a single engagement cannot accumulate
@@ -2198,6 +2608,11 @@ impl HireSettleContract {
                         env.storage()
                             .persistent()
                             .remove(&DataKey::LastProofAt(engagement_id.clone(), i));
+
+                        // The retention timer just restarted, so a due-soon
+                        // notification emitted against the old deadline must not
+                        // suppress one for the new deadline. See issue #241.
+                        Self::clear_due_soon_flag(&env, &engagement_id, i);
 
                         if was_disputed {
                             env.storage()
@@ -2302,6 +2717,50 @@ impl HireSettleContract {
     // ----------------------------------------------------------
     // ISSUE #43 — COMPANY TRANSFER
     // ----------------------------------------------------------
+    // ISSUE #254 — COMPANY MULTI-SIGNER SUPPORT
+    // ----------------------------------------------------------
+
+    /// Register a co-signer address that is also authorized to perform
+    /// company-gated actions (confirm, dispute, cancel, etc.) on behalf
+    /// of this company. Only the company address itself can set the cosigner.
+    pub fn set_company_cosigner(env: Env, company: Address, cosigner: Address) {
+        company.require_auth();
+        env.storage().persistent().set(
+            &DataKey::CompanyCosigner(company.clone()),
+            &cosigner,
+        );
+        env.events().publish(
+            (Symbol::new(&env, "company_cosigner_set"),),
+            (company, cosigner),
+        );
+    }
+
+    /// Return the registered co-signer for a company, or `None` if none set.
+    pub fn get_company_cosigner(env: Env, company: Address) -> Option<Address> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::CompanyCosigner(company))
+    }
+
+    /// Internal helper: check if `caller` is either the engagement's company
+    /// or the company's registered co-signer.
+    fn is_authorized_company(env: &Env, caller: &Address, engagement_company: &Address) -> bool {
+        if caller == engagement_company {
+            return true;
+        }
+        let cosigner: Option<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CompanyCosigner(engagement_company.clone()));
+        match cosigner {
+            Some(c) => caller == &c,
+            None => false,
+        }
+    }
+
+    // ----------------------------------------------------------
+    // ISSUE #43 — COMPANY TRANSFER
+    // ----------------------------------------------------------
 
     /// Transfer the company role on an engagement to a new address, effective
     /// immediately (e.g. the company was acquired or restructured).
@@ -2323,6 +2782,7 @@ impl HireSettleContract {
         new_company: Address,
     ) {
         Self::assert_not_paused(&env);
+        Self::assert_engagement_not_paused(&env, &engagement_id);
         current_company.require_auth();
 
         let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
@@ -2380,6 +2840,7 @@ impl HireSettleContract {
         new_recruiter: Address,
     ) {
         Self::assert_not_paused(&env);
+        Self::assert_engagement_not_paused(&env, &engagement_id);
         recruiter.require_auth();
 
         let engagement = Self::get_engagement_internal(&env, &engagement_id);
@@ -2425,11 +2886,12 @@ impl HireSettleContract {
     /// - `("recruiter_transferred", engagement_id)` with `(old_recruiter, new_recruiter)`.
     pub fn accept_recruiter_transfer(env: Env, company: Address, engagement_id: String) {
         Self::assert_not_paused(&env);
+        Self::assert_engagement_not_paused(&env, &engagement_id);
         company.require_auth();
 
         let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
 
-        if company != engagement.company {
+        if !Self::is_authorized_company(&env, &company, &engagement.company) {
             panic!("{}", ERR_UNAUTHORIZED);
         }
 
@@ -2526,6 +2988,7 @@ impl HireSettleContract {
         engagement_id: String,
     ) {
         Self::assert_not_paused(&env);
+        Self::assert_engagement_not_paused(&env, &engagement_id);
         company.require_auth();
         recruiter.require_auth();
 
@@ -2537,7 +3000,7 @@ impl HireSettleContract {
             panic!("{}", ERR_ENGAGEMENT_NOT_ACTIVE);
         }
 
-        if company != engagement.company {
+        if !Self::is_authorized_company(&env, &company, &engagement.company) {
             panic!("{}", ERR_UNAUTHORIZED);
         }
 
@@ -2600,6 +3063,7 @@ impl HireSettleContract {
     /// Company tops up the escrow balance for an active engagement.
     pub fn top_up_escrow(env: Env, company: Address, engagement_id: String, amount: i128) {
         Self::assert_not_paused(&env);
+        Self::assert_engagement_not_paused(&env, &engagement_id);
         company.require_auth();
 
         let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
@@ -2610,7 +3074,7 @@ impl HireSettleContract {
             panic!("{}", ERR_ENGAGEMENT_NOT_ACTIVE);
         }
 
-        if company != engagement.company {
+        if !Self::is_authorized_company(&env, &company, &engagement.company) {
             panic!("{}", ERR_UNAUTHORIZED);
         }
 
@@ -2824,6 +3288,50 @@ impl HireSettleContract {
         }
     }
 
+    /// Return lightweight summaries for multiple engagements in a single call,
+    /// reducing round-trips for dashboards that need to render many engagements
+    /// at once.
+    ///
+    /// Engagement IDs that do not exist are silently skipped — the returned
+    /// vector may be shorter than the input list when some IDs are invalid.
+    ///
+    /// # Panics
+    ///
+    /// - `"too many IDs"` — `engagement_ids` contains more than 20 entries.
+    pub fn batch_get_engagement_summary(
+        env: Env,
+        engagement_ids: Vec<String>,
+    ) -> Vec<EngagementSummary> {
+        if engagement_ids.len() > 20 {
+            panic!("too many IDs");
+        }
+        let mut results: Vec<EngagementSummary> = Vec::new(&env);
+        for i in 0..engagement_ids.len() {
+            let eid = engagement_ids.get(i).unwrap();
+            let maybe: Option<Engagement> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Engagement(eid.clone()));
+            if let Some(engagement) = maybe {
+                results.push_back(EngagementSummary {
+                    id: engagement.id,
+                    job_title: engagement.job_title,
+                    company: engagement.company,
+                    recruiter: engagement.recruiter,
+                    total_amount: engagement.total_amount,
+                    released_amount: engagement.released_amount,
+                    status: engagement.status,
+                    milestone_count: engagement.milestones.len(),
+                    created_at_ledger: engagement.created_at_ledger,
+                    co_recruiter: engagement.co_recruiter,
+                    recruiter_split_bps: engagement.recruiter_split_bps,
+                    contract_pdf_hash: engagement.contract_pdf_hash,
+                });
+            }
+        }
+        results
+    }
+
     /// Return the off-chain attestation hash (e.g. SHA-256 of the contract PDF)
     /// stored at engagement creation, or None if not provided.
     /// Read-only and permissionless.
@@ -2857,6 +3365,7 @@ impl HireSettleContract {
         successor: Address,
     ) {
         Self::assert_not_paused(&env);
+        Self::assert_engagement_not_paused(&env, &engagement_id);
         arbiter.require_auth();
 
         let engagement = Self::get_engagement_internal(&env, &engagement_id);
@@ -2903,6 +3412,7 @@ impl HireSettleContract {
     ///   longer be claimed.
     pub fn claim_arbiter(env: Env, nominee: Address, engagement_id: String) {
         Self::assert_not_paused(&env);
+        Self::assert_engagement_not_paused(&env, &engagement_id);
         nominee.require_auth();
 
         let nomination: ArbiterNomination = env
@@ -3126,11 +3636,14 @@ impl HireSettleContract {
         milestone_index: u32,
         new_payment_percent: u32,
     ) {
+        Self::assert_engagement_not_paused(&env, &engagement_id);
         proposer.require_auth();
 
         let engagement = Self::get_engagement_internal(&env, &engagement_id);
 
-        if proposer != engagement.company && proposer != engagement.recruiter {
+        if !Self::is_authorized_company(&env, &proposer, &engagement.company)
+            && proposer != engagement.recruiter
+        {
             panic!("{}", ERR_UNAUTHORIZED);
         }
 
@@ -3194,11 +3707,14 @@ impl HireSettleContract {
         engagement_id: String,
         milestone_index: u32,
     ) {
+        Self::assert_engagement_not_paused(&env, &engagement_id);
         acceptor.require_auth();
 
         let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
 
-        if acceptor != engagement.company && acceptor != engagement.recruiter {
+        if !Self::is_authorized_company(&env, &acceptor, &engagement.company)
+            && acceptor != engagement.recruiter
+        {
             panic!("{}", ERR_UNAUTHORIZED);
         }
 
@@ -3314,11 +3830,14 @@ impl HireSettleContract {
         engagement_id: String,
         milestone_index: u32,
     ) {
+        Self::assert_engagement_not_paused(&env, &engagement_id);
         rejector.require_auth();
 
         let engagement = Self::get_engagement_internal(&env, &engagement_id);
 
-        if rejector != engagement.company && rejector != engagement.recruiter {
+        if !Self::is_authorized_company(&env, &rejector, &engagement.company)
+            && rejector != engagement.recruiter
+        {
             panic!("{}", ERR_UNAUTHORIZED);
         }
 
@@ -3692,6 +4211,7 @@ impl HireSettleContract {
         additional_ledgers: u32,
     ) {
         Self::assert_not_paused(&env);
+        Self::assert_engagement_not_paused(&env, &engagement_id);
         recruiter.require_auth();
 
         let engagement = Self::get_engagement_internal(&env, &engagement_id);
@@ -3773,6 +4293,7 @@ impl HireSettleContract {
         milestone_index: u32,
     ) {
         Self::assert_not_paused(&env);
+        Self::assert_engagement_not_paused(&env, &engagement_id);
         company.require_auth();
 
         let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
@@ -3817,6 +4338,11 @@ impl HireSettleContract {
         engagement.milestones.set(milestone_index, milestone);
         engagement.last_activity_ledger = current_ledger;
 
+        // The deadline just moved out, so any due-soon notification already
+        // emitted referred to the old one — reset so the new deadline can be
+        // announced in its own right. See issue #241.
+        Self::clear_due_soon_flag(&env, &engagement_id, milestone_index);
+
         env.storage().persistent().remove(&proposal_key);
 
         env.storage()
@@ -3851,6 +4377,7 @@ impl HireSettleContract {
         milestone_index: u32,
     ) {
         Self::assert_not_paused(&env);
+        Self::assert_engagement_not_paused(&env, &engagement_id);
         company.require_auth();
 
         let engagement = Self::get_engagement_internal(&env, &engagement_id);
@@ -3996,6 +4523,7 @@ impl HireSettleContract {
     /// Emits `("early_exit_requested", engagement_id)`.
     pub fn request_early_exit(env: Env, recruiter: Address, engagement_id: String) {
         Self::assert_not_paused(&env);
+        Self::assert_engagement_not_paused(&env, &engagement_id);
         recruiter.require_auth();
 
         let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
@@ -4054,10 +4582,11 @@ impl HireSettleContract {
     /// Emits `("early_exit_accepted", engagement_id)` with the refund amount.
     pub fn accept_early_exit(env: Env, company: Address, engagement_id: String) {
         Self::assert_not_paused(&env);
+        Self::assert_engagement_not_paused(&env, &engagement_id);
         company.require_auth();
 
         let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
-        Self::assert_exit_request_pending(&engagement, &company);
+        Self::assert_exit_request_pending(&env, &company, &engagement);
 
         let refund = engagement.total_amount - engagement.released_amount;
         if refund > 0 {
@@ -4115,10 +4644,11 @@ impl HireSettleContract {
     /// Emits `("early_exit_rejected", engagement_id)`.
     pub fn reject_early_exit(env: Env, company: Address, engagement_id: String) {
         Self::assert_not_paused(&env);
+        Self::assert_engagement_not_paused(&env, &engagement_id);
         company.require_auth();
 
         let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
-        Self::assert_exit_request_pending(&engagement, &company);
+        Self::assert_exit_request_pending(&env, &company, &engagement);
 
         let old_engagement_status = engagement.status.clone();
         engagement.status = EngagementStatus::Active;
@@ -4250,6 +4780,166 @@ impl HireSettleContract {
     }
 
     // ----------------------------------------------------------
+    // ISSUE #249 — ENGAGEMENT TAGS
+    // ----------------------------------------------------------
+
+    /// Add a tag to an engagement. Only the engagement's company (or its
+    /// registered co-signer) may tag the engagement.
+    /// Duplicate tags are silently ignored.
+    pub fn add_engagement_tag(
+        env: Env,
+        caller: Address,
+        engagement_id: String,
+        tag: String,
+    ) {
+        caller.require_auth();
+        let engagement = Self::get_engagement_internal(&env, &engagement_id);
+        if !Self::is_authorized_company(&env, &caller, &engagement.company) {
+            panic!("{}", ERR_UNAUTHORIZED);
+        }
+
+        let key = DataKey::EngagementTag(tag.clone());
+        let mut ids: Vec<String> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        for i in 0..ids.len() {
+            if ids.get(i).unwrap() == engagement_id {
+                return;
+            }
+        }
+        ids.push_back(engagement_id.clone());
+        env.storage().persistent().set(&key, &ids);
+        env.events().publish(
+            (Symbol::new(&env, "engagement_tag_added"), tag),
+            engagement_id,
+        );
+    }
+
+    /// Remove a tag from an engagement. Only the engagement's company (or its
+    /// registered co-signer) may remove a tag.
+    /// No-op if the tag was not present.
+    pub fn remove_engagement_tag(
+        env: Env,
+        caller: Address,
+        engagement_id: String,
+        tag: String,
+    ) {
+        caller.require_auth();
+        let engagement = Self::get_engagement_internal(&env, &engagement_id);
+        if !Self::is_authorized_company(&env, &caller, &engagement.company) {
+            panic!("{}", ERR_UNAUTHORIZED);
+        }
+
+        let key = DataKey::EngagementTag(tag.clone());
+        let ids: Vec<String> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut new_ids = Vec::new(&env);
+        let mut found = false;
+        for i in 0..ids.len() {
+            let id = ids.get(i).unwrap();
+            if id == engagement_id {
+                found = true;
+            } else {
+                new_ids.push_back(id);
+            }
+        }
+        if found {
+            env.storage().persistent().set(&key, &new_ids);
+            env.events().publish(
+                (Symbol::new(&env, "engagement_tag_removed"), tag),
+                engagement_id,
+            );
+        }
+    }
+
+    /// Return a paginated slice of engagement IDs for a given tag.
+    /// `page` is 0-indexed; out-of-range pages return an empty vec.
+    pub fn get_engagements_by_tag(
+        env: Env,
+        status: EngagementStatus,
+        page: u32,
+        page_size: u32,
+    ) -> Vec<String> {
+        let mut result = Vec::new(&env);
+        if page_size == 0 {
+            return result;
+        }
+
+        let ids: Vec<String> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AllEngagements)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        // Use saturating arithmetic so a huge `page` / `page_size` combination
+        // clamps instead of wrapping around via u32 overflow.
+        let start = page.saturating_mul(page_size);
+        let end = start.saturating_add(page_size);
+
+        // Walk the index counting matches, collecting only those whose position
+        // within the filtered sequence falls inside the requested page.
+        let mut matched: u32 = 0;
+        for i in 0..ids.len() {
+            if matched >= end {
+                break;
+            }
+            let id = ids.get(i).unwrap();
+            let engagement: Engagement = match env
+                .storage()
+                .persistent()
+                .get(&DataKey::Engagement(id.clone()))
+            {
+                Some(e) => e,
+                // An entry whose record has since expired from storage is
+                // skipped rather than treated as a match.
+                None => continue,
+            };
+            if engagement.status == status {
+                if matched >= start {
+                    result.push_back(id);
+                }
+                matched += 1;
+            }
+        }
+
+        result
+    }
+
+    /// Return the total number of engagements currently in a given status
+    /// (issue #237). Companion to `get_engagement_ids_by_status` for sizing
+    /// pagination, mirroring `get_company_engagement_count`.
+    ///
+    /// Carries the same scan cost and index-coverage caveats as
+    /// `get_engagement_ids_by_status`.
+    pub fn get_engagement_count_by_status(env: Env, status: EngagementStatus) -> u32 {
+        let ids: Vec<String> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AllEngagements)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut count: u32 = 0;
+        for i in 0..ids.len() {
+            let id = ids.get(i).unwrap();
+            if let Some(engagement) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, Engagement>(&DataKey::Engagement(id))
+            {
+                if engagement.status == status {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+
+    // ----------------------------------------------------------
     // ISSUE #249 — ENGAGEMENT LIST BY TAG
     // ----------------------------------------------------------
 
@@ -4259,7 +4949,7 @@ impl HireSettleContract {
         let ids: Vec<String> = env
             .storage()
             .persistent()
-            .get(&DataKey::TagEngagements(tag))
+            .get(&DataKey::EngagementTag(tag))
             .unwrap_or_else(|| Vec::new(&env));
 
         let total = ids.len();
@@ -4278,22 +4968,17 @@ impl HireSettleContract {
         result
     }
 
-    /// Return the total number of engagements associated with a given tag.
-    pub fn get_tag_engagement_count(env: Env, tag: String) -> u32 {
+    /// Return the total number of engagements tagged with a given tag.
+    pub fn get_engagement_tag_count(env: Env, tag: String) -> u32 {
         let ids: Vec<String> = env
             .storage()
             .persistent()
-            .get(&DataKey::TagEngagements(tag))
+            .get(&DataKey::EngagementTag(tag))
             .unwrap_or_else(|| Vec::new(&env));
         ids.len()
     }
 
-    /// Return the tags assigned to an engagement, if any.
-    pub fn get_engagement_tags(env: Env, engagement_id: String) -> Option<Vec<String>> {
-        Self::get_engagement_internal(&env, &engagement_id).tags
-    }
-
-    // ----------------------------------------------------------
+4    // ----------------------------------------------------------
     // ISSUE #41 — CONFIGURABLE LEDGERS PER DAY
     // ----------------------------------------------------------
 
@@ -4456,6 +5141,7 @@ impl HireSettleContract {
     /// # Events
     /// Emits `("engagement_expired", engagement_id)` with the refund amount.
     pub fn expire_engagement(env: Env, engagement_id: String) {
+        Self::assert_engagement_not_paused(&env, &engagement_id);
         let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
 
         if engagement.status == EngagementStatus::Completed {
@@ -4607,6 +5293,7 @@ impl HireSettleContract {
         milestone_indices: Vec<u32>,
     ) {
         Self::assert_not_paused(&env);
+        Self::assert_engagement_not_paused(&env, &engagement_id);
         company.require_auth();
 
         if milestone_indices.is_empty() {
@@ -4619,7 +5306,7 @@ impl HireSettleContract {
             panic!("{}", ERR_ENGAGEMENT_NOT_ACTIVE);
         }
 
-        if company != engagement.company {
+        if !Self::is_authorized_company(&env, &company, &engagement.company) {
             panic!("{}", ERR_UNAUTHORIZED);
         }
 
@@ -4650,6 +5337,8 @@ impl HireSettleContract {
         }
 
         let platform_fee = Self::get_platform_fee_internal(&env);
+        let effective_bps =
+            Self::resolve_platform_fee_bps(&env, platform_fee.bps, engagement.total_amount);
         let token_client = token::Client::new(&env, &engagement.token);
 
         for i in 0..milestone_indices.len() {
@@ -4657,7 +5346,7 @@ impl HireSettleContract {
             let mut m = engagement.milestones.get(idx).unwrap();
 
             let payment = (engagement.total_amount * m.payment_percent as i128) / 100;
-            let fee_amount = (payment * platform_fee.bps as i128) / 10_000;
+            let fee_amount = (payment * effective_bps as i128) / 10_000;
             let net_payment = payment - fee_amount;
             engagement.released_amount += payment;
 
@@ -4813,6 +5502,7 @@ impl HireSettleContract {
         milestone_index: u32,
     ) {
         Self::assert_not_paused(&env);
+        Self::assert_engagement_not_paused(&env, &engagement_id);
         caller.require_auth();
 
         let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
@@ -4841,7 +5531,9 @@ impl HireSettleContract {
         // Release payment identically to confirm_milestone.
         let payment = (engagement.total_amount * milestone.payment_percent as i128) / 100;
         let platform_fee = Self::get_platform_fee_internal(&env);
-        let fee_amount = (payment * platform_fee.bps as i128) / 10_000;
+        let effective_bps =
+            Self::resolve_platform_fee_bps(&env, platform_fee.bps, engagement.total_amount);
+        let fee_amount = (payment * effective_bps as i128) / 10_000;
         let net_payment = payment - fee_amount;
         engagement.released_amount += payment;
 
@@ -5108,6 +5800,68 @@ impl HireSettleContract {
     }
 
     // ----------------------------------------------------------
+    // ISSUE #240 — FULL CONFIG SNAPSHOT
+    // ----------------------------------------------------------
+
+    /// Return every admin-configurable contract parameter in a single
+    /// read-only call (issue #240).
+    ///
+    /// Off-chain indexers otherwise need ~20 separate round-trips
+    /// (`get_platform_fee`, `get_arbiter_fee`, `get_confirm_window`, …) to
+    /// reconstruct the current configuration. Each field is sourced from the
+    /// same accessor its dedicated getter uses, so the snapshot is exactly what
+    /// those calls would return at this ledger — including defaults for
+    /// parameters never explicitly set.
+    ///
+    /// Because the whole struct is read within one invocation, the values are
+    /// mutually consistent: there is no window for an admin transaction to land
+    /// between two reads and yield a torn view.
+    ///
+    /// Read-only and permissionless.
+    ///
+    /// # Panics
+    /// - `"admin not initialized"` — `init` has not been called.
+    pub fn get_config_snapshot(env: Env) -> ConfigSnapshot {
+        let platform_fee = Self::get_platform_fee_internal(&env);
+
+        ConfigSnapshot {
+            version: Self::get_version(env.clone()),
+            admin: Self::get_admin_internal(&env),
+            admin_renounced: env
+                .storage()
+                .instance()
+                .get(&DataKey::AdminRenounced)
+                .unwrap_or(false),
+            paused: Self::is_paused_internal(&env),
+            platform_fee_bps: platform_fee.bps,
+            platform_fee_treasury: platform_fee.treasury,
+            arbiter_fee_bps: Self::get_arbiter_fee(env.clone()),
+            super_arbiter: env.storage().instance().get(&DataKey::SuperArbiter),
+            confirm_window_ledgers: Self::get_confirm_window(env.clone()),
+            dispute_window_ledgers: Self::get_dispute_window(env.clone()),
+            proof_cooldown_ledgers: Self::get_proof_cooldown(&env),
+            due_soon_window_ledgers: Self::get_due_soon_window(env.clone()),
+            amendment_ttl_ledgers: Self::get_amendment_ttl(env.clone()),
+            extension_ttl_ledgers: Self::get_extension_ttl(env.clone()),
+            inactivity_timeout_ledgers: Self::get_inactivity_timeout_ledgers(env.clone()),
+            storage_ttl_extend_to: Self::get_storage_ttl_extend_to(env.clone()),
+            upgrade_lock_duration_ledgers: Self::get_upgrade_lock_duration(env.clone()),
+            ledgers_per_day: Self::get_ledgers_per_day_internal(&env),
+            max_milestones: Self::get_max_milestones(env.clone()),
+            max_retention_days: Self::get_max_retention_days(env.clone()),
+            max_replacements: Self::get_max_replacements_internal(&env),
+            max_active_per_company: Self::get_max_active_per_company(env.clone()),
+            max_proof_hash_length: Self::get_max_proof_hash_length_internal(&env),
+            min_engagement_amount: Self::get_min_amount(env.clone()),
+            token_allowlist_enabled: env
+                .storage()
+                .persistent()
+                .get(&DataKey::AllowlistEnabled)
+                .unwrap_or(false),
+        }
+    }
+
+    // ----------------------------------------------------------
     // ISSUE #59 — ADMIN ROLE RENOUNCEMENT
     // ----------------------------------------------------------
 
@@ -5154,11 +5908,11 @@ impl HireSettleContract {
     /// the engagement must be `ExitRequested` and `company` must match the
     /// engagement's company. Used by both `accept_early_exit` and
     /// `reject_early_exit` (issue #173).
-    fn assert_exit_request_pending(engagement: &Engagement, company: &Address) {
+    fn assert_exit_request_pending(env: &Env, company: &Address, engagement: &Engagement) {
         if engagement.status != EngagementStatus::ExitRequested {
             panic!("no exit request pending");
         }
-        if company != &engagement.company {
+        if !Self::is_authorized_company(env, company, &engagement.company) {
             panic!("{}", ERR_UNAUTHORIZED);
         }
     }
@@ -5195,6 +5949,35 @@ impl HireSettleContract {
     fn assert_not_paused(env: &Env) {
         if Self::is_paused_internal(env) {
             panic!("ContractPaused");
+        }
+    }
+
+    fn is_engagement_paused_internal(env: &Env, engagement_id: &String) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::EngagementPaused(engagement_id.clone()))
+            .unwrap_or(false)
+    }
+
+    /// Per-engagement quarantine guard (issue #239). Layered on top of — not a
+    /// replacement for — `assert_not_paused`: the global pause halts every
+    /// engagement, this one halts a single quarantined ID.
+    fn assert_engagement_not_paused(env: &Env, engagement_id: &String) {
+        if Self::is_engagement_paused_internal(env, engagement_id) {
+            panic!("{}", ERR_ENGAGEMENT_PAUSED);
+        }
+    }
+
+    /// Clear the due-soon notification flag for a milestone (issue #241).
+    ///
+    /// Called whenever a milestone's `valid_after_ledger` moves — an accepted
+    /// extension pushes it out, a replacement restarts the retention timer.
+    /// Without this the flag from the *previous* deadline would suppress the
+    /// notification for the new one, silently starving off-chain notifiers.
+    fn clear_due_soon_flag(env: &Env, engagement_id: &String, milestone_index: u32) {
+        let key = DataKey::DueSoonNotified(engagement_id.clone(), milestone_index);
+        if env.storage().persistent().has(&key) {
+            env.storage().persistent().remove(&key);
         }
     }
 
@@ -5266,6 +6049,29 @@ impl HireSettleContract {
                 bps: 0,
                 treasury: Self::get_admin_internal(env),
             })
+    }
+
+    /// Resolve the effective platform-fee bps for an engagement of the given
+    /// `total_amount`. Walks configured fee tiers (highest threshold first)
+    /// and returns the first matching tier's bps, or falls back to the base
+    /// platform fee if no tier matches.
+    fn resolve_platform_fee_bps(env: &Env, base_bps: u32, total_amount: i128) -> u32 {
+        let tiers: Option<Vec<FeeTier>> = env.storage().persistent().get(&DataKey::FeeTiers);
+        if let Some(tiers) = tiers {
+            let len = tiers.len();
+            if len > 0 {
+                // Walk from highest threshold to lowest.
+                let mut i = len;
+                while i > 0 {
+                    i -= 1;
+                    let tier = tiers.get(i).unwrap();
+                    if total_amount >= tier.threshold {
+                        return tier.bps;
+                    }
+                }
+            }
+        }
+        base_bps
     }
 
     fn get_ledgers_per_day_internal(env: &Env) -> u32 {
