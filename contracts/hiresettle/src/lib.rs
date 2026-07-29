@@ -212,6 +212,10 @@ pub struct Engagement {
     /// Optional off-chain attestation hash (e.g. SHA-256 of the contract PDF).
     /// Stored at engagement creation for audit and verification purposes.
     pub contract_pdf_hash: Option<String>,
+    /// Optional referrer address set at creation time (issue #251).
+    /// If present and recognised by the admin-configured referral list,
+    /// a configurable fee discount is applied to every milestone payout.
+    pub referrer: Option<Address>,
     /// Optional list of short string tags for categorization (issue #248, #249).
     pub tags: Option<Vec<String>>,
 }
@@ -248,6 +252,8 @@ pub struct EngagementSummary {
     pub recruiter_split_bps: u32,
     /// Optional off-chain attestation hash (e.g. SHA-256 of the contract PDF).
     pub contract_pdf_hash: Option<String>,
+    /// Optional referrer address (issue #251).
+    pub referrer: Option<Address>,
     /// Optional list of short string tags for categorization (issue #248, #249).
     pub tags: Option<Vec<String>>,
 }
@@ -326,79 +332,16 @@ pub struct PlatformFee {
     pub treasury: Address,
 }
 
-/// A single-call snapshot of every admin-configurable contract parameter
-/// (issue #240).
-///
-/// Returned by [`HireSettleContract::get_config_snapshot`] so off-chain
-/// indexers can reconstruct the full contract configuration in one
-/// round-trip instead of calling ~20 separate getters. Every field mirrors
-/// the value its dedicated getter would return at the same ledger, including
-/// the defaults applied when a parameter has never been explicitly set.
+/// A single fee-tier bracket: engagements whose `total_amount` is at or above
+/// `threshold` pay `bps` instead of the default platform-fee rate.
+/// Configured via `set_fee_tiers` (issue #250).
 #[contracttype]
 #[derive(Clone)]
-pub struct ConfigSnapshot {
-    /// Contract version string — see `get_version`.
-    pub version: String,
-    /// Current admin address — see `get_admin`.
-    pub admin: Address,
-    /// `true` once the admin has permanently renounced the role (issue #59).
-    /// When set, every admin-gated setter panics with `"NoAdmin"`.
-    pub admin_renounced: bool,
-    /// Whether the contract is globally paused — see `is_paused`.
-    pub paused: bool,
-    /// Platform fee in basis points — see `get_platform_fee`.
-    pub platform_fee_bps: u32,
-    /// Treasury receiving platform fees — see `get_platform_fee`.
-    pub platform_fee_treasury: Address,
-    /// Arbiter fee in basis points (issue #52) — see `get_arbiter_fee`.
-    pub arbiter_fee_bps: u32,
-    /// Configured super-arbiter for escalated disputes (issue #246), if any.
-    pub super_arbiter: Option<Address>,
-    /// Confirm window in ledgers — see `get_confirm_window`.
-    pub confirm_window_ledgers: u32,
-    /// Dispute window in ledgers — see `get_dispute_window`.
-    pub dispute_window_ledgers: u32,
-    /// Proof resubmission cooldown in ledgers — see `set_proof_cooldown`.
-    pub proof_cooldown_ledgers: u32,
-    /// Due-soon notification window in ledgers (issue #241) —
-    /// see `get_due_soon_window`.
-    pub due_soon_window_ledgers: u32,
-    /// Amendment proposal TTL in ledgers — see `get_amendment_ttl`.
-    pub amendment_ttl_ledgers: u32,
-    /// Milestone extension proposal TTL in ledgers (issue #247) —
-    /// see `get_extension_ttl`.
-    pub extension_ttl_ledgers: u32,
-    /// Inactivity timeout in ledgers (issue #38) —
-    /// see `get_inactivity_timeout_ledgers`.
-    pub inactivity_timeout_ledgers: u32,
-    /// Storage TTL extension target in ledgers (issue #40) —
-    /// see `get_storage_ttl_extend_to`.
-    pub storage_ttl_extend_to: u32,
-    /// Upgrade time-lock duration in ledgers (issue #69) —
-    /// see `get_upgrade_lock_duration`.
-    pub upgrade_lock_duration_ledgers: u32,
-    /// Ledgers-per-day constant (issue #41) — see `get_ledgers_per_day`.
-    pub ledgers_per_day: u32,
-    /// Maximum milestone count per engagement (issue #21) —
-    /// see `get_max_milestones`.
-    pub max_milestones: u32,
-    /// Maximum retention window in days (issue #18) —
-    /// see `get_max_retention_days`.
-    pub max_retention_days: u32,
-    /// Maximum replacements per engagement (issue #31) —
-    /// see `get_max_replacements`.
-    pub max_replacements: u32,
-    /// Maximum simultaneously active engagements per company —
-    /// see `get_max_active_per_company`.
-    pub max_active_per_company: u32,
-    /// Maximum proof hash length in characters (issue #68) —
-    /// see `get_max_proof_hash_length`.
-    pub max_proof_hash_length: u32,
-    /// Minimum engagement amount in the token's smallest unit (issue #17) —
-    /// see `get_min_amount`.
-    pub min_engagement_amount: i128,
-    /// Whether the token allowlist is being enforced (issue #26).
-    pub token_allowlist_enabled: bool,
+pub struct FeeTier {
+    /// Minimum `total_amount` (inclusive) to qualify for this tier.
+    pub threshold: i128,
+    /// Platform fee in basis points applied to engagements in this tier.
+    pub bps: u32,
 }
 
 /// Bundled optional configuration passed as the last argument of `create_engagement`.
@@ -418,8 +361,21 @@ pub struct EngagementConfig {
     /// Optional off-chain attestation hash (e.g. SHA-256 of the contract PDF).
     /// Must be non-empty if provided.
     pub contract_pdf_hash: Option<String>,
+    /// Optional referrer address (issue #251). If present and in the
+    /// admin-configured referral list, the engagement receives a fee discount.
+    pub referrer: Option<Address>,
     /// Optional list of short string tags for off-chain categorization (issue #248, #249).
     pub tags: Option<Vec<String>>,
+}
+
+/// Returned by `get_contract_health` for quick off-chain diagnostics (issue #256).
+#[contracttype]
+#[derive(Clone)]
+pub struct ContractHealth {
+    pub paused: bool,
+    pub admin: Address,
+    pub version: String,
+    pub total_engagement_count: u64,
 }
 
 // ============================================================
@@ -508,6 +464,10 @@ pub enum DataKey {
     CompanyActiveCount(Address),
     /// Admin-configurable maximum number of replacements allowed per engagement (issue #31, default 3).
     MaxReplacements,
+    /// Per-tag list of engagement IDs (issue #249).
+    EngagementTag(String),
+    /// Optional co-signer address authorized to perform company-gated actions (issue #254).
+    CompanyCosigner(Address),
     /// Active milestone extension proposal for a Locked retention milestone,
     /// awaiting company approval (issue #247).
     MilestoneExtensionProposal(String, u32),
@@ -669,6 +629,55 @@ impl HireSettleContract {
     pub fn get_platform_fee(env: Env) -> (u32, Address) {
         let fee = Self::get_platform_fee_internal(&env);
         (fee.bps, fee.treasury)
+    }
+
+    /// Admin sets fee tiers that scale the platform fee down for larger
+    /// engagements (issue #250). Each tier specifies a `threshold`
+    /// (minimum `total_amount`) and the `bps` rate that applies. Tiers
+    /// must be sorted by ascending threshold, each `bps` must be ≤ the
+    /// base platform fee, and at most 10 tiers are allowed.
+    ///
+    /// At fee-calculation time the contract walks the tiers from highest
+    /// threshold to lowest and uses the first matching tier's `bps`.
+    /// If no tier matches, the base `platform_fee.bps` applies.
+    ///
+    /// Pass an empty vector to clear all tiers (flat fee for every size).
+    pub fn set_fee_tiers(env: Env, admin: Address, tiers: Vec<FeeTier>) {
+        Self::assert_not_paused(&env);
+        Self::assert_admin(&env, &admin);
+
+        if tiers.len() > 10 {
+            panic!("too many fee tiers");
+        }
+
+        let base_bps = Self::get_platform_fee_internal(&env).bps;
+        for i in 0..tiers.len() {
+            let t = tiers.get(i).unwrap();
+            if t.bps > base_bps {
+                panic!("tier bps exceeds base platform fee");
+            }
+            if t.threshold <= 0 {
+                panic!("tier threshold must be positive");
+            }
+            if i > 0 {
+                let prev = tiers.get(i - 1).unwrap();
+                if t.threshold <= prev.threshold {
+                    panic!("tiers must be sorted by ascending threshold");
+                }
+            }
+        }
+
+        env.storage().persistent().set(&DataKey::FeeTiers, &tiers);
+        env.events()
+            .publish((Symbol::new(&env, "fee_tiers_set"),), tiers.len());
+    }
+
+    /// Return the current fee tiers. Empty vector means no tiering (flat fee).
+    pub fn get_fee_tiers(env: Env) -> Vec<FeeTier> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::FeeTiers)
+            .unwrap_or_else(|| Vec::new(&env))
     }
 
     /// Admin sets the contract version string (issue #16).
@@ -872,6 +881,25 @@ impl HireSettleContract {
     /// Return the current contract admin.
     pub fn get_admin(env: Env) -> Address {
         Self::get_admin_internal(&env)
+    }
+
+    /// Return a single diagnostic snapshot of the contract's health (issue #256).
+    /// Returns paused state, admin, version, and total engagement count in one call.
+    pub fn get_contract_health(env: Env) -> ContractHealth {
+        ContractHealth {
+            paused: Self::is_paused_internal(&env),
+            admin: Self::get_admin_internal(&env),
+            version: env
+                .storage()
+                .persistent()
+                .get(&DataKey::Version)
+                .unwrap_or_else(|| String::from_str(&env, DEFAULT_VERSION)),
+            total_engagement_count: env
+                .storage()
+                .instance()
+                .get(&DataKey::EngagementCount)
+                .unwrap_or(0u64),
+        }
     }
 
     // ----------------------------------------------------------
@@ -1186,6 +1214,7 @@ impl HireSettleContract {
             co_recruiter: config.co_recruiter,
             recruiter_split_bps: config.recruiter_split_bps,
             contract_pdf_hash: config.contract_pdf_hash,
+            referrer: config.referrer,
             tags: config.tags.clone(),
         };
 
@@ -1738,7 +1767,7 @@ impl HireSettleContract {
             panic!("{}", ERR_ENGAGEMENT_NOT_ACTIVE);
         }
 
-        if company != engagement.company {
+        if !Self::is_authorized_company(&env, &company, &engagement.company) {
             panic!("{}", ERR_UNAUTHORIZED);
         }
 
@@ -1773,7 +1802,10 @@ impl HireSettleContract {
         let payment = full_share - milestone.replacement_paid_out;
         if payment > 0 {
             let platform_fee = Self::get_platform_fee_internal(&env);
-            let fee_amount = (payment * platform_fee.bps as i128) / 10_000;
+            let effective_bps =
+                Self::apply_referral_discount(&env, platform_fee.bps, &engagement.referrer);
+                Self::resolve_platform_fee_bps(&env, platform_fee.bps, engagement.total_amount);
+            let fee_amount = (payment * effective_bps as i128) / 10_000;
             let net_payment = payment - fee_amount;
             engagement.released_amount += payment;
 
@@ -1909,7 +1941,7 @@ impl HireSettleContract {
             panic!("{}", ERR_ENGAGEMENT_NOT_ACTIVE);
         }
 
-        if company != engagement.company {
+        if !Self::is_authorized_company(&env, &company, &engagement.company) {
             panic!("{}", ERR_UNAUTHORIZED);
         }
 
@@ -2215,6 +2247,14 @@ impl HireSettleContract {
             panic!("{}", ERR_ENGAGEMENT_NOT_ACTIVE);
         }
 
+        if !Self::is_authorized_company(&env, &company, &engagement.company) {
+            panic!("{}", ERR_UNAUTHORIZED);
+        }
+
+        let placement_confirmed = {
+            let m0 = engagement.milestones.get(0).unwrap();
+            m0.status == MilestoneStatus::Confirmed || m0.status == MilestoneStatus::Resolved
+        };
         let milestone = Self::get_milestone_or_panic(&engagement, milestone_index);
 
         if milestone.status != MilestoneStatus::Disputed {
@@ -2677,6 +2717,50 @@ impl HireSettleContract {
     // ----------------------------------------------------------
     // ISSUE #43 — COMPANY TRANSFER
     // ----------------------------------------------------------
+    // ISSUE #254 — COMPANY MULTI-SIGNER SUPPORT
+    // ----------------------------------------------------------
+
+    /// Register a co-signer address that is also authorized to perform
+    /// company-gated actions (confirm, dispute, cancel, etc.) on behalf
+    /// of this company. Only the company address itself can set the cosigner.
+    pub fn set_company_cosigner(env: Env, company: Address, cosigner: Address) {
+        company.require_auth();
+        env.storage().persistent().set(
+            &DataKey::CompanyCosigner(company.clone()),
+            &cosigner,
+        );
+        env.events().publish(
+            (Symbol::new(&env, "company_cosigner_set"),),
+            (company, cosigner),
+        );
+    }
+
+    /// Return the registered co-signer for a company, or `None` if none set.
+    pub fn get_company_cosigner(env: Env, company: Address) -> Option<Address> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::CompanyCosigner(company))
+    }
+
+    /// Internal helper: check if `caller` is either the engagement's company
+    /// or the company's registered co-signer.
+    fn is_authorized_company(env: &Env, caller: &Address, engagement_company: &Address) -> bool {
+        if caller == engagement_company {
+            return true;
+        }
+        let cosigner: Option<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CompanyCosigner(engagement_company.clone()));
+        match cosigner {
+            Some(c) => caller == &c,
+            None => false,
+        }
+    }
+
+    // ----------------------------------------------------------
+    // ISSUE #43 — COMPANY TRANSFER
+    // ----------------------------------------------------------
 
     /// Transfer the company role on an engagement to a new address, effective
     /// immediately (e.g. the company was acquired or restructured).
@@ -2807,7 +2891,7 @@ impl HireSettleContract {
 
         let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
 
-        if company != engagement.company {
+        if !Self::is_authorized_company(&env, &company, &engagement.company) {
             panic!("{}", ERR_UNAUTHORIZED);
         }
 
@@ -2916,7 +3000,7 @@ impl HireSettleContract {
             panic!("{}", ERR_ENGAGEMENT_NOT_ACTIVE);
         }
 
-        if company != engagement.company {
+        if !Self::is_authorized_company(&env, &company, &engagement.company) {
             panic!("{}", ERR_UNAUTHORIZED);
         }
 
@@ -2990,7 +3074,7 @@ impl HireSettleContract {
             panic!("{}", ERR_ENGAGEMENT_NOT_ACTIVE);
         }
 
-        if company != engagement.company {
+        if !Self::is_authorized_company(&env, &company, &engagement.company) {
             panic!("{}", ERR_UNAUTHORIZED);
         }
 
@@ -3202,6 +3286,50 @@ impl HireSettleContract {
             contract_pdf_hash: engagement.contract_pdf_hash,
             tags: engagement.tags,
         }
+    }
+
+    /// Return lightweight summaries for multiple engagements in a single call,
+    /// reducing round-trips for dashboards that need to render many engagements
+    /// at once.
+    ///
+    /// Engagement IDs that do not exist are silently skipped — the returned
+    /// vector may be shorter than the input list when some IDs are invalid.
+    ///
+    /// # Panics
+    ///
+    /// - `"too many IDs"` — `engagement_ids` contains more than 20 entries.
+    pub fn batch_get_engagement_summary(
+        env: Env,
+        engagement_ids: Vec<String>,
+    ) -> Vec<EngagementSummary> {
+        if engagement_ids.len() > 20 {
+            panic!("too many IDs");
+        }
+        let mut results: Vec<EngagementSummary> = Vec::new(&env);
+        for i in 0..engagement_ids.len() {
+            let eid = engagement_ids.get(i).unwrap();
+            let maybe: Option<Engagement> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Engagement(eid.clone()));
+            if let Some(engagement) = maybe {
+                results.push_back(EngagementSummary {
+                    id: engagement.id,
+                    job_title: engagement.job_title,
+                    company: engagement.company,
+                    recruiter: engagement.recruiter,
+                    total_amount: engagement.total_amount,
+                    released_amount: engagement.released_amount,
+                    status: engagement.status,
+                    milestone_count: engagement.milestones.len(),
+                    created_at_ledger: engagement.created_at_ledger,
+                    co_recruiter: engagement.co_recruiter,
+                    recruiter_split_bps: engagement.recruiter_split_bps,
+                    contract_pdf_hash: engagement.contract_pdf_hash,
+                });
+            }
+        }
+        results
     }
 
     /// Return the off-chain attestation hash (e.g. SHA-256 of the contract PDF)
@@ -3513,7 +3641,9 @@ impl HireSettleContract {
 
         let engagement = Self::get_engagement_internal(&env, &engagement_id);
 
-        if proposer != engagement.company && proposer != engagement.recruiter {
+        if !Self::is_authorized_company(&env, &proposer, &engagement.company)
+            && proposer != engagement.recruiter
+        {
             panic!("{}", ERR_UNAUTHORIZED);
         }
 
@@ -3582,7 +3712,9 @@ impl HireSettleContract {
 
         let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
 
-        if acceptor != engagement.company && acceptor != engagement.recruiter {
+        if !Self::is_authorized_company(&env, &acceptor, &engagement.company)
+            && acceptor != engagement.recruiter
+        {
             panic!("{}", ERR_UNAUTHORIZED);
         }
 
@@ -3703,7 +3835,9 @@ impl HireSettleContract {
 
         let engagement = Self::get_engagement_internal(&env, &engagement_id);
 
-        if rejector != engagement.company && rejector != engagement.recruiter {
+        if !Self::is_authorized_company(&env, &rejector, &engagement.company)
+            && rejector != engagement.recruiter
+        {
             panic!("{}", ERR_UNAUTHORIZED);
         }
 
@@ -4202,7 +4336,7 @@ impl HireSettleContract {
         company.require_auth();
 
         let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
-        Self::assert_exit_request_pending(&engagement, &company);
+        Self::assert_exit_request_pending(&env, &company, &engagement);
 
         let refund = engagement.total_amount - engagement.released_amount;
         if refund > 0 {
@@ -4264,7 +4398,7 @@ impl HireSettleContract {
         company.require_auth();
 
         let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
-        Self::assert_exit_request_pending(&engagement, &company);
+        Self::assert_exit_request_pending(&env, &company, &engagement);
 
         let old_engagement_status = engagement.status.clone();
         engagement.status = EngagementStatus::Active;
@@ -4396,35 +4530,86 @@ impl HireSettleContract {
     }
 
     // ----------------------------------------------------------
-    // ISSUE #237 — ENGAGEMENT LIST BY STATUS
+    // ISSUE #249 — ENGAGEMENT TAGS
     // ----------------------------------------------------------
 
-    /// Return a paginated slice of engagement IDs filtered by
-    /// [`EngagementStatus`], across the whole contract (issue #237).
-    ///
-    /// `page` is 0-indexed and paginates the **filtered** result, not the
-    /// underlying index — so page 0 always holds the first `page_size` matches
-    /// regardless of how many non-matching engagements they are interleaved
-    /// with. Out-of-range pages and a `page_size` of 0 return an empty vec,
-    /// matching `get_engagements_by_company` / `get_engagements_by_recruiter`.
-    ///
-    /// Results preserve creation order, so a caller paging forward with a
-    /// stable status sees a stable ordering.
-    ///
-    /// # Cost
-    /// Filtering reads every engagement record, since status lives on the
-    /// engagement rather than in a per-status index. That is deliberate: a
-    /// maintained per-status index would put an O(n) list rewrite on every
-    /// status transition in the write path, whereas this cost falls entirely on
-    /// a read-only call that indexers and dashboards run against a simulated
-    /// (non-metered) invocation. Prefer the per-company / per-recruiter queries
-    /// when you already know the party.
-    ///
-    /// # Coverage
-    /// The backing index is populated at `create_engagement`, so engagements
-    /// created before this function was deployed are not enumerated. Their
-    /// records remain fully readable via `get_engagement`.
-    pub fn get_engagement_ids_by_status(
+    /// Add a tag to an engagement. Only the engagement's company (or its
+    /// registered co-signer) may tag the engagement.
+    /// Duplicate tags are silently ignored.
+    pub fn add_engagement_tag(
+        env: Env,
+        caller: Address,
+        engagement_id: String,
+        tag: String,
+    ) {
+        caller.require_auth();
+        let engagement = Self::get_engagement_internal(&env, &engagement_id);
+        if !Self::is_authorized_company(&env, &caller, &engagement.company) {
+            panic!("{}", ERR_UNAUTHORIZED);
+        }
+
+        let key = DataKey::EngagementTag(tag.clone());
+        let mut ids: Vec<String> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        for i in 0..ids.len() {
+            if ids.get(i).unwrap() == engagement_id {
+                return;
+            }
+        }
+        ids.push_back(engagement_id.clone());
+        env.storage().persistent().set(&key, &ids);
+        env.events().publish(
+            (Symbol::new(&env, "engagement_tag_added"), tag),
+            engagement_id,
+        );
+    }
+
+    /// Remove a tag from an engagement. Only the engagement's company (or its
+    /// registered co-signer) may remove a tag.
+    /// No-op if the tag was not present.
+    pub fn remove_engagement_tag(
+        env: Env,
+        caller: Address,
+        engagement_id: String,
+        tag: String,
+    ) {
+        caller.require_auth();
+        let engagement = Self::get_engagement_internal(&env, &engagement_id);
+        if !Self::is_authorized_company(&env, &caller, &engagement.company) {
+            panic!("{}", ERR_UNAUTHORIZED);
+        }
+
+        let key = DataKey::EngagementTag(tag.clone());
+        let ids: Vec<String> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut new_ids = Vec::new(&env);
+        let mut found = false;
+        for i in 0..ids.len() {
+            let id = ids.get(i).unwrap();
+            if id == engagement_id {
+                found = true;
+            } else {
+                new_ids.push_back(id);
+            }
+        }
+        if found {
+            env.storage().persistent().set(&key, &new_ids);
+            env.events().publish(
+                (Symbol::new(&env, "engagement_tag_removed"), tag),
+                engagement_id,
+            );
+        }
+    }
+
+    /// Return a paginated slice of engagement IDs for a given tag.
+    /// `page` is 0-indexed; out-of-range pages return an empty vec.
+    pub fn get_engagements_by_tag(
         env: Env,
         status: EngagementStatus,
         page: u32,
@@ -4514,7 +4699,7 @@ impl HireSettleContract {
         let ids: Vec<String> = env
             .storage()
             .persistent()
-            .get(&DataKey::TagEngagements(tag))
+            .get(&DataKey::EngagementTag(tag))
             .unwrap_or_else(|| Vec::new(&env));
 
         let total = ids.len();
@@ -4533,22 +4718,17 @@ impl HireSettleContract {
         result
     }
 
-    /// Return the total number of engagements associated with a given tag.
-    pub fn get_tag_engagement_count(env: Env, tag: String) -> u32 {
+    /// Return the total number of engagements tagged with a given tag.
+    pub fn get_engagement_tag_count(env: Env, tag: String) -> u32 {
         let ids: Vec<String> = env
             .storage()
             .persistent()
-            .get(&DataKey::TagEngagements(tag))
+            .get(&DataKey::EngagementTag(tag))
             .unwrap_or_else(|| Vec::new(&env));
         ids.len()
     }
 
-    /// Return the tags assigned to an engagement, if any.
-    pub fn get_engagement_tags(env: Env, engagement_id: String) -> Option<Vec<String>> {
-        Self::get_engagement_internal(&env, &engagement_id).tags
-    }
-
-    // ----------------------------------------------------------
+4    // ----------------------------------------------------------
     // ISSUE #41 — CONFIGURABLE LEDGERS PER DAY
     // ----------------------------------------------------------
 
@@ -4876,7 +5056,7 @@ impl HireSettleContract {
             panic!("{}", ERR_ENGAGEMENT_NOT_ACTIVE);
         }
 
-        if company != engagement.company {
+        if !Self::is_authorized_company(&env, &company, &engagement.company) {
             panic!("{}", ERR_UNAUTHORIZED);
         }
 
@@ -4907,6 +5087,8 @@ impl HireSettleContract {
         }
 
         let platform_fee = Self::get_platform_fee_internal(&env);
+        let effective_bps =
+            Self::resolve_platform_fee_bps(&env, platform_fee.bps, engagement.total_amount);
         let token_client = token::Client::new(&env, &engagement.token);
 
         for i in 0..milestone_indices.len() {
@@ -4914,7 +5096,7 @@ impl HireSettleContract {
             let mut m = engagement.milestones.get(idx).unwrap();
 
             let payment = (engagement.total_amount * m.payment_percent as i128) / 100;
-            let fee_amount = (payment * platform_fee.bps as i128) / 10_000;
+            let fee_amount = (payment * effective_bps as i128) / 10_000;
             let net_payment = payment - fee_amount;
             engagement.released_amount += payment;
 
@@ -5099,7 +5281,9 @@ impl HireSettleContract {
         // Release payment identically to confirm_milestone.
         let payment = (engagement.total_amount * milestone.payment_percent as i128) / 100;
         let platform_fee = Self::get_platform_fee_internal(&env);
-        let fee_amount = (payment * platform_fee.bps as i128) / 10_000;
+        let effective_bps =
+            Self::resolve_platform_fee_bps(&env, platform_fee.bps, engagement.total_amount);
+        let fee_amount = (payment * effective_bps as i128) / 10_000;
         let net_payment = payment - fee_amount;
         engagement.released_amount += payment;
 
@@ -5474,11 +5658,11 @@ impl HireSettleContract {
     /// the engagement must be `ExitRequested` and `company` must match the
     /// engagement's company. Used by both `accept_early_exit` and
     /// `reject_early_exit` (issue #173).
-    fn assert_exit_request_pending(engagement: &Engagement, company: &Address) {
+    fn assert_exit_request_pending(env: &Env, company: &Address, engagement: &Engagement) {
         if engagement.status != EngagementStatus::ExitRequested {
             panic!("no exit request pending");
         }
-        if company != &engagement.company {
+        if !Self::is_authorized_company(env, company, &engagement.company) {
             panic!("{}", ERR_UNAUTHORIZED);
         }
     }
@@ -5563,6 +5747,29 @@ impl HireSettleContract {
                 bps: 0,
                 treasury: Self::get_admin_internal(env),
             })
+    }
+
+    /// Resolve the effective platform-fee bps for an engagement of the given
+    /// `total_amount`. Walks configured fee tiers (highest threshold first)
+    /// and returns the first matching tier's bps, or falls back to the base
+    /// platform fee if no tier matches.
+    fn resolve_platform_fee_bps(env: &Env, base_bps: u32, total_amount: i128) -> u32 {
+        let tiers: Option<Vec<FeeTier>> = env.storage().persistent().get(&DataKey::FeeTiers);
+        if let Some(tiers) = tiers {
+            let len = tiers.len();
+            if len > 0 {
+                // Walk from highest threshold to lowest.
+                let mut i = len;
+                while i > 0 {
+                    i -= 1;
+                    let tier = tiers.get(i).unwrap();
+                    if total_amount >= tier.threshold {
+                        return tier.bps;
+                    }
+                }
+            }
+        }
+        base_bps
     }
 
     fn get_ledgers_per_day_internal(env: &Env) -> u32 {
