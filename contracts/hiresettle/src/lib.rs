@@ -2867,6 +2867,50 @@ impl HireSettleContract {
         }
     }
 
+    /// Return lightweight summaries for multiple engagements in a single call,
+    /// reducing round-trips for dashboards that need to render many engagements
+    /// at once.
+    ///
+    /// Engagement IDs that do not exist are silently skipped — the returned
+    /// vector may be shorter than the input list when some IDs are invalid.
+    ///
+    /// # Panics
+    ///
+    /// - `"too many IDs"` — `engagement_ids` contains more than 20 entries.
+    pub fn batch_get_engagement_summary(
+        env: Env,
+        engagement_ids: Vec<String>,
+    ) -> Vec<EngagementSummary> {
+        if engagement_ids.len() > 20 {
+            panic!("too many IDs");
+        }
+        let mut results: Vec<EngagementSummary> = Vec::new(&env);
+        for i in 0..engagement_ids.len() {
+            let eid = engagement_ids.get(i).unwrap();
+            let maybe: Option<Engagement> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Engagement(eid.clone()));
+            if let Some(engagement) = maybe {
+                results.push_back(EngagementSummary {
+                    id: engagement.id,
+                    job_title: engagement.job_title,
+                    company: engagement.company,
+                    recruiter: engagement.recruiter,
+                    total_amount: engagement.total_amount,
+                    released_amount: engagement.released_amount,
+                    status: engagement.status,
+                    milestone_count: engagement.milestones.len(),
+                    created_at_ledger: engagement.created_at_ledger,
+                    co_recruiter: engagement.co_recruiter,
+                    recruiter_split_bps: engagement.recruiter_split_bps,
+                    contract_pdf_hash: engagement.contract_pdf_hash,
+                });
+            }
+        }
+        results
+    }
+
     /// Return the off-chain attestation hash (e.g. SHA-256 of the contract PDF)
     /// stored at engagement creation, or None if not provided.
     /// Read-only and permissionless.

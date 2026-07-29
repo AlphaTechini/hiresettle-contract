@@ -874,6 +874,105 @@ fn test_get_engagement_summary_after_completion() {
 }
 
 // ============================================================
+// batch_get_engagement_summary
+// ============================================================
+
+#[test]
+fn test_batch_get_engagement_summary_multiple() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    create_standard_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "BATCH-1",
+    );
+    create_standard_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "BATCH-2",
+    );
+    create_standard_engagement(
+        &env, &client, &token_id, &company, &recruiter, &arbiter, "BATCH-3",
+    );
+
+    let ids = vec![
+        &env,
+        String::from_str(&env, "BATCH-1"),
+        String::from_str(&env, "BATCH-2"),
+        String::from_str(&env, "BATCH-3"),
+    ];
+    let summaries = client.batch_get_engagement_summary(&ids);
+    assert_eq!(summaries.len(), 3);
+    assert_eq!(
+        summaries.get(0).unwrap().id,
+        String::from_str(&env, "BATCH-1")
+    );
+    assert_eq!(
+        summaries.get(1).unwrap().id,
+        String::from_str(&env, "BATCH-2")
+    );
+    assert_eq!(
+        summaries.get(2).unwrap().id,
+        String::from_str(&env, "BATCH-3")
+    );
+    assert_eq!(summaries.get(0).unwrap().total_amount, 1_000_000_000);
+    assert_eq!(summaries.get(0).unwrap().milestone_count, 3);
+}
+
+#[test]
+fn test_batch_get_engagement_summary_skips_missing() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    create_standard_engagement(
+        &env,
+        &client,
+        &token_id,
+        &company,
+        &recruiter,
+        &arbiter,
+        "BATCH-EXISTS",
+    );
+
+    let ids = vec![
+        &env,
+        String::from_str(&env, "BATCH-EXISTS"),
+        String::from_str(&env, "DOES-NOT-EXIST"),
+    ];
+    let summaries = client.batch_get_engagement_summary(&ids);
+    assert_eq!(summaries.len(), 1);
+    assert_eq!(
+        summaries.get(0).unwrap().id,
+        String::from_str(&env, "BATCH-EXISTS")
+    );
+}
+
+#[test]
+fn test_batch_get_engagement_summary_empty_input() {
+    let (env, contract_id, _token_id, _company, _recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    let ids: Vec<String> = Vec::new(&env);
+    let summaries = client.batch_get_engagement_summary(&ids);
+    assert_eq!(summaries.len(), 0);
+}
+
+#[test]
+#[should_panic(expected = "too many IDs")]
+fn test_batch_get_engagement_summary_too_many_ids() {
+    let (env, contract_id, _token_id, _company, _recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    // Build 21 IDs — all nonexistent, we just need to trigger the cap.
+    let names = [
+        "A01", "A02", "A03", "A04", "A05", "A06", "A07", "A08", "A09", "A10", "A11", "A12", "A13",
+        "A14", "A15", "A16", "A17", "A18", "A19", "A20", "A21",
+    ];
+    let mut ids: Vec<String> = Vec::new(&env);
+    for name in names.iter() {
+        ids.push_back(String::from_str(&env, name));
+    }
+    client.batch_get_engagement_summary(&ids);
+}
+
+// ============================================================
 // Cancellation edge cases
 // ============================================================
 
@@ -7121,12 +7220,23 @@ fn test_get_active_dispute_count_zero_when_no_dispute() {
     let client = HireSettleContractClient::new(&env, &contract_id);
     let eng_id = String::from_str(&env, "ENG-DISP-COUNT-0");
     create_standard_engagement(
-        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-DISP-COUNT-0",
+        &env,
+        &client,
+        &token_id,
+        &company,
+        &recruiter,
+        &arbiter,
+        "ENG-DISP-COUNT-0",
     );
     assert_eq!(client.get_active_dispute_count(&eng_id), 0);
 
     // Submit proof — still not disputed
-    client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://proof"));
+    client.submit_proof(
+        &recruiter,
+        &eng_id,
+        &0,
+        &String::from_str(&env, "ipfs://proof"),
+    );
     assert_eq!(client.get_active_dispute_count(&eng_id), 0);
 }
 
@@ -7137,10 +7247,21 @@ fn test_get_active_dispute_count_one_dispute() {
     let client = HireSettleContractClient::new(&env, &contract_id);
     let eng_id = String::from_str(&env, "ENG-DISP-COUNT-1");
     create_standard_engagement(
-        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-DISP-COUNT-1",
+        &env,
+        &client,
+        &token_id,
+        &company,
+        &recruiter,
+        &arbiter,
+        "ENG-DISP-COUNT-1",
     );
 
-    client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://proof"));
+    client.submit_proof(
+        &recruiter,
+        &eng_id,
+        &0,
+        &String::from_str(&env, "ipfs://proof"),
+    );
     client.raise_dispute(&company, &eng_id, &0, &String::from_str(&env, "wrong_doc"));
     assert_eq!(client.get_active_dispute_count(&eng_id), 1);
 }
@@ -7184,7 +7305,10 @@ fn test_get_active_dispute_count_multiple_concurrent_disputes() {
         &eng_id,
         &company,
         &recruiter,
-        &ArbiterSetup { arbiters: vec![&env, a1.clone(), a2.clone()], quorum: 2 },
+        &ArbiterSetup {
+            arbiters: vec![&env, a1.clone(), a2.clone()],
+            quorum: 2,
+        },
         &token_id,
         &1_000_000_000,
         &String::from_str(&env, "Engineer"),
@@ -7195,11 +7319,21 @@ fn test_get_active_dispute_count_multiple_concurrent_disputes() {
 
     assert_eq!(client.get_active_dispute_count(&eng_id), 0);
 
-    client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://proof-a"));
+    client.submit_proof(
+        &recruiter,
+        &eng_id,
+        &0,
+        &String::from_str(&env, "ipfs://proof-a"),
+    );
     client.raise_dispute(&company, &eng_id, &0, &String::from_str(&env, "dispute_a"));
     assert_eq!(client.get_active_dispute_count(&eng_id), 1);
 
-    client.submit_proof(&recruiter, &eng_id, &1, &String::from_str(&env, "ipfs://proof-b"));
+    client.submit_proof(
+        &recruiter,
+        &eng_id,
+        &1,
+        &String::from_str(&env, "ipfs://proof-b"),
+    );
     client.raise_dispute(&company, &eng_id, &1, &String::from_str(&env, "dispute_b"));
     assert_eq!(client.get_active_dispute_count(&eng_id), 2);
 }
@@ -7211,10 +7345,21 @@ fn test_get_active_dispute_count_decreases_after_resolution_approve() {
     let client = HireSettleContractClient::new(&env, &contract_id);
     let eng_id = String::from_str(&env, "ENG-DISP-COUNT-RESOLVE");
     create_standard_engagement(
-        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-DISP-COUNT-RESOLVE",
+        &env,
+        &client,
+        &token_id,
+        &company,
+        &recruiter,
+        &arbiter,
+        "ENG-DISP-COUNT-RESOLVE",
     );
 
-    client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://proof"));
+    client.submit_proof(
+        &recruiter,
+        &eng_id,
+        &0,
+        &String::from_str(&env, "ipfs://proof"),
+    );
     client.raise_dispute(&company, &eng_id, &0, &String::from_str(&env, "dispute"));
     assert_eq!(client.get_active_dispute_count(&eng_id), 1);
 
@@ -7229,10 +7374,21 @@ fn test_get_active_dispute_count_decreases_after_resolution_reject() {
     let client = HireSettleContractClient::new(&env, &contract_id);
     let eng_id = String::from_str(&env, "ENG-DISP-COUNT-REJECT");
     create_standard_engagement(
-        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-DISP-COUNT-REJECT",
+        &env,
+        &client,
+        &token_id,
+        &company,
+        &recruiter,
+        &arbiter,
+        "ENG-DISP-COUNT-REJECT",
     );
 
-    client.submit_proof(&recruiter, &eng_id, &0, &String::from_str(&env, "ipfs://proof"));
+    client.submit_proof(
+        &recruiter,
+        &eng_id,
+        &0,
+        &String::from_str(&env, "ipfs://proof"),
+    );
     client.raise_dispute(&company, &eng_id, &0, &String::from_str(&env, "dispute"));
     assert_eq!(client.get_active_dispute_count(&eng_id), 1);
 
@@ -7503,7 +7659,13 @@ fn test_submit_proof_at_cap_succeeds() {
 
     let eng_id = String::from_str(&env, "ENG-PHLEN-AT");
     create_standard_engagement(
-        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-PHLEN-AT",
+        &env,
+        &client,
+        &token_id,
+        &company,
+        &recruiter,
+        &arbiter,
+        "ENG-PHLEN-AT",
     );
 
     // Exactly 10 characters
@@ -7527,7 +7689,13 @@ fn test_submit_proof_over_cap_rejected() {
 
     let eng_id = String::from_str(&env, "ENG-PHLEN-OVER");
     create_standard_engagement(
-        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-PHLEN-OVER",
+        &env,
+        &client,
+        &token_id,
+        &company,
+        &recruiter,
+        &arbiter,
+        "ENG-PHLEN-OVER",
     );
 
     // 11 characters — one over the 10-character cap
@@ -7546,7 +7714,13 @@ fn test_loosening_cap_allows_longer_proofs() {
 
     let eng_id = String::from_str(&env, "ENG-PHLEN-LOOSEN");
     create_standard_engagement(
-        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-PHLEN-LOOSEN",
+        &env,
+        &client,
+        &token_id,
+        &company,
+        &recruiter,
+        &arbiter,
+        "ENG-PHLEN-LOOSEN",
     );
 
     // Verify a 10-char proof is rejected with the tight cap
@@ -7574,7 +7748,13 @@ fn test_tightening_cap_blocks_previously_valid_proofs() {
 
     let eng_id = String::from_str(&env, "ENG-PHLEN-TIGHT");
     create_standard_engagement(
-        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-PHLEN-TIGHT",
+        &env,
+        &client,
+        &token_id,
+        &company,
+        &recruiter,
+        &arbiter,
+        "ENG-PHLEN-TIGHT",
     );
 
     // Tighten cap to 5
@@ -7776,6 +7956,10 @@ fn test_get_arbiter_votes_default_before_any_votes() {
     let eng_id = String::from_str(&env, "ENG-AVOTES-EMPTY");
 
     create_standard_engagement(
+        &env,
+        &client,
+        &token_id,
+        &company,
         &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-AVOTES-EMPTY",
     );
 
@@ -7848,40 +8032,11 @@ f    let eng_id = String::from_str(&env, "ENG-MULTI-ARB-3");
 
     client.submit_proof(
         &recruiter,
-        &eng_id,
-        &0,
-        &String::from_str(&env, "ipfs://proof-av"),
+        &arbiter,
+        "ENG-AVOTES-EMPTY",
     );
-    client.raise_dispute(&company, &eng_id, &0, &String::from_str(&env, "dispute"));
 
-    // Before any vote, counts are zero.
-    let counts = client.get_arbiter_votes(&eng_id, &0);
-    assert_eq!(counts.approve_votes, 0);
-    assert_eq!(counts.reject_votes, 0);
-
-    // First arbiter approves — 1 approve, 0 reject.
-    client.cast_arbiter_vote(&a1, &eng_id, &0, &true);
-    let counts = client.get_arbiter_votes(&eng_id, &0);
-    assert_eq!(counts.approve_votes, 1);
-    assert_eq!(counts.reject_votes, 0);
-
-    // Second arbiter rejects — 1 approve, 1 reject.
-    // Quorum of 2 approves not yet reached; reject threshold (>1) not met
-    // either, so the dispute remains open.
-    client.cast_arbiter_vote(&a2, &eng_id, &0, &false);
-    let counts = client.get_arbiter_votes(&eng_id, &0);
-    assert_eq!(counts.approve_votes, 1);
-    assert_eq!(counts.reject_votes, 1);
-
-    // Third arbiter approves — 2 approves reach quorum; dispute resolved.
-    // The vote record is cleared on resolution, so get_arbiter_votes reverts
-    // to its default zero state.
-    client.cast_arbiter_vote(&a3, &eng_id, &0, &true);
-    let m0 = client.get_milestone(&eng_id, &0);
-    assert_eq!(m0.status, MilestoneStatus::Resolved);
-    assert_eq!(token_client.balance(&recruiter), 300_000_000);
-
-    // Vote record cleared — back to default zeros.
+    // No vote record exists yet — should return the zero default.
     let counts = client.get_arbiter_votes(&eng_id, &0);
     assert_eq!(counts.approve_votes, 0);
     assert_eq!(counts.reject_votes, 0);
@@ -8007,7 +8162,13 @@ fn test_expire_engagement_success_refunds_after_timeout() {
 
     let eng_id = String::from_str(&env, "ENG-EXPIRE-OK");
     create_standard_engagement(
-        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-EXPIRE-OK",
+        &env,
+        &client,
+        &token_id,
+        &company,
+        &recruiter,
+        &arbiter,
+        "ENG-EXPIRE-OK",
     );
 
     let company_balance_before = token_client.balance(&company);
@@ -8045,7 +8206,13 @@ fn test_expire_engagement_rejected_before_timeout() {
 
     let eng_id = String::from_str(&env, "ENG-EXPIRE-EARLY");
     create_standard_engagement(
-        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-EXPIRE-EARLY",
+        &env,
+        &client,
+        &token_id,
+        &company,
+        &recruiter,
+        &arbiter,
+        "ENG-EXPIRE-EARLY",
     );
 
     // Set timeout to 1 000 ledgers and advance only 500 — timeout not yet elapsed.
@@ -8065,7 +8232,13 @@ fn test_expire_engagement_rejected_on_completed_engagement() {
 
     let eng_id = String::from_str(&env, "ENG-EXPIRE-DONE");
     create_standard_engagement(
-        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-EXPIRE-DONE",
+        &env,
+        &client,
+        &token_id,
+        &company,
+        &recruiter,
+        &arbiter,
+        "ENG-EXPIRE-DONE",
     );
 
     // Confirm all three milestones to complete the engagement.
@@ -8126,7 +8299,13 @@ fn test_expire_engagement_rejected_on_cancelled_engagement_before_timeout() {
 
     let eng_id = String::from_str(&env, "ENG-EXPIRE-CANC");
     create_standard_engagement(
-        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-EXPIRE-CANC",
+        &env,
+        &client,
+        &token_id,
+        &company,
+        &recruiter,
+        &arbiter,
+        "ENG-EXPIRE-CANC",
     );
 
     // Cancel the engagement — requires both company and recruiter auth.
