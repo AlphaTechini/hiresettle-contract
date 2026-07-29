@@ -150,6 +150,22 @@ pub struct AmendmentProposal {
 /// Alias for the frontend-facing name used by `get_pending_amendment`.
 pub type PendingAmendment = AmendmentProposal;
 
+/// A pending milestone extension proposal, awaiting company approval (issue #247).
+/// Recruiter-initiated: proposes adding `additional_ledgers` to a Locked retention
+/// milestone's `valid_after_ledger`, pushing its unlock deadline further out.
+#[contracttype]
+#[derive(Clone)]
+pub struct MilestoneExtensionProposal {
+    /// The recruiter who proposed the extension.
+    pub proposer: Address,
+    /// Number of additional ledgers to add to `valid_after_ledger` on acceptance.
+    pub additional_ledgers: u32,
+    /// Ledger when the proposal was made.
+    pub proposed_at_ledger: u32,
+    /// Ledger at which the proposal expires if not accepted.
+    pub expires_at_ledger: u32,
+}
+
 /// The full engagement record stored on-chain — note that `proof_submitted_at` on
 /// each milestone is set by `submit_proof` and consumed by `force_confirm_milestone`.
 #[contracttype]
@@ -196,6 +212,8 @@ pub struct Engagement {
     /// Optional off-chain attestation hash (e.g. SHA-256 of the contract PDF).
     /// Stored at engagement creation for audit and verification purposes.
     pub contract_pdf_hash: Option<String>,
+    /// Optional list of short string tags for categorization (issue #248, #249).
+    pub tags: Option<Vec<String>>,
 }
 
 /// A lightweight read-only view of an engagement, suitable for list/dashboard APIs.
@@ -230,6 +248,8 @@ pub struct EngagementSummary {
     pub recruiter_split_bps: u32,
     /// Optional off-chain attestation hash (e.g. SHA-256 of the contract PDF).
     pub contract_pdf_hash: Option<String>,
+    /// Optional list of short string tags for categorization (issue #248, #249).
+    pub tags: Option<Vec<String>>,
 }
 
 /// Per-dispute, per-milestone vote tally stored on-chain until the dispute resolves.
@@ -323,6 +343,18 @@ pub struct EngagementConfig {
     /// Optional off-chain attestation hash (e.g. SHA-256 of the contract PDF).
     /// Must be non-empty if provided.
     pub contract_pdf_hash: Option<String>,
+    /// Optional list of short string tags for off-chain categorization (issue #248, #249).
+    pub tags: Option<Vec<String>>,
+}
+
+/// Returned by `get_contract_health` for quick off-chain diagnostics (issue #256).
+#[contracttype]
+#[derive(Clone)]
+pub struct ContractHealth {
+    pub paused: bool,
+    pub admin: Address,
+    pub version: String,
+    pub total_engagement_count: u64,
 }
 
 // ============================================================
@@ -411,12 +443,33 @@ pub enum DataKey {
     CompanyActiveCount(Address),
     /// Admin-configurable maximum number of replacements allowed per engagement (issue #31, default 3).
     MaxReplacements,
+    /// Per-tag list of engagement IDs (issue #249).
+    EngagementTag(String),
+    /// Optional co-signer address authorized to perform company-gated actions (issue #254).
+    CompanyCosigner(Address),
+    /// Active milestone extension proposal for a Locked retention milestone,
+    /// awaiting company approval (issue #247).
+    MilestoneExtensionProposal(String, u32),
+    /// Admin-configurable TTL extension for milestone extension proposals (issue #247).
+    MilestoneExtensionTTL,
+    /// Admin-configurable super-arbiter address for tie-breaking escalated
+    /// disputes (issue #246).
+    SuperArbiter,
+    /// Ledger at which a dispute was raised for (engagement_id, milestone_index),
+    /// used to determine when the dispute window has elapsed (issue #246).
+    DisputeRaisedAt(String, u32),
+    /// Whether a disputed (engagement_id, milestone_index) has been auto-escalated
+    /// to the super arbiter (issue #246).
+    EscalatedDispute(String, u32),
+    /// Per-tag index mapping tag string to list of engagement IDs (issue #248, #249).
+    TagEngagements(String),
 }
 
 // ============================================================
 // CONTRACT
 // ============================================================
 
+/// Milestone-based recruiter fee escrow contract.
 #[contract]
 pub struct HireSettleContract;
 
@@ -439,6 +492,13 @@ const MAX_ENGAGEMENT_ID_LENGTH: u32 = 64;
 const DEFAULT_MAX_ACTIVE_PER_COMPANY: u32 = 50;
 /// Default maximum number of replacements allowed per engagement (issue #31).
 const DEFAULT_MAX_REPLACEMENTS: u32 = 3;
+/// Default TTL, in ledgers, for a pending milestone extension proposal (issue #247).
+/// Mirrors `AmendmentTTL`'s default.
+const DEFAULT_EXTENSION_TTL: u32 = 17_280;
+/// Maximum number of tags stored on an engagement (issue #248).
+const MAX_TAGS: u32 = 10;
+/// Maximum length, in characters, of a single engagement tag (issue #248).
+const MAX_TAG_LENGTH: u32 = 32;
 
 /// Shared panic message constants for the most-repeated error strings
 /// (issue #171). Keeping these as constants means a typo can't silently
@@ -627,6 +687,25 @@ impl HireSettleContract {
         Self::get_admin_internal(&env)
     }
 
+    /// Return a single diagnostic snapshot of the contract's health (issue #256).
+    /// Returns paused state, admin, version, and total engagement count in one call.
+    pub fn get_contract_health(env: Env) -> ContractHealth {
+        ContractHealth {
+            paused: Self::is_paused_internal(&env),
+            admin: Self::get_admin_internal(&env),
+            version: env
+                .storage()
+                .persistent()
+                .get(&DataKey::Version)
+                .unwrap_or_else(|| String::from_str(&env, DEFAULT_VERSION)),
+            total_engagement_count: env
+                .storage()
+                .instance()
+                .get(&DataKey::EngagementCount)
+                .unwrap_or(0u64),
+        }
+    }
+
     // ----------------------------------------------------------
     // ADMIN CONFIG
     // ----------------------------------------------------------
@@ -761,6 +840,21 @@ impl HireSettleContract {
                     let name_str = core::str::from_utf8(&name_buf[..name_len]).unwrap_or("");
                     panic!("DuplicateMilestoneName: {}", name_str);
                 }
+            }
+        }
+
+        // Issue #248: engagement tags validation — bounded count and length so
+        // storage stays predictable regardless of caller input.
+        if config.tags.len() > MAX_TAGS {
+            panic!("TooManyTags");
+        }
+        for i in 0..config.tags.len() {
+            let tag = config.tags.get(i).unwrap();
+            if tag.len() == 0 {
+                panic!("TagEmpty: index {}", i);
+            }
+            if tag.len() > MAX_TAG_LENGTH {
+                panic!("TagTooLong: index {}", i);
             }
         }
 
@@ -922,6 +1016,7 @@ impl HireSettleContract {
             co_recruiter: config.co_recruiter,
             recruiter_split_bps: config.recruiter_split_bps,
             contract_pdf_hash: config.contract_pdf_hash,
+            tags: config.tags.clone(),
         };
 
         env.storage()
@@ -978,6 +1073,40 @@ impl HireSettleContract {
             &DataKey::RecruiterEngagements(recruiter.clone()),
             &recruiter_ids,
         );
+
+        // Issue #248 & #249: append engagement_id to per-tag indices.
+        if let Some(ref tags) = config.tags {
+            if tags.len() > 10 {
+                panic!("TooManyTags");
+            }
+            let mut seen_tags = Vec::new(&env);
+            for i in 0..tags.len() {
+                let t = tags.get(i).unwrap();
+                if t.len() == 0 {
+                    panic!("TagEmpty");
+                }
+                if t.len() > 32 {
+                    panic!("TagTooLong");
+                }
+                if !seen_tags.contains(&t) {
+                    seen_tags.push_back(t.clone());
+                    let mut tag_ids: Vec<String> = env
+                        .storage()
+                        .persistent()
+                        .get(&DataKey::TagEngagements(t.clone()))
+                        .unwrap_or_else(|| Vec::new(&env));
+                    tag_ids.push_back(engagement_id.clone());
+                    env.storage()
+                        .persistent()
+                        .set(&DataKey::TagEngagements(t.clone()), &tag_ids);
+                    env.storage().persistent().extend_ttl(
+                        &DataKey::TagEngagements(t.clone()),
+                        100_000,
+                        6_300_000,
+                    );
+                }
+            }
+        }
         env.storage().persistent().extend_ttl(
             &DataKey::RecruiterEngagements(recruiter.clone()),
             100_000,
@@ -1241,7 +1370,7 @@ impl HireSettleContract {
             panic!("{}", ERR_ENGAGEMENT_NOT_ACTIVE);
         }
 
-        if company != engagement.company {
+        if !Self::is_authorized_company(&env, &company, &engagement.company) {
             panic!("{}", ERR_UNAUTHORIZED);
         }
 
@@ -1411,7 +1540,7 @@ impl HireSettleContract {
             panic!("{}", ERR_ENGAGEMENT_NOT_ACTIVE);
         }
 
-        if company != engagement.company {
+        if !Self::is_authorized_company(&env, &company, &engagement.company) {
             panic!("{}", ERR_UNAUTHORIZED);
         }
 
@@ -1440,6 +1569,13 @@ impl HireSettleContract {
         env.storage().persistent().set(
             &DataKey::DisputeReason(engagement_id.clone(), milestone_index),
             &reason.clone(),
+        );
+
+        // Issue #246: record when the dispute was raised so `escalate_dispute`
+        // can measure elapsed time against the dispute window.
+        env.storage().persistent().set(
+            &DataKey::DisputeRaisedAt(engagement_id.clone(), milestone_index),
+            &current_ledger,
         );
 
         env.storage()
@@ -1573,6 +1709,14 @@ impl HireSettleContract {
                 engagement_id.clone(),
                 milestone_index,
             ));
+            env.storage().persistent().remove(&DataKey::DisputeRaisedAt(
+                engagement_id.clone(),
+                milestone_index,
+            ));
+            env.storage().persistent().remove(&DataKey::EscalatedDispute(
+                engagement_id.clone(),
+                milestone_index,
+            ));
 
             env.events().publish(
                 (Symbol::new(&env, "dispute_resolved"), engagement_id.clone()),
@@ -1609,6 +1753,14 @@ impl HireSettleContract {
                 engagement_id.clone(),
                 milestone_index,
             ));
+            env.storage().persistent().remove(&DataKey::DisputeRaisedAt(
+                engagement_id.clone(),
+                milestone_index,
+            ));
+            env.storage().persistent().remove(&DataKey::EscalatedDispute(
+                engagement_id.clone(),
+                milestone_index,
+            ));
 
             env.events().publish(
                 (Symbol::new(&env, "dispute_resolved"), engagement_id.clone()),
@@ -1626,6 +1778,307 @@ impl HireSettleContract {
             env.storage()
                 .persistent()
                 .extend_ttl(&vote_key, 100_000, 6_300_000);
+        }
+
+        engagement.last_activity_ledger = env.ledger().sequence();
+        env.storage()
+            .persistent()
+            .set(&DataKey::Engagement(engagement_id.clone()), &engagement);
+        Self::extend_engagement_ttl(&env, &engagement_id);
+    }
+
+    // ----------------------------------------------------------
+    // DISPUTE AUTO-ESCALATION TO SUPER ARBITER (issue #246)
+    // ----------------------------------------------------------
+
+    /// Admin sets (or replaces) the super-arbiter address used to break ties
+    /// on escalated disputes.
+    pub fn set_super_arbiter(env: Env, admin: Address, super_arbiter: Address) {
+        Self::assert_admin(&env, &admin);
+        env.storage()
+            .instance()
+            .set(&DataKey::SuperArbiter, &super_arbiter);
+        env.events().publish(
+            (Symbol::new(&env, "super_arbiter_set"),),
+            super_arbiter,
+        );
+    }
+
+    /// Return the currently configured super-arbiter address, if any.
+    pub fn get_super_arbiter(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::SuperArbiter)
+    }
+
+    /// Return whether a disputed milestone has been auto-escalated to the
+    /// super arbiter.
+    pub fn is_dispute_escalated(env: Env, engagement_id: String, milestone_index: u32) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::EscalatedDispute(engagement_id, milestone_index))
+            .unwrap_or(false)
+    }
+
+    /// Permissionlessly escalate a disputed milestone to the configured
+    /// super arbiter once arbiter votes remain split (neither quorum nor the
+    /// rejection threshold reached) past the dispute window, measured from
+    /// when the dispute was raised. Mirrors the permissionless shape of
+    /// `unlock_milestone` — anyone can trigger it once the condition holds.
+    ///
+    /// # Panics
+    /// - `"engagement is not active"` — engagement status is not `Active`.
+    /// - `"milestone is not in disputed status"` — the milestone isn't `Disputed`.
+    /// - `"DisputeWindowNotElapsed"` — the dispute window has not yet elapsed
+    ///   since the dispute was raised.
+    /// - `"dispute already resolvable without escalation"` — votes already
+    ///   satisfy the quorum or rejection threshold; call `cast_arbiter_vote`
+    ///   (any further vote) to resolve normally instead.
+    /// - `"no super arbiter configured"` — the admin has not set a super arbiter.
+    pub fn escalate_dispute(env: Env, engagement_id: String, milestone_index: u32) {
+        Self::assert_not_paused(&env);
+
+        let engagement = Self::get_engagement_internal(&env, &engagement_id);
+
+        if engagement.status != EngagementStatus::Active {
+            panic!("{}", ERR_ENGAGEMENT_NOT_ACTIVE);
+        }
+
+        if !Self::is_authorized_company(&env, &company, &engagement.company) {
+            panic!("{}", ERR_UNAUTHORIZED);
+        }
+
+        let placement_confirmed = {
+            let m0 = engagement.milestones.get(0).unwrap();
+            m0.status == MilestoneStatus::Confirmed || m0.status == MilestoneStatus::Resolved
+        };
+        let milestone = Self::get_milestone_or_panic(&engagement, milestone_index);
+
+        if milestone.status != MilestoneStatus::Disputed {
+            panic!("milestone is not in disputed status");
+        }
+
+        let raised_at: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DisputeRaisedAt(
+                engagement_id.clone(),
+                milestone_index,
+            ))
+            .unwrap_or_else(|| panic!("no dispute in progress"));
+
+        let dispute_window = env
+            .storage()
+            .instance()
+            .get(&DataKey::DisputeWindow)
+            .unwrap_or(DEFAULT_DISPUTE_WINDOW_LEDGERS);
+
+        let current_ledger = env.ledger().sequence();
+        if current_ledger <= raised_at + dispute_window {
+            panic!("DisputeWindowNotElapsed");
+        }
+
+        let vote_key = DataKey::ArbiterVotes(engagement_id.clone(), milestone_index);
+        let record: ArbiterVoteRecord =
+            env.storage()
+                .persistent()
+                .get(&vote_key)
+                .unwrap_or(ArbiterVoteRecord {
+                    approve_votes: 0,
+                    reject_votes: 0,
+                    voted: Vec::new(&env),
+                });
+
+        let total_arbiters = engagement.arbiters.len();
+        let quorum = engagement.quorum;
+        if record.approve_votes >= quorum || record.reject_votes > total_arbiters - quorum {
+            panic!("dispute already resolvable without escalation");
+        }
+
+        let super_arbiter: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::SuperArbiter)
+            .unwrap_or_else(|| panic!("no super arbiter configured"));
+
+        env.storage().persistent().set(
+            &DataKey::EscalatedDispute(engagement_id.clone(), milestone_index),
+            &true,
+        );
+        env.storage().persistent().extend_ttl(
+            &DataKey::EscalatedDispute(engagement_id.clone(), milestone_index),
+            100_000,
+            6_300_000,
+        );
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "dispute_escalated"),
+                engagement_id.clone(),
+            ),
+            (milestone_index, super_arbiter),
+        );
+    }
+
+    /// The configured super arbiter casts a tie-breaking resolution on an
+    /// escalated dispute. `approve` mirrors `cast_arbiter_vote`'s semantics:
+    /// `true` releases payment to the recruiter (milestone → `Resolved`);
+    /// `false` clears the proof and returns the milestone to `Pending`.
+    ///
+    /// # Panics
+    /// - `"unauthorized"` — caller is not the configured super arbiter.
+    /// - `"engagement is not active"` — engagement status is not `Active`.
+    /// - `"milestone is not in disputed status"` — the milestone isn't `Disputed`.
+    /// - `"dispute has not been escalated"` — `escalate_dispute` has not been
+    ///   called for this milestone yet.
+    pub fn super_arbiter_resolve(
+        env: Env,
+        super_arbiter: Address,
+        engagement_id: String,
+        milestone_index: u32,
+        approve: bool,
+    ) {
+        Self::assert_not_paused(&env);
+        super_arbiter.require_auth();
+
+        let configured: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::SuperArbiter)
+            .unwrap_or_else(|| panic!("no super arbiter configured"));
+        if super_arbiter != configured {
+            panic!("{}", ERR_UNAUTHORIZED);
+        }
+
+        let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
+
+        if engagement.status != EngagementStatus::Active {
+            panic!("{}", ERR_ENGAGEMENT_NOT_ACTIVE);
+        }
+
+        let mut milestone = Self::get_milestone_or_panic(&engagement, milestone_index);
+
+        if milestone.status != MilestoneStatus::Disputed {
+            panic!("milestone is not in disputed status");
+        }
+
+        let escalated_key = DataKey::EscalatedDispute(engagement_id.clone(), milestone_index);
+        let escalated: bool = env.storage().persistent().get(&escalated_key).unwrap_or(false);
+        if !escalated {
+            panic!("dispute has not been escalated");
+        }
+
+        let vote_key = DataKey::ArbiterVotes(engagement_id.clone(), milestone_index);
+
+        if approve {
+            let payment = (engagement.total_amount * milestone.payment_percent as i128) / 100;
+            engagement.released_amount += payment;
+
+            let arbiter_fee_bps: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::ArbiterFee)
+                .unwrap_or(0u32);
+            let arbiter_fee_amount = (payment * arbiter_fee_bps as i128) / 10_000;
+            let net_payment = payment - arbiter_fee_amount;
+
+            let token_client = token::Client::new(&env, &engagement.token);
+            if arbiter_fee_amount > 0 {
+                token_client.transfer(
+                    &env.current_contract_address(),
+                    &super_arbiter,
+                    &arbiter_fee_amount,
+                );
+            }
+            Self::distribute_recruiter_payout(&env, &engagement, net_payment, &token_client);
+
+            let old_status = milestone.status.clone();
+            milestone.status = MilestoneStatus::Resolved;
+            engagement.milestones.set(milestone_index, milestone);
+
+            let all_done = (0..engagement.milestones.len()).all(|i| {
+                let s = engagement.milestones.get(i).unwrap().status;
+                s == MilestoneStatus::Confirmed || s == MilestoneStatus::Resolved
+            });
+            let old_engagement_status = engagement.status.clone();
+            if all_done {
+                engagement.status = EngagementStatus::Completed;
+                Self::decrement_company_active_count(&env, &engagement.company);
+            }
+
+            env.storage().persistent().remove(&vote_key);
+            env.storage().persistent().remove(&DataKey::DisputeReason(
+                engagement_id.clone(),
+                milestone_index,
+            ));
+            env.storage().persistent().remove(&DataKey::DisputeRaisedAt(
+                engagement_id.clone(),
+                milestone_index,
+            ));
+            env.storage().persistent().remove(&escalated_key);
+
+            env.events().publish(
+                (Symbol::new(&env, "dispute_resolved"), engagement_id.clone()),
+                (milestone_index, true),
+            );
+            env.events().publish(
+                (
+                    Symbol::new(&env, "dispute_escalation_resolved"),
+                    engagement_id.clone(),
+                ),
+                (milestone_index, super_arbiter.clone(), true),
+            );
+            Self::emit_milestone_status_changed(
+                &env,
+                &engagement_id,
+                milestone_index,
+                old_status,
+                MilestoneStatus::Resolved,
+            );
+            Self::emit_engagement_status_changed(
+                &env,
+                &engagement_id,
+                old_engagement_status,
+                engagement.status.clone(),
+            );
+        } else {
+            let old_status = milestone.status.clone();
+            milestone.status = MilestoneStatus::Pending;
+            milestone.proof_hash = String::from_str(&env, "");
+            milestone.proof_submitted_at = 0;
+            engagement.milestones.set(milestone_index, milestone);
+
+            env.storage().persistent().remove(&vote_key);
+            env.storage().persistent().remove(&DataKey::LastProofAt(
+                engagement_id.clone(),
+                milestone_index,
+            ));
+            env.storage().persistent().remove(&DataKey::DisputeReason(
+                engagement_id.clone(),
+                milestone_index,
+            ));
+            env.storage().persistent().remove(&DataKey::DisputeRaisedAt(
+                engagement_id.clone(),
+                milestone_index,
+            ));
+            env.storage().persistent().remove(&escalated_key);
+
+            env.events().publish(
+                (Symbol::new(&env, "dispute_resolved"), engagement_id.clone()),
+                (milestone_index, false),
+            );
+            env.events().publish(
+                (
+                    Symbol::new(&env, "dispute_escalation_resolved"),
+                    engagement_id.clone(),
+                ),
+                (milestone_index, super_arbiter.clone(), false),
+            );
+            Self::emit_milestone_status_changed(
+                &env,
+                &engagement_id,
+                milestone_index,
+                old_status,
+                MilestoneStatus::Pending,
+            );
         }
 
         engagement.last_activity_ledger = env.ledger().sequence();
@@ -1752,6 +2205,12 @@ impl HireSettleContract {
                             env.storage()
                                 .persistent()
                                 .remove(&DataKey::DisputeReason(engagement_id.clone(), i));
+                            env.storage()
+                                .persistent()
+                                .remove(&DataKey::DisputeRaisedAt(engagement_id.clone(), i));
+                            env.storage()
+                                .persistent()
+                                .remove(&DataKey::EscalatedDispute(engagement_id.clone(), i));
                         }
                     }
                 }
@@ -1837,6 +2296,50 @@ impl HireSettleContract {
     /// Returns `DEFAULT_MAX_REPLACEMENTS` (3) when not configured.
     pub fn get_max_replacements(env: Env) -> u32 {
         Self::get_max_replacements_internal(&env)
+    }
+
+    // ----------------------------------------------------------
+    // ISSUE #43 — COMPANY TRANSFER
+    // ----------------------------------------------------------
+    // ISSUE #254 — COMPANY MULTI-SIGNER SUPPORT
+    // ----------------------------------------------------------
+
+    /// Register a co-signer address that is also authorized to perform
+    /// company-gated actions (confirm, dispute, cancel, etc.) on behalf
+    /// of this company. Only the company address itself can set the cosigner.
+    pub fn set_company_cosigner(env: Env, company: Address, cosigner: Address) {
+        company.require_auth();
+        env.storage().persistent().set(
+            &DataKey::CompanyCosigner(company.clone()),
+            &cosigner,
+        );
+        env.events().publish(
+            (Symbol::new(&env, "company_cosigner_set"),),
+            (company, cosigner),
+        );
+    }
+
+    /// Return the registered co-signer for a company, or `None` if none set.
+    pub fn get_company_cosigner(env: Env, company: Address) -> Option<Address> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::CompanyCosigner(company))
+    }
+
+    /// Internal helper: check if `caller` is either the engagement's company
+    /// or the company's registered co-signer.
+    fn is_authorized_company(env: &Env, caller: &Address, engagement_company: &Address) -> bool {
+        if caller == engagement_company {
+            return true;
+        }
+        let cosigner: Option<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CompanyCosigner(engagement_company.clone()));
+        match cosigner {
+            Some(c) => caller == &c,
+            None => false,
+        }
     }
 
     // ----------------------------------------------------------
@@ -1969,7 +2472,7 @@ impl HireSettleContract {
 
         let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
 
-        if company != engagement.company {
+        if !Self::is_authorized_company(&env, &company, &engagement.company) {
             panic!("{}", ERR_UNAUTHORIZED);
         }
 
@@ -2077,7 +2580,7 @@ impl HireSettleContract {
             panic!("{}", ERR_ENGAGEMENT_NOT_ACTIVE);
         }
 
-        if company != engagement.company {
+        if !Self::is_authorized_company(&env, &company, &engagement.company) {
             panic!("{}", ERR_UNAUTHORIZED);
         }
 
@@ -2150,7 +2653,7 @@ impl HireSettleContract {
             panic!("{}", ERR_ENGAGEMENT_NOT_ACTIVE);
         }
 
-        if company != engagement.company {
+        if !Self::is_authorized_company(&env, &company, &engagement.company) {
             panic!("{}", ERR_UNAUTHORIZED);
         }
 
@@ -2360,6 +2863,7 @@ impl HireSettleContract {
             co_recruiter: engagement.co_recruiter,
             recruiter_split_bps: engagement.recruiter_split_bps,
             contract_pdf_hash: engagement.contract_pdf_hash,
+            tags: engagement.tags,
         }
     }
 
@@ -2412,6 +2916,12 @@ impl HireSettleContract {
     /// Read-only and permissionless.
     pub fn get_contract_pdf_hash(env: Env, engagement_id: String) -> Option<String> {
         Self::get_engagement_internal(&env, &engagement_id).contract_pdf_hash
+    }
+
+    /// Return the off-chain categorization tags stored at engagement creation
+    /// (issue #248). Empty if none were provided. Read-only and permissionless.
+    pub fn get_tags(env: Env, engagement_id: String) -> Vec<String> {
+        Self::get_engagement_internal(&env, &engagement_id).tags
     }
 
     // ----------------------------------------------------------
@@ -2542,6 +3052,109 @@ impl HireSettleContract {
     }
 
     // ----------------------------------------------------------
+    // ADMIN ARBITER REPLACEMENT (issue #245)
+    // ----------------------------------------------------------
+
+    /// Emergency, admin-gated replacement of a non-responsive arbiter slot,
+    /// bypassing the nominate/claim succession flow. Intended for cases where
+    /// an arbiter is unreachable and a dispute is blocked waiting on their vote.
+    ///
+    /// # Caller
+    /// `admin` — must be the current contract admin.
+    ///
+    /// # Panics
+    /// - `"engagement is in a terminal state"` — the engagement is `Completed`,
+    ///   `Cancelled`, or `Expired`.
+    /// - `"ArbiterNotFound"` — `old_arbiter` is not in the engagement's arbiter list.
+    /// - `"CompanyArbiterCollision"` / `"RecruiterArbiterCollision"` — `new_arbiter`
+    ///   is the engagement's company or recruiter.
+    /// - `"DuplicateArbiter"` — `new_arbiter` is already an arbiter on this engagement.
+    pub fn admin_replace_arbiter(
+        env: Env,
+        admin: Address,
+        engagement_id: String,
+        old_arbiter: Address,
+        new_arbiter: Address,
+    ) {
+        Self::assert_not_paused(&env);
+        Self::assert_admin(&env, &admin);
+
+        let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
+
+        if Self::is_terminal_status(&engagement.status) {
+            panic!("engagement is in a terminal state");
+        }
+
+        if new_arbiter == engagement.company {
+            panic!("CompanyArbiterCollision");
+        }
+        if new_arbiter == engagement.recruiter {
+            panic!("RecruiterArbiterCollision");
+        }
+        for i in 0..engagement.arbiters.len() {
+            if engagement.arbiters.get(i).unwrap() == new_arbiter {
+                panic!("DuplicateArbiter");
+            }
+        }
+
+        let mut found = false;
+        for i in 0..engagement.arbiters.len() {
+            if engagement.arbiters.get(i).unwrap() == old_arbiter {
+                engagement.arbiters.set(i, new_arbiter.clone());
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            panic!("ArbiterNotFound");
+        }
+
+        // Migrate the seat's vote identity on any dispute currently in progress,
+        // mirroring `claim_arbiter` (issue #178) — otherwise the replaced
+        // arbiter's cast vote no longer matches any address in
+        // `engagement.arbiters`, but `new_arbiter` also isn't in `voted`, so
+        // the duplicate-vote check would let it cast a second vote for the
+        // same seat.
+        for i in 0..engagement.milestones.len() {
+            if engagement.milestones.get(i).unwrap().status == MilestoneStatus::Disputed {
+                let vote_key = DataKey::ArbiterVotes(engagement_id.clone(), i);
+                if let Some(mut record) = env
+                    .storage()
+                    .persistent()
+                    .get::<DataKey, ArbiterVoteRecord>(&vote_key)
+                {
+                    for j in 0..record.voted.len() {
+                        if record.voted.get(j).unwrap() == old_arbiter {
+                            record.voted.set(j, new_arbiter.clone());
+                        }
+                    }
+                    env.storage().persistent().set(&vote_key, &record);
+                }
+            }
+        }
+
+        // A pending succession nomination for the replaced seat is no longer
+        // meaningful once the admin has intervened directly.
+        env.storage()
+            .persistent()
+            .remove(&DataKey::PendingArbiter(engagement_id.clone()));
+
+        engagement.last_activity_ledger = env.ledger().sequence();
+        env.storage()
+            .persistent()
+            .set(&DataKey::Engagement(engagement_id.clone()), &engagement);
+        Self::extend_engagement_ttl(&env, &engagement_id);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "arbiter_admin_replaced"),
+                engagement_id.clone(),
+            ),
+            (old_arbiter, new_arbiter),
+        );
+    }
+
+    // ----------------------------------------------------------
     // AMENDMENT PROPOSAL MANAGEMENT
     // ----------------------------------------------------------
 
@@ -2602,7 +3215,9 @@ impl HireSettleContract {
 
         let engagement = Self::get_engagement_internal(&env, &engagement_id);
 
-        if proposer != engagement.company && proposer != engagement.recruiter {
+        if !Self::is_authorized_company(&env, &proposer, &engagement.company)
+            && proposer != engagement.recruiter
+        {
             panic!("{}", ERR_UNAUTHORIZED);
         }
 
@@ -2670,7 +3285,9 @@ impl HireSettleContract {
 
         let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
 
-        if acceptor != engagement.company && acceptor != engagement.recruiter {
+        if !Self::is_authorized_company(&env, &acceptor, &engagement.company)
+            && acceptor != engagement.recruiter
+        {
             panic!("{}", ERR_UNAUTHORIZED);
         }
 
@@ -2790,7 +3407,9 @@ impl HireSettleContract {
 
         let engagement = Self::get_engagement_internal(&env, &engagement_id);
 
-        if rejector != engagement.company && rejector != engagement.recruiter {
+        if !Self::is_authorized_company(&env, &rejector, &engagement.company)
+            && rejector != engagement.recruiter
+        {
             panic!("{}", ERR_UNAUTHORIZED);
         }
 
@@ -2855,6 +3474,265 @@ impl HireSettleContract {
     ) -> Option<PendingAmendment> {
         let key = DataKey::AmendmentProposal(engagement_id, milestone_index);
         match env.storage().persistent().get::<_, AmendmentProposal>(&key) {
+            Some(proposal) if env.ledger().sequence() <= proposal.expires_at_ledger => {
+                Some(proposal)
+            }
+            _ => None,
+        }
+    }
+
+    // ----------------------------------------------------------
+    // MILESTONE EXTENSION REQUEST (issue #247)
+    // ----------------------------------------------------------
+
+    /// Admin sets the milestone extension proposal TTL in ledgers.
+    /// Default is 17,280 ledgers (~1 day).
+    pub fn set_extension_ttl(env: Env, admin: Address, ledgers: u32) {
+        Self::assert_admin(&env, &admin);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::MilestoneExtensionTTL, &ledgers);
+
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::MilestoneExtensionTTL, 100_000, 6_300_000);
+    }
+
+    /// Get the current milestone extension proposal TTL in ledgers.
+    /// Returns `DEFAULT_EXTENSION_TTL` (17,280) if not yet set.
+    pub fn get_extension_ttl(env: Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MilestoneExtensionTTL)
+            .unwrap_or(DEFAULT_EXTENSION_TTL)
+    }
+
+    /// Recruiter requests additional ledgers be added to a Locked retention
+    /// milestone's unlock deadline (`valid_after_ledger`), subject to company
+    /// approval. Mirrors the propose-then-accept shape of `propose_amendment`
+    /// / `accept_amendment`, but is one-directional: only the recruiter may
+    /// propose, and only the company may accept or reject.
+    ///
+    /// Only one pending extension proposal may exist per milestone; a new
+    /// proposal overwrites any existing one.
+    ///
+    /// # Panics
+    /// - `"unauthorized"` — caller is not the engagement's recruiter.
+    /// - `"engagement is not active"` — engagement status is not `Active`.
+    /// - `"only retention milestones can be extended"` — the milestone is a
+    ///   `Placement` milestone.
+    /// - `"milestone is not locked"` — the milestone has already unlocked
+    ///   (or otherwise progressed) and no longer has a meaningful deadline to extend.
+    /// - `"additional ledgers must be greater than zero"` — `additional_ledgers` is 0.
+    pub fn propose_milestone_extension(
+        env: Env,
+        recruiter: Address,
+        engagement_id: String,
+        milestone_index: u32,
+        additional_ledgers: u32,
+    ) {
+        Self::assert_not_paused(&env);
+        recruiter.require_auth();
+
+        let engagement = Self::get_engagement_internal(&env, &engagement_id);
+
+        if engagement.status != EngagementStatus::Active {
+            panic!("{}", ERR_ENGAGEMENT_NOT_ACTIVE);
+        }
+
+        if recruiter != engagement.recruiter {
+            panic!("{}", ERR_UNAUTHORIZED);
+        }
+
+        let milestone = Self::get_milestone_or_panic(&engagement, milestone_index);
+
+        if milestone.kind != MilestoneKind::Retention {
+            panic!("only retention milestones can be extended");
+        }
+
+        if milestone.status != MilestoneStatus::Locked {
+            panic!("milestone is not locked");
+        }
+
+        if additional_ledgers == 0 {
+            panic!("additional ledgers must be greater than zero");
+        }
+
+        let current_ledger = env.ledger().sequence();
+        let ttl = Self::get_extension_ttl(env.clone());
+
+        let proposal = MilestoneExtensionProposal {
+            proposer: recruiter.clone(),
+            additional_ledgers,
+            proposed_at_ledger: current_ledger,
+            expires_at_ledger: current_ledger + ttl,
+        };
+
+        env.storage().persistent().set(
+            &DataKey::MilestoneExtensionProposal(engagement_id.clone(), milestone_index),
+            &proposal,
+        );
+
+        env.storage().persistent().extend_ttl(
+            &DataKey::MilestoneExtensionProposal(engagement_id.clone(), milestone_index),
+            100_000,
+            6_300_000,
+        );
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "milestone_extension_proposed"),
+                engagement_id.clone(),
+            ),
+            (
+                milestone_index,
+                recruiter,
+                additional_ledgers,
+                current_ledger + ttl,
+            ),
+        );
+    }
+
+    /// Company accepts a pending milestone extension proposal, applying the
+    /// extension immediately by adding `additional_ledgers` to the milestone's
+    /// `valid_after_ledger`.
+    ///
+    /// # Panics
+    /// - `"unauthorized"` — caller is not the engagement's company.
+    /// - `"no pending milestone extension proposal"` — no proposal exists for
+    ///   this milestone.
+    /// - `"milestone_extension_expired"` — the proposal's TTL has elapsed;
+    ///   the proposal is cleared and an `milestone_extension_rejected` event
+    ///   is emitted before panicking.
+    /// - `"milestone is not locked"` — the milestone progressed since the
+    ///   proposal was made and no longer has a deadline to extend.
+    pub fn accept_milestone_extension(
+        env: Env,
+        company: Address,
+        engagement_id: String,
+        milestone_index: u32,
+    ) {
+        Self::assert_not_paused(&env);
+        company.require_auth();
+
+        let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
+
+        if company != engagement.company {
+            panic!("{}", ERR_UNAUTHORIZED);
+        }
+
+        let proposal_key =
+            DataKey::MilestoneExtensionProposal(engagement_id.clone(), milestone_index);
+        let proposal: MilestoneExtensionProposal = env
+            .storage()
+            .persistent()
+            .get(&proposal_key)
+            .unwrap_or_else(|| panic!("no pending milestone extension proposal"));
+
+        let current_ledger = env.ledger().sequence();
+
+        if current_ledger > proposal.expires_at_ledger {
+            env.storage().persistent().remove(&proposal_key);
+
+            env.events().publish(
+                (
+                    Symbol::new(&env, "milestone_extension_rejected"),
+                    engagement_id.clone(),
+                ),
+                (milestone_index, company, Symbol::new(&env, "expired")),
+            );
+
+            panic!("milestone_extension_expired");
+        }
+
+        let mut milestone = Self::get_milestone_or_panic(&engagement, milestone_index);
+
+        if milestone.status != MilestoneStatus::Locked {
+            panic!("milestone is not locked");
+        }
+
+        let old_valid_after_ledger = milestone.valid_after_ledger;
+        milestone.valid_after_ledger += proposal.additional_ledgers;
+        let new_valid_after_ledger = milestone.valid_after_ledger;
+        engagement.milestones.set(milestone_index, milestone);
+        engagement.last_activity_ledger = current_ledger;
+
+        env.storage().persistent().remove(&proposal_key);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Engagement(engagement_id.clone()), &engagement);
+        Self::extend_engagement_ttl(&env, &engagement_id);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "milestone_extension_accepted"),
+                engagement_id.clone(),
+            ),
+            (
+                milestone_index,
+                company,
+                old_valid_after_ledger,
+                new_valid_after_ledger,
+            ),
+        );
+    }
+
+    /// Company rejects a pending milestone extension proposal.
+    ///
+    /// # Panics
+    /// - `"unauthorized"` — caller is not the engagement's company.
+    /// - `"no pending milestone extension proposal"` — no proposal exists for
+    ///   this milestone.
+    pub fn reject_milestone_extension(
+        env: Env,
+        company: Address,
+        engagement_id: String,
+        milestone_index: u32,
+    ) {
+        Self::assert_not_paused(&env);
+        company.require_auth();
+
+        let engagement = Self::get_engagement_internal(&env, &engagement_id);
+
+        if company != engagement.company {
+            panic!("{}", ERR_UNAUTHORIZED);
+        }
+
+        let proposal_key =
+            DataKey::MilestoneExtensionProposal(engagement_id.clone(), milestone_index);
+        let _: MilestoneExtensionProposal = env
+            .storage()
+            .persistent()
+            .get(&proposal_key)
+            .unwrap_or_else(|| panic!("no pending milestone extension proposal"));
+
+        env.storage().persistent().remove(&proposal_key);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "milestone_extension_rejected"),
+                engagement_id.clone(),
+            ),
+            (milestone_index, company, Symbol::new(&env, "declined")),
+        );
+    }
+
+    /// Get the current pending milestone extension proposal for a milestone,
+    /// if one exists and has not expired. Returns `None` when there is no
+    /// active proposal or the proposal's TTL has elapsed (treated as non-existent).
+    pub fn get_pending_milestone_extension(
+        env: Env,
+        engagement_id: String,
+        milestone_index: u32,
+    ) -> Option<MilestoneExtensionProposal> {
+        let key = DataKey::MilestoneExtensionProposal(engagement_id, milestone_index);
+        match env
+            .storage()
+            .persistent()
+            .get::<_, MilestoneExtensionProposal>(&key)
+        {
             Some(proposal) if env.ledger().sequence() <= proposal.expires_at_ledger => {
                 Some(proposal)
             }
@@ -3020,7 +3898,7 @@ impl HireSettleContract {
         company.require_auth();
 
         let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
-        Self::assert_exit_request_pending(&engagement, &company);
+        Self::assert_exit_request_pending(&env, &company, &engagement);
 
         let refund = engagement.total_amount - engagement.released_amount;
         if refund > 0 {
@@ -3081,7 +3959,7 @@ impl HireSettleContract {
         company.require_auth();
 
         let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
-        Self::assert_exit_request_pending(&engagement, &company);
+        Self::assert_exit_request_pending(&env, &company, &engagement);
 
         let old_engagement_status = engagement.status.clone();
         engagement.status = EngagementStatus::Active;
@@ -3213,6 +4091,124 @@ impl HireSettleContract {
     }
 
     // ----------------------------------------------------------
+    // ISSUE #249 — ENGAGEMENT TAGS
+    // ----------------------------------------------------------
+
+    /// Add a tag to an engagement. Only the engagement's company (or its
+    /// registered co-signer) may tag the engagement.
+    /// Duplicate tags are silently ignored.
+    pub fn add_engagement_tag(
+        env: Env,
+        caller: Address,
+        engagement_id: String,
+        tag: String,
+    ) {
+        caller.require_auth();
+        let engagement = Self::get_engagement_internal(&env, &engagement_id);
+        if !Self::is_authorized_company(&env, &caller, &engagement.company) {
+            panic!("{}", ERR_UNAUTHORIZED);
+        }
+
+        let key = DataKey::EngagementTag(tag.clone());
+        let mut ids: Vec<String> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        for i in 0..ids.len() {
+            if ids.get(i).unwrap() == engagement_id {
+                return;
+            }
+        }
+        ids.push_back(engagement_id.clone());
+        env.storage().persistent().set(&key, &ids);
+        env.events().publish(
+            (Symbol::new(&env, "engagement_tag_added"), tag),
+            engagement_id,
+        );
+    }
+
+    /// Remove a tag from an engagement. Only the engagement's company (or its
+    /// registered co-signer) may remove a tag.
+    /// No-op if the tag was not present.
+    pub fn remove_engagement_tag(
+        env: Env,
+        caller: Address,
+        engagement_id: String,
+        tag: String,
+    ) {
+        caller.require_auth();
+        let engagement = Self::get_engagement_internal(&env, &engagement_id);
+        if !Self::is_authorized_company(&env, &caller, &engagement.company) {
+            panic!("{}", ERR_UNAUTHORIZED);
+        }
+
+        let key = DataKey::EngagementTag(tag.clone());
+        let ids: Vec<String> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut new_ids = Vec::new(&env);
+        let mut found = false;
+        for i in 0..ids.len() {
+            let id = ids.get(i).unwrap();
+            if id == engagement_id {
+                found = true;
+            } else {
+                new_ids.push_back(id);
+            }
+        }
+        if found {
+            env.storage().persistent().set(&key, &new_ids);
+            env.events().publish(
+                (Symbol::new(&env, "engagement_tag_removed"), tag),
+                engagement_id,
+            );
+        }
+    }
+
+    /// Return a paginated slice of engagement IDs for a given tag.
+    /// `page` is 0-indexed; out-of-range pages return an empty vec.
+    pub fn get_engagements_by_tag(
+        env: Env,
+        tag: String,
+        page: u32,
+        page_size: u32,
+    ) -> Vec<String> {
+        let ids: Vec<String> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EngagementTag(tag))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let total = ids.len();
+        if page_size == 0 {
+            return Vec::new(&env);
+        }
+        let start = page.saturating_mul(page_size);
+        if start >= total {
+            return Vec::new(&env);
+        }
+        let end = start.saturating_add(page_size).min(total);
+        let mut result = Vec::new(&env);
+        for i in start..end {
+            result.push_back(ids.get(i).unwrap());
+        }
+        result
+    }
+
+    /// Return the total number of engagements tagged with a given tag.
+    pub fn get_engagement_tag_count(env: Env, tag: String) -> u32 {
+        let ids: Vec<String> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EngagementTag(tag))
+            .unwrap_or_else(|| Vec::new(&env));
+        ids.len()
+    }
+
+4    // ----------------------------------------------------------
     // ISSUE #41 — CONFIGURABLE LEDGERS PER DAY
     // ----------------------------------------------------------
 
@@ -3538,7 +4534,7 @@ impl HireSettleContract {
             panic!("{}", ERR_ENGAGEMENT_NOT_ACTIVE);
         }
 
-        if company != engagement.company {
+        if !Self::is_authorized_company(&env, &company, &engagement.company) {
             panic!("{}", ERR_UNAUTHORIZED);
         }
 
@@ -4073,11 +5069,11 @@ impl HireSettleContract {
     /// the engagement must be `ExitRequested` and `company` must match the
     /// engagement's company. Used by both `accept_early_exit` and
     /// `reject_early_exit` (issue #173).
-    fn assert_exit_request_pending(engagement: &Engagement, company: &Address) {
+    fn assert_exit_request_pending(env: &Env, company: &Address, engagement: &Engagement) {
         if engagement.status != EngagementStatus::ExitRequested {
             panic!("no exit request pending");
         }
-        if company != &engagement.company {
+        if !Self::is_authorized_company(env, company, &engagement.company) {
             panic!("{}", ERR_UNAUTHORIZED);
         }
     }
