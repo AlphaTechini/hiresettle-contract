@@ -8427,3 +8427,28 @@ fn test_arbiter_fee_deducted_on_dispute_approval() {
         a2_balance_before + 3_000_000
     );
 }
+
+// ============================================================
+// ISSUE #16 — CONTRACT VERSION STRING
+// ============================================================
+
+#[test]
+fn test_set_and_get_version() {
+    let (env, contract_id, _token_id, company, _recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    // Default value
+    assert_eq!(client.get_version(), String::from_str(&env, "0.2.0"));
+
+    client.set_version(&company, &String::from_str(&env, "1.0.0"));
+    assert_eq!(client.get_version(), String::from_str(&env, "1.0.0"));
+}
+
+#[test]
+#[should_panic(expected = "unauthorized")]
+fn test_set_version_requires_admin() {
+    let (env, contract_id, _token_id, _company, recruiter, _arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    client.set_version(&recruiter, &String::from_str(&env, "1.0.0"));
+}
