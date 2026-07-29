@@ -441,6 +441,52 @@ claim_arbiter()
 
 Only the nominated address can complete the claim. Once claimed, the successor assumes the arbiter's position for future dispute voting while preserving the integrity of the arbitration panel.
 
+### Early Exit
+
+The early-exit protocol allows a **recruiter** to request a graceful exit from an engagement before all milestones are completed. It is a three-step flow involving both the recruiter and the company.
+
+#### Step 1 -- Recruiter requests early exit
+
+```text
+request_early_exit(recruiter, engagement_id)
+```
+
+**Caller:** Recruiter (must match the engagement's recruiter and sign the transaction).
+
+The engagement must be in `Active` status. On success, the engagement transitions to `ExitRequested`. No funds are moved at this stage.
+
+#### Step 2a -- Company accepts
+
+```text
+accept_early_exit(company, engagement_id)
+```
+
+**Caller:** Company (must match the engagement's company and sign the transaction).
+
+On acceptance:
+
+- The recruiter **keeps** all payments already released for confirmed or resolved milestones (`released_amount`).
+- The remaining escrow balance (`total_amount - released_amount`) is **refunded** to the company.
+- The engagement status moves to `Cancelled` (terminal).
+
+#### Step 2b -- Company rejects
+
+```text
+reject_early_exit(company, engagement_id)
+```
+
+**Caller:** Company.
+
+On rejection, the engagement returns to `Active` and the recruiter must continue working through the remaining milestones. No funds are moved.
+
+#### Payment split summary
+
+| Scenario | Recruiter receives | Company receives |
+|---|---|---|
+| Accepted (partial progress) | `released_amount` (already paid) | `total_amount - released_amount` (refund) |
+| Accepted (no milestones done) | Nothing | Full `total_amount` refund |
+| Rejected | N/A -- engagement continues | N/A -- engagement continues |
+
 ### Read-Only Queries
 
 All read-only functions are permissionless and require no authentication.
