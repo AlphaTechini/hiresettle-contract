@@ -212,6 +212,10 @@ pub struct Engagement {
     /// Optional off-chain attestation hash (e.g. SHA-256 of the contract PDF).
     /// Stored at engagement creation for audit and verification purposes.
     pub contract_pdf_hash: Option<String>,
+    /// Optional referrer address set at creation time (issue #251).
+    /// If present and recognised by the admin-configured referral list,
+    /// a configurable fee discount is applied to every milestone payout.
+    pub referrer: Option<Address>,
     /// Optional list of short string tags for categorization (issue #248, #249).
     pub tags: Option<Vec<String>>,
 }
@@ -248,6 +252,8 @@ pub struct EngagementSummary {
     pub recruiter_split_bps: u32,
     /// Optional off-chain attestation hash (e.g. SHA-256 of the contract PDF).
     pub contract_pdf_hash: Option<String>,
+    /// Optional referrer address (issue #251).
+    pub referrer: Option<Address>,
     /// Optional list of short string tags for categorization (issue #248, #249).
     pub tags: Option<Vec<String>>,
 }
@@ -355,6 +361,9 @@ pub struct EngagementConfig {
     /// Optional off-chain attestation hash (e.g. SHA-256 of the contract PDF).
     /// Must be non-empty if provided.
     pub contract_pdf_hash: Option<String>,
+    /// Optional referrer address (issue #251). If present and in the
+    /// admin-configured referral list, the engagement receives a fee discount.
+    pub referrer: Option<Address>,
     /// Optional list of short string tags for off-chain categorization (issue #248, #249).
     pub tags: Option<Vec<String>>,
 }
@@ -1077,6 +1086,7 @@ impl HireSettleContract {
             co_recruiter: config.co_recruiter,
             recruiter_split_bps: config.recruiter_split_bps,
             contract_pdf_hash: config.contract_pdf_hash,
+            referrer: config.referrer,
             tags: config.tags.clone(),
         };
 
@@ -1467,6 +1477,7 @@ impl HireSettleContract {
         if payment > 0 {
             let platform_fee = Self::get_platform_fee_internal(&env);
             let effective_bps =
+                Self::apply_referral_discount(&env, platform_fee.bps, &engagement.referrer);
                 Self::resolve_platform_fee_bps(&env, platform_fee.bps, engagement.total_amount);
             let fee_amount = (payment * effective_bps as i128) / 10_000;
             let net_payment = payment - fee_amount;
