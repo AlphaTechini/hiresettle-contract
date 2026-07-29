@@ -8316,9 +8316,7 @@ fn test_expire_engagement_rejected_on_cancelled_engagement_before_timeout() {
     client.expire_engagement(&eng_id);
 }
 
-// ============================================================
-// ISSUE #52 / #149 — ARBITER FEE TESTS
-// ============================================================
+
 
 /// Admin can set the arbiter fee and get_arbiter_fee reflects it.
 #[test]

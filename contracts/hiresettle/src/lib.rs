@@ -484,6 +484,19 @@ pub enum DataKey {
     EscalatedDispute(String, u32),
     /// Per-tag index mapping tag string to list of engagement IDs (issue #248, #249).
     TagEngagements(String),
+    /// Admin-configurable due-soon notification window in ledgers (issue #241,
+    /// default 17_280 — ~1 day).
+    DueSoonWindow,
+    /// Set once a `milestone_due_soon` event has been emitted for
+    /// (engagement_id, milestone_index), so the notification fires at most once
+    /// per unlock deadline (issue #241).
+    DueSoonNotified(String, u32),
+    /// Whether a single engagement is quarantined by the admin (issue #239).
+    /// Independent of the global `Paused` flag.
+    EngagementPaused(String),
+    /// Global ordered list of every engagement ID ever created (issue #237).
+    /// Backs `get_engagement_ids_by_status`.
+    AllEngagements,
 }
 
 // ============================================================
@@ -516,6 +529,10 @@ const DEFAULT_MAX_REPLACEMENTS: u32 = 3;
 /// Default TTL, in ledgers, for a pending milestone extension proposal (issue #247).
 /// Mirrors `AmendmentTTL`'s default.
 const DEFAULT_EXTENSION_TTL: u32 = 17_280;
+/// Default due-soon notification window in ledgers (issue #241): a Retention
+/// milestone becomes "due soon" once it is within this many ledgers of its
+/// `valid_after_ledger`. ~1 day at 5 s/ledger.
+const DEFAULT_DUE_SOON_WINDOW_LEDGERS: u32 = 17_280;
 /// Maximum number of tags stored on an engagement (issue #248).
 const MAX_TAGS: u32 = 10;
 /// Maximum length, in characters, of a single engagement tag (issue #248).
@@ -528,6 +545,10 @@ const MAX_TAG_LENGTH: u32 = 32;
 const ERR_UNAUTHORIZED: &str = "unauthorized";
 const ERR_ENGAGEMENT_NOT_ACTIVE: &str = "engagement is not active";
 const ERR_INVALID_MILESTONE_INDEX: &str = "invalid milestone index";
+/// Raised when an operation targets an engagement the admin has quarantined
+/// via `pause_engagement` (issue #239). Distinct from `"ContractPaused"` so
+/// off-chain callers can tell a single-engagement freeze from a global halt.
+const ERR_ENGAGEMENT_PAUSED: &str = "EngagementPaused";
 
 #[contractimpl]
 impl HireSettleContract {
@@ -712,6 +733,111 @@ impl HireSettleContract {
     /// Return true if the contract is currently paused.
     pub fn is_paused(env: Env) -> bool {
         Self::is_paused_internal(&env)
+    }
+
+    // ----------------------------------------------------------
+    // ISSUE #239 — PER-ENGAGEMENT PAUSE (QUARANTINE)
+    // ----------------------------------------------------------
+
+    /// Quarantine a single engagement, blocking its state-changing operations
+    /// without halting the rest of the contract (issue #239).
+    ///
+    /// # Caller
+    /// `admin` — must be the current contract admin.
+    ///
+    /// # Scope
+    /// While quarantined, every engagement-lifecycle call for this ID is
+    /// rejected with `"EngagementPaused"`: milestone unlock / proof submission /
+    /// confirmation (including batch and force-confirm), disputes and arbiter
+    /// voting, escalation, replacements, amendments, milestone extensions,
+    /// role transfers, escrow top-ups, early exit, cancellation, and expiry.
+    ///
+    /// Deliberately still permitted:
+    /// - **Read-only queries** — quarantine must not blind indexers or the
+    ///   parties to the engagement's state.
+    /// - **`admin_replace_arbiter`** — quarantine is frequently *because* the
+    ///   arbiter panel is the problem; the admin keeps the tool to fix it.
+    /// - **`pause_engagement` / `unpause_engagement`** themselves, so the admin
+    ///   can always lift the freeze.
+    ///
+    /// This is orthogonal to the global [`Self::pause`]: an engagement can be
+    /// quarantined while the contract runs normally, and unpausing the contract
+    /// does not lift a per-engagement quarantine. Both guards must pass for a
+    /// call to proceed.
+    ///
+    /// Pausing an already-paused engagement is a no-op that still emits the
+    /// event, so the admin can re-assert quarantine idempotently.
+    ///
+    /// # Panics
+    /// - `"unauthorized"` — caller is not the contract admin.
+    /// - `"engagement not found"` — no engagement exists with this ID.
+    ///
+    /// # Events
+    /// Emits `("engagement_paused", engagement_id)` with the acting admin.
+    pub fn pause_engagement(env: Env, admin: Address, engagement_id: String) {
+        Self::assert_admin(&env, &admin);
+
+        // Reject unknown IDs so a typo cannot silently create a quarantine
+        // record that later blocks a legitimately created engagement.
+        let _ = Self::get_engagement_internal(&env, &engagement_id);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::EngagementPaused(engagement_id.clone()), &true);
+        env.storage().persistent().extend_ttl(
+            &DataKey::EngagementPaused(engagement_id.clone()),
+            100_000,
+            6_300_000,
+        );
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "engagement_paused"),
+                engagement_id.clone(),
+            ),
+            admin,
+        );
+    }
+
+    /// Lift the quarantine on a single engagement (issue #239), returning it to
+    /// normal operation. Unpausing an engagement that is not paused is a no-op
+    /// that still emits the event.
+    ///
+    /// Note this has no bearing on the global pause — if the contract itself is
+    /// paused, the engagement stays blocked by `"ContractPaused"`.
+    ///
+    /// # Panics
+    /// - `"unauthorized"` — caller is not the contract admin.
+    /// - `"engagement not found"` — no engagement exists with this ID.
+    ///
+    /// # Events
+    /// Emits `("engagement_unpaused", engagement_id)` with the acting admin.
+    pub fn unpause_engagement(env: Env, admin: Address, engagement_id: String) {
+        Self::assert_admin(&env, &admin);
+
+        let _ = Self::get_engagement_internal(&env, &engagement_id);
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::EngagementPaused(engagement_id.clone()));
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "engagement_unpaused"),
+                engagement_id.clone(),
+            ),
+            admin,
+        );
+    }
+
+    /// Return `true` if this specific engagement is quarantined (issue #239).
+    ///
+    /// Independent of [`Self::is_paused`] — check both to know whether a
+    /// state-changing call will be accepted. Read-only and permissionless;
+    /// unknown engagement IDs return `false` rather than panicking, so callers
+    /// can probe without a prior existence check.
+    pub fn is_engagement_paused(env: Env, engagement_id: String) -> bool {
+        Self::is_engagement_paused_internal(&env, &engagement_id)
     }
 
     /// Nominate a new admin. The nominee must call `claim_admin` to complete rotation.
@@ -915,16 +1041,18 @@ impl HireSettleContract {
 
         // Issue #248: engagement tags validation — bounded count and length so
         // storage stays predictable regardless of caller input.
-        if config.tags.len() > MAX_TAGS {
-            panic!("TooManyTags");
-        }
-        for i in 0..config.tags.len() {
-            let tag = config.tags.get(i).unwrap();
-            if tag.len() == 0 {
-                panic!("TagEmpty: index {}", i);
+        if let Some(ref tags) = config.tags {
+            if tags.len() > MAX_TAGS {
+                panic!("TooManyTags");
             }
-            if tag.len() > MAX_TAG_LENGTH {
-                panic!("TagTooLong: index {}", i);
+            for i in 0..tags.len() {
+                let tag = tags.get(i).unwrap();
+                if tag.len() == 0 {
+                    panic!("TagEmpty: index {}", i);
+                }
+                if tag.len() > MAX_TAG_LENGTH {
+                    panic!("TagTooLong: index {}", i);
+                }
             }
         }
 
@@ -1117,6 +1245,22 @@ impl HireSettleContract {
             .instance()
             .set(&DataKey::EngagementCount, &(count + 1));
 
+        // Issue #237: append engagement_id to the global index that backs
+        // `get_engagement_ids_by_status`. Kept separate from `EngagementCount`
+        // because that counter is a scalar and cannot be enumerated.
+        let mut all_ids: Vec<String> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AllEngagements)
+            .unwrap_or_else(|| Vec::new(&env));
+        all_ids.push_back(engagement_id.clone());
+        env.storage()
+            .persistent()
+            .set(&DataKey::AllEngagements, &all_ids);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::AllEngagements, 100_000, 6_300_000);
+
         // Issue #35: append engagement_id to the per-company index.
         let mut company_ids: Vec<String> = env
             .storage()
@@ -1147,18 +1291,12 @@ impl HireSettleContract {
 
         // Issue #248 & #249: append engagement_id to per-tag indices.
         if let Some(ref tags) = config.tags {
-            if tags.len() > 10 {
-                panic!("TooManyTags");
-            }
+            // Count/length were already validated above; here we only need to
+            // de-duplicate so a repeated tag doesn't list the engagement twice
+            // in the same per-tag index.
             let mut seen_tags = Vec::new(&env);
             for i in 0..tags.len() {
                 let t = tags.get(i).unwrap();
-                if t.len() == 0 {
-                    panic!("TagEmpty");
-                }
-                if t.len() > 32 {
-                    panic!("TagTooLong");
-                }
                 if !seen_tags.contains(&t) {
                     seen_tags.push_back(t.clone());
                     let mut tag_ids: Vec<String> = env
@@ -1223,6 +1361,7 @@ impl HireSettleContract {
     ///   before `valid_after_ledger`.
     pub fn unlock_milestone(env: Env, engagement_id: String, milestone_index: u32) {
         Self::assert_not_paused(&env);
+        Self::assert_engagement_not_paused(&env, &engagement_id);
         let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
 
         if engagement.status != EngagementStatus::Active {
@@ -1257,6 +1396,12 @@ impl HireSettleContract {
             .persistent()
             .set(&DataKey::Engagement(engagement_id.clone()), &engagement);
         Self::extend_engagement_ttl(&env, &engagement_id);
+
+        // The due-soon flag only guards against duplicate notifications for a
+        // pending deadline; once unlocked that deadline is spent, so drop the
+        // entry rather than leave it occupying storage. See issue #241.
+        Self::clear_due_soon_flag(&env, &engagement_id, milestone_index);
+
         Self::emit_milestone_status_changed(
             &env,
             &engagement_id,
@@ -1274,6 +1419,185 @@ impl HireSettleContract {
                 engagement_id.clone(),
             ),
             (milestone_index, valid_after_ledger, unlocked_at_ledger),
+        );
+    }
+
+    // ----------------------------------------------------------
+    // ISSUE #241 — MILESTONE DUE-SOON NOTIFICATION
+    // ----------------------------------------------------------
+
+    /// Admin sets the due-soon notification window in ledgers (issue #241).
+    ///
+    /// A `Locked` retention milestone becomes "due soon" once it is within this
+    /// many ledgers of its `valid_after_ledger`. Defaults to 17 280 (~1 day).
+    ///
+    /// Changing the window takes effect immediately for every engagement, but
+    /// does **not** retract notifications already emitted — a milestone that was
+    /// notified under a wider window stays flagged until its deadline moves or
+    /// it unlocks.
+    ///
+    /// # Panics
+    /// - `"unauthorized"` — caller is not the contract admin.
+    /// - `"InvalidDueSoonWindow"` — `ledgers` is 0, which would leave no lead
+    ///   time and make the notification useless.
+    pub fn set_due_soon_window(env: Env, admin: Address, ledgers: u32) {
+        Self::assert_admin(&env, &admin);
+        if ledgers == 0 {
+            panic!("InvalidDueSoonWindow");
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::DueSoonWindow, &ledgers);
+        env.events()
+            .publish((Symbol::new(&env, "due_soon_window_set"),), ledgers);
+    }
+
+    /// Return the current due-soon notification window in ledgers (issue #241).
+    /// Defaults to 17 280 (~1 day) when not configured.
+    pub fn get_due_soon_window(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::DueSoonWindow)
+            .unwrap_or(DEFAULT_DUE_SOON_WINDOW_LEDGERS)
+    }
+
+    /// Returns `true` when a milestone is inside its due-soon window: it is a
+    /// `Locked` `Retention` milestone whose `valid_after_ledger` is still in the
+    /// future but no more than `due_soon_window` ledgers away (issue #241).
+    ///
+    /// Returns `false` for `Placement` milestones, for milestones that already
+    /// progressed past `Locked`, and for milestones that are already unlockable
+    /// (use `is_milestone_unlockable` for that case).
+    ///
+    /// Read-only and permissionless.
+    pub fn is_milestone_due_soon(env: Env, engagement_id: String, milestone_index: u32) -> bool {
+        let engagement = Self::get_engagement_internal(&env, &engagement_id);
+        let milestone = Self::get_milestone_or_panic(&engagement, milestone_index);
+
+        if milestone.kind != MilestoneKind::Retention || milestone.status != MilestoneStatus::Locked
+        {
+            return false;
+        }
+
+        let current = env.ledger().sequence();
+        if current >= milestone.valid_after_ledger {
+            return false;
+        }
+
+        milestone.valid_after_ledger - current <= Self::get_due_soon_window(env.clone())
+    }
+
+    /// Returns `true` once `notify_milestone_due_soon` has fired for this
+    /// milestone's current deadline (issue #241). Keepers can poll this to skip
+    /// engagements that have already been announced.
+    ///
+    /// Resets to `false` whenever the deadline itself moves — an accepted
+    /// milestone extension, a replacement restarting the retention timer, or the
+    /// milestone unlocking.
+    pub fn is_milestone_due_soon_notified(
+        env: Env,
+        engagement_id: String,
+        milestone_index: u32,
+    ) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::DueSoonNotified(engagement_id, milestone_index))
+            .unwrap_or(false)
+    }
+
+    /// Emit a `milestone_due_soon` event for a retention milestone that is
+    /// approaching its unlock deadline (issue #241).
+    ///
+    /// # Caller
+    /// Anyone — this is a permissionless keeper function, mirroring
+    /// `unlock_milestone` and `escalate_dispute`. It exists so off-chain
+    /// notification services can subscribe to a single event stream instead of
+    /// polling `ledgers_until_unlock` for every locked milestone.
+    ///
+    /// # Behaviour
+    /// Fires at most **once per deadline**: the emission is recorded under
+    /// `DataKey::DueSoonNotified` and a second call panics. The record is
+    /// cleared whenever the deadline moves (extension accepted, replacement
+    /// requested) or the milestone unlocks, so a rescheduled milestone is
+    /// announced again for its new deadline.
+    ///
+    /// This call deliberately does **not** touch `last_activity_ledger`: it is a
+    /// notification, not engagement activity, and bumping it would let a keeper
+    /// postpone `expire_engagement` indefinitely.
+    ///
+    /// # Panics
+    /// - `"ContractPaused"` / `"EngagementPaused"` — contract or engagement is paused.
+    /// - `"engagement is not active"` — the engagement is not `Active`.
+    /// - `"only retention milestones can be due soon"` — milestone is a `Placement`.
+    /// - `"milestone is not locked"` — milestone already progressed past `Locked`.
+    /// - `"milestone is already unlockable"` — the deadline has passed; call
+    ///   `unlock_milestone` instead.
+    /// - `"DueSoonWindowNotReached"` — the milestone is further out than the
+    ///   configured window.
+    /// - `"DueSoonAlreadyNotified"` — this deadline was already announced.
+    ///
+    /// # Events
+    /// Emits `("milestone_due_soon", engagement_id)` with
+    /// `(milestone_index, valid_after_ledger, ledgers_remaining, window)`.
+    /// `ledgers_remaining` and `window` are included so a consumer can rank
+    /// urgency and reproduce the trigger condition without extra queries.
+    pub fn notify_milestone_due_soon(env: Env, engagement_id: String, milestone_index: u32) {
+        Self::assert_not_paused(&env);
+        Self::assert_engagement_not_paused(&env, &engagement_id);
+
+        let engagement = Self::get_engagement_internal(&env, &engagement_id);
+
+        if engagement.status != EngagementStatus::Active {
+            panic!("{}", ERR_ENGAGEMENT_NOT_ACTIVE);
+        }
+
+        let milestone = Self::get_milestone_or_panic(&engagement, milestone_index);
+
+        if milestone.kind != MilestoneKind::Retention {
+            panic!("only retention milestones can be due soon");
+        }
+
+        if milestone.status != MilestoneStatus::Locked {
+            panic!("milestone is not locked");
+        }
+
+        let current_ledger = env.ledger().sequence();
+        if current_ledger >= milestone.valid_after_ledger {
+            panic!("milestone is already unlockable");
+        }
+
+        let window = Self::get_due_soon_window(env.clone());
+        let ledgers_remaining = milestone.valid_after_ledger - current_ledger;
+        if ledgers_remaining > window {
+            panic!("DueSoonWindowNotReached");
+        }
+
+        let notified_key = DataKey::DueSoonNotified(engagement_id.clone(), milestone_index);
+        if env
+            .storage()
+            .persistent()
+            .get::<DataKey, bool>(&notified_key)
+            .unwrap_or(false)
+        {
+            panic!("DueSoonAlreadyNotified");
+        }
+
+        env.storage().persistent().set(&notified_key, &true);
+        env.storage()
+            .persistent()
+            .extend_ttl(&notified_key, 100_000, 6_300_000);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "milestone_due_soon"),
+                engagement_id.clone(),
+            ),
+            (
+                milestone_index,
+                milestone.valid_after_ledger,
+                ledgers_remaining,
+                window,
+            ),
         );
     }
 
@@ -1313,6 +1637,7 @@ impl HireSettleContract {
         proof_hash: String,
     ) {
         Self::assert_not_paused(&env);
+        Self::assert_engagement_not_paused(&env, &engagement_id);
 
         // Issue #20: Proof hash format validation (before require_auth for fail-fast)
         if proof_hash.len() == 0 {
@@ -1433,6 +1758,7 @@ impl HireSettleContract {
         milestone_index: u32,
     ) {
         Self::assert_not_paused(&env);
+        Self::assert_engagement_not_paused(&env, &engagement_id);
         company.require_auth();
 
         let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
@@ -1602,6 +1928,7 @@ impl HireSettleContract {
         milestone_index: u32,
         reason: String,
     ) {
+        Self::assert_engagement_not_paused(&env, &engagement_id);
         company.require_auth();
 
         if reason.len() > 128 {
@@ -1689,6 +2016,7 @@ impl HireSettleContract {
         approve: bool,
     ) {
         Self::assert_not_paused(&env);
+        Self::assert_engagement_not_paused(&env, &engagement_id);
         arbiter.require_auth();
 
         let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
@@ -1787,10 +2115,12 @@ impl HireSettleContract {
                 engagement_id.clone(),
                 milestone_index,
             ));
-            env.storage().persistent().remove(&DataKey::EscalatedDispute(
-                engagement_id.clone(),
-                milestone_index,
-            ));
+            env.storage()
+                .persistent()
+                .remove(&DataKey::EscalatedDispute(
+                    engagement_id.clone(),
+                    milestone_index,
+                ));
 
             env.events().publish(
                 (Symbol::new(&env, "dispute_resolved"), engagement_id.clone()),
@@ -1831,10 +2161,12 @@ impl HireSettleContract {
                 engagement_id.clone(),
                 milestone_index,
             ));
-            env.storage().persistent().remove(&DataKey::EscalatedDispute(
-                engagement_id.clone(),
-                milestone_index,
-            ));
+            env.storage()
+                .persistent()
+                .remove(&DataKey::EscalatedDispute(
+                    engagement_id.clone(),
+                    milestone_index,
+                ));
 
             env.events().publish(
                 (Symbol::new(&env, "dispute_resolved"), engagement_id.clone()),
@@ -1872,10 +2204,8 @@ impl HireSettleContract {
         env.storage()
             .instance()
             .set(&DataKey::SuperArbiter, &super_arbiter);
-        env.events().publish(
-            (Symbol::new(&env, "super_arbiter_set"),),
-            super_arbiter,
-        );
+        env.events()
+            .publish((Symbol::new(&env, "super_arbiter_set"),), super_arbiter);
     }
 
     /// Return the currently configured super-arbiter address, if any.
@@ -1909,6 +2239,7 @@ impl HireSettleContract {
     /// - `"no super arbiter configured"` — the admin has not set a super arbiter.
     pub fn escalate_dispute(env: Env, engagement_id: String, milestone_index: u32) {
         Self::assert_not_paused(&env);
+        Self::assert_engagement_not_paused(&env, &engagement_id);
 
         let engagement = Self::get_engagement_internal(&env, &engagement_id);
 
@@ -2011,6 +2342,7 @@ impl HireSettleContract {
         approve: bool,
     ) {
         Self::assert_not_paused(&env);
+        Self::assert_engagement_not_paused(&env, &engagement_id);
         super_arbiter.require_auth();
 
         let configured: Address = env
@@ -2035,7 +2367,11 @@ impl HireSettleContract {
         }
 
         let escalated_key = DataKey::EscalatedDispute(engagement_id.clone(), milestone_index);
-        let escalated: bool = env.storage().persistent().get(&escalated_key).unwrap_or(false);
+        let escalated: bool = env
+            .storage()
+            .persistent()
+            .get(&escalated_key)
+            .unwrap_or(false);
         if !escalated {
             panic!("dispute has not been escalated");
         }
@@ -2177,6 +2513,7 @@ impl HireSettleContract {
     /// a clean vote count instead of inheriting stale votes. See issue #177.
     pub fn request_replacement(env: Env, company: Address, engagement_id: String, reason: String) {
         Self::assert_not_paused(&env);
+        Self::assert_engagement_not_paused(&env, &engagement_id);
         company.require_auth();
 
         // Bound reason length so a single engagement cannot accumulate
@@ -2271,6 +2608,11 @@ impl HireSettleContract {
                         env.storage()
                             .persistent()
                             .remove(&DataKey::LastProofAt(engagement_id.clone(), i));
+
+                        // The retention timer just restarted, so a due-soon
+                        // notification emitted against the old deadline must not
+                        // suppress one for the new deadline. See issue #241.
+                        Self::clear_due_soon_flag(&env, &engagement_id, i);
 
                         if was_disputed {
                             env.storage()
@@ -2440,6 +2782,7 @@ impl HireSettleContract {
         new_company: Address,
     ) {
         Self::assert_not_paused(&env);
+        Self::assert_engagement_not_paused(&env, &engagement_id);
         current_company.require_auth();
 
         let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
@@ -2497,6 +2840,7 @@ impl HireSettleContract {
         new_recruiter: Address,
     ) {
         Self::assert_not_paused(&env);
+        Self::assert_engagement_not_paused(&env, &engagement_id);
         recruiter.require_auth();
 
         let engagement = Self::get_engagement_internal(&env, &engagement_id);
@@ -2542,6 +2886,7 @@ impl HireSettleContract {
     /// - `("recruiter_transferred", engagement_id)` with `(old_recruiter, new_recruiter)`.
     pub fn accept_recruiter_transfer(env: Env, company: Address, engagement_id: String) {
         Self::assert_not_paused(&env);
+        Self::assert_engagement_not_paused(&env, &engagement_id);
         company.require_auth();
 
         let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
@@ -2643,6 +2988,7 @@ impl HireSettleContract {
         engagement_id: String,
     ) {
         Self::assert_not_paused(&env);
+        Self::assert_engagement_not_paused(&env, &engagement_id);
         company.require_auth();
         recruiter.require_auth();
 
@@ -2717,6 +3063,7 @@ impl HireSettleContract {
     /// Company tops up the escrow balance for an active engagement.
     pub fn top_up_escrow(env: Env, company: Address, engagement_id: String, amount: i128) {
         Self::assert_not_paused(&env);
+        Self::assert_engagement_not_paused(&env, &engagement_id);
         company.require_auth();
 
         let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
@@ -2995,7 +3342,9 @@ impl HireSettleContract {
     /// Return the off-chain categorization tags stored at engagement creation
     /// (issue #248). Empty if none were provided. Read-only and permissionless.
     pub fn get_tags(env: Env, engagement_id: String) -> Vec<String> {
-        Self::get_engagement_internal(&env, &engagement_id).tags
+        Self::get_engagement_internal(&env, &engagement_id)
+            .tags
+            .unwrap_or_else(|| Vec::new(&env))
     }
 
     // ----------------------------------------------------------
@@ -3016,6 +3365,7 @@ impl HireSettleContract {
         successor: Address,
     ) {
         Self::assert_not_paused(&env);
+        Self::assert_engagement_not_paused(&env, &engagement_id);
         arbiter.require_auth();
 
         let engagement = Self::get_engagement_internal(&env, &engagement_id);
@@ -3062,6 +3412,7 @@ impl HireSettleContract {
     ///   longer be claimed.
     pub fn claim_arbiter(env: Env, nominee: Address, engagement_id: String) {
         Self::assert_not_paused(&env);
+        Self::assert_engagement_not_paused(&env, &engagement_id);
         nominee.require_auth();
 
         let nomination: ArbiterNomination = env
@@ -3285,6 +3636,7 @@ impl HireSettleContract {
         milestone_index: u32,
         new_payment_percent: u32,
     ) {
+        Self::assert_engagement_not_paused(&env, &engagement_id);
         proposer.require_auth();
 
         let engagement = Self::get_engagement_internal(&env, &engagement_id);
@@ -3355,6 +3707,7 @@ impl HireSettleContract {
         engagement_id: String,
         milestone_index: u32,
     ) {
+        Self::assert_engagement_not_paused(&env, &engagement_id);
         acceptor.require_auth();
 
         let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
@@ -3477,6 +3830,7 @@ impl HireSettleContract {
         engagement_id: String,
         milestone_index: u32,
     ) {
+        Self::assert_engagement_not_paused(&env, &engagement_id);
         rejector.require_auth();
 
         let engagement = Self::get_engagement_internal(&env, &engagement_id);
@@ -3607,6 +3961,7 @@ impl HireSettleContract {
         additional_ledgers: u32,
     ) {
         Self::assert_not_paused(&env);
+        Self::assert_engagement_not_paused(&env, &engagement_id);
         recruiter.require_auth();
 
         let engagement = Self::get_engagement_internal(&env, &engagement_id);
@@ -3688,6 +4043,7 @@ impl HireSettleContract {
         milestone_index: u32,
     ) {
         Self::assert_not_paused(&env);
+        Self::assert_engagement_not_paused(&env, &engagement_id);
         company.require_auth();
 
         let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
@@ -3732,6 +4088,11 @@ impl HireSettleContract {
         engagement.milestones.set(milestone_index, milestone);
         engagement.last_activity_ledger = current_ledger;
 
+        // The deadline just moved out, so any due-soon notification already
+        // emitted referred to the old one — reset so the new deadline can be
+        // announced in its own right. See issue #241.
+        Self::clear_due_soon_flag(&env, &engagement_id, milestone_index);
+
         env.storage().persistent().remove(&proposal_key);
 
         env.storage()
@@ -3766,6 +4127,7 @@ impl HireSettleContract {
         milestone_index: u32,
     ) {
         Self::assert_not_paused(&env);
+        Self::assert_engagement_not_paused(&env, &engagement_id);
         company.require_auth();
 
         let engagement = Self::get_engagement_internal(&env, &engagement_id);
@@ -3911,6 +4273,7 @@ impl HireSettleContract {
     /// Emits `("early_exit_requested", engagement_id)`.
     pub fn request_early_exit(env: Env, recruiter: Address, engagement_id: String) {
         Self::assert_not_paused(&env);
+        Self::assert_engagement_not_paused(&env, &engagement_id);
         recruiter.require_auth();
 
         let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
@@ -3969,6 +4332,7 @@ impl HireSettleContract {
     /// Emits `("early_exit_accepted", engagement_id)` with the refund amount.
     pub fn accept_early_exit(env: Env, company: Address, engagement_id: String) {
         Self::assert_not_paused(&env);
+        Self::assert_engagement_not_paused(&env, &engagement_id);
         company.require_auth();
 
         let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
@@ -4030,6 +4394,7 @@ impl HireSettleContract {
     /// Emits `("early_exit_rejected", engagement_id)`.
     pub fn reject_early_exit(env: Env, company: Address, engagement_id: String) {
         Self::assert_not_paused(&env);
+        Self::assert_engagement_not_paused(&env, &engagement_id);
         company.require_auth();
 
         let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
@@ -4246,10 +4611,91 @@ impl HireSettleContract {
     /// `page` is 0-indexed; out-of-range pages return an empty vec.
     pub fn get_engagements_by_tag(
         env: Env,
-        tag: String,
+        status: EngagementStatus,
         page: u32,
         page_size: u32,
     ) -> Vec<String> {
+        let mut result = Vec::new(&env);
+        if page_size == 0 {
+            return result;
+        }
+
+        let ids: Vec<String> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AllEngagements)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        // Use saturating arithmetic so a huge `page` / `page_size` combination
+        // clamps instead of wrapping around via u32 overflow.
+        let start = page.saturating_mul(page_size);
+        let end = start.saturating_add(page_size);
+
+        // Walk the index counting matches, collecting only those whose position
+        // within the filtered sequence falls inside the requested page.
+        let mut matched: u32 = 0;
+        for i in 0..ids.len() {
+            if matched >= end {
+                break;
+            }
+            let id = ids.get(i).unwrap();
+            let engagement: Engagement = match env
+                .storage()
+                .persistent()
+                .get(&DataKey::Engagement(id.clone()))
+            {
+                Some(e) => e,
+                // An entry whose record has since expired from storage is
+                // skipped rather than treated as a match.
+                None => continue,
+            };
+            if engagement.status == status {
+                if matched >= start {
+                    result.push_back(id);
+                }
+                matched += 1;
+            }
+        }
+
+        result
+    }
+
+    /// Return the total number of engagements currently in a given status
+    /// (issue #237). Companion to `get_engagement_ids_by_status` for sizing
+    /// pagination, mirroring `get_company_engagement_count`.
+    ///
+    /// Carries the same scan cost and index-coverage caveats as
+    /// `get_engagement_ids_by_status`.
+    pub fn get_engagement_count_by_status(env: Env, status: EngagementStatus) -> u32 {
+        let ids: Vec<String> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AllEngagements)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut count: u32 = 0;
+        for i in 0..ids.len() {
+            let id = ids.get(i).unwrap();
+            if let Some(engagement) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, Engagement>(&DataKey::Engagement(id))
+            {
+                if engagement.status == status {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+
+    // ----------------------------------------------------------
+    // ISSUE #249 — ENGAGEMENT LIST BY TAG
+    // ----------------------------------------------------------
+
+    /// Return a paginated slice of engagement IDs associated with a given tag.
+    /// `page` is 0-indexed; out-of-range pages return an empty vec.
+    pub fn get_engagements_by_tag(env: Env, tag: String, page: u32, page_size: u32) -> Vec<String> {
         let ids: Vec<String> = env
             .storage()
             .persistent()
@@ -4445,6 +4891,7 @@ impl HireSettleContract {
     /// # Events
     /// Emits `("engagement_expired", engagement_id)` with the refund amount.
     pub fn expire_engagement(env: Env, engagement_id: String) {
+        Self::assert_engagement_not_paused(&env, &engagement_id);
         let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
 
         if engagement.status == EngagementStatus::Completed {
@@ -4596,6 +5043,7 @@ impl HireSettleContract {
         milestone_indices: Vec<u32>,
     ) {
         Self::assert_not_paused(&env);
+        Self::assert_engagement_not_paused(&env, &engagement_id);
         company.require_auth();
 
         if milestone_indices.is_empty() {
@@ -4804,6 +5252,7 @@ impl HireSettleContract {
         milestone_index: u32,
     ) {
         Self::assert_not_paused(&env);
+        Self::assert_engagement_not_paused(&env, &engagement_id);
         caller.require_auth();
 
         let mut engagement = Self::get_engagement_internal(&env, &engagement_id);
@@ -5101,6 +5550,68 @@ impl HireSettleContract {
     }
 
     // ----------------------------------------------------------
+    // ISSUE #240 — FULL CONFIG SNAPSHOT
+    // ----------------------------------------------------------
+
+    /// Return every admin-configurable contract parameter in a single
+    /// read-only call (issue #240).
+    ///
+    /// Off-chain indexers otherwise need ~20 separate round-trips
+    /// (`get_platform_fee`, `get_arbiter_fee`, `get_confirm_window`, …) to
+    /// reconstruct the current configuration. Each field is sourced from the
+    /// same accessor its dedicated getter uses, so the snapshot is exactly what
+    /// those calls would return at this ledger — including defaults for
+    /// parameters never explicitly set.
+    ///
+    /// Because the whole struct is read within one invocation, the values are
+    /// mutually consistent: there is no window for an admin transaction to land
+    /// between two reads and yield a torn view.
+    ///
+    /// Read-only and permissionless.
+    ///
+    /// # Panics
+    /// - `"admin not initialized"` — `init` has not been called.
+    pub fn get_config_snapshot(env: Env) -> ConfigSnapshot {
+        let platform_fee = Self::get_platform_fee_internal(&env);
+
+        ConfigSnapshot {
+            version: Self::get_version(env.clone()),
+            admin: Self::get_admin_internal(&env),
+            admin_renounced: env
+                .storage()
+                .instance()
+                .get(&DataKey::AdminRenounced)
+                .unwrap_or(false),
+            paused: Self::is_paused_internal(&env),
+            platform_fee_bps: platform_fee.bps,
+            platform_fee_treasury: platform_fee.treasury,
+            arbiter_fee_bps: Self::get_arbiter_fee(env.clone()),
+            super_arbiter: env.storage().instance().get(&DataKey::SuperArbiter),
+            confirm_window_ledgers: Self::get_confirm_window(env.clone()),
+            dispute_window_ledgers: Self::get_dispute_window(env.clone()),
+            proof_cooldown_ledgers: Self::get_proof_cooldown(&env),
+            due_soon_window_ledgers: Self::get_due_soon_window(env.clone()),
+            amendment_ttl_ledgers: Self::get_amendment_ttl(env.clone()),
+            extension_ttl_ledgers: Self::get_extension_ttl(env.clone()),
+            inactivity_timeout_ledgers: Self::get_inactivity_timeout_ledgers(env.clone()),
+            storage_ttl_extend_to: Self::get_storage_ttl_extend_to(env.clone()),
+            upgrade_lock_duration_ledgers: Self::get_upgrade_lock_duration(env.clone()),
+            ledgers_per_day: Self::get_ledgers_per_day_internal(&env),
+            max_milestones: Self::get_max_milestones(env.clone()),
+            max_retention_days: Self::get_max_retention_days(env.clone()),
+            max_replacements: Self::get_max_replacements_internal(&env),
+            max_active_per_company: Self::get_max_active_per_company(env.clone()),
+            max_proof_hash_length: Self::get_max_proof_hash_length_internal(&env),
+            min_engagement_amount: Self::get_min_amount(env.clone()),
+            token_allowlist_enabled: env
+                .storage()
+                .persistent()
+                .get(&DataKey::AllowlistEnabled)
+                .unwrap_or(false),
+        }
+    }
+
+    // ----------------------------------------------------------
     // ISSUE #59 — ADMIN ROLE RENOUNCEMENT
     // ----------------------------------------------------------
 
@@ -5188,6 +5699,35 @@ impl HireSettleContract {
     fn assert_not_paused(env: &Env) {
         if Self::is_paused_internal(env) {
             panic!("ContractPaused");
+        }
+    }
+
+    fn is_engagement_paused_internal(env: &Env, engagement_id: &String) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::EngagementPaused(engagement_id.clone()))
+            .unwrap_or(false)
+    }
+
+    /// Per-engagement quarantine guard (issue #239). Layered on top of — not a
+    /// replacement for — `assert_not_paused`: the global pause halts every
+    /// engagement, this one halts a single quarantined ID.
+    fn assert_engagement_not_paused(env: &Env, engagement_id: &String) {
+        if Self::is_engagement_paused_internal(env, engagement_id) {
+            panic!("{}", ERR_ENGAGEMENT_PAUSED);
+        }
+    }
+
+    /// Clear the due-soon notification flag for a milestone (issue #241).
+    ///
+    /// Called whenever a milestone's `valid_after_ledger` moves — an accepted
+    /// extension pushes it out, a replacement restarts the retention timer.
+    /// Without this the flag from the *previous* deadline would suppress the
+    /// notification for the new one, silently starving off-chain notifiers.
+    fn clear_due_soon_flag(env: &Env, engagement_id: &String, milestone_index: u32) {
+        let key = DataKey::DueSoonNotified(engagement_id.clone(), milestone_index);
+        if env.storage().persistent().has(&key) {
+            env.storage().persistent().remove(&key);
         }
     }
 
