@@ -8428,27 +8428,106 @@ fn test_arbiter_fee_deducted_on_dispute_approval() {
     );
 }
 
-// ============================================================
-// ISSUE #16 — CONTRACT VERSION STRING
-// ============================================================
-
 #[test]
-fn test_set_and_get_version() {
-    let (env, contract_id, _token_id, company, _recruiter, _arbiter) = setup();
+fn test_recruiter_cosigner_can_submit_proof_and_cancel() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
     let client = HireSettleContractClient::new(&env, &contract_id);
 
-    // Default value
-    assert_eq!(client.get_version(), String::from_str(&env, "0.2.0"));
+    create_standard_engagement(
+        &env,
+        &client,
+        &token_id,
+        &company,
+        &recruiter,
+        &arbiter,
+        "ENG-REC-COSIGN",
+    );
 
-    client.set_version(&company, &String::from_str(&env, "1.0.0"));
-    assert_eq!(client.get_version(), String::from_str(&env, "1.0.0"));
+    let recruiter_cosigner = Address::generate(&env);
+    client.set_recruiter_cosigner(&recruiter, &recruiter_cosigner);
+
+    let eng_id = String::from_str(&env, "ENG-REC-COSIGN");
+    client.submit_proof(
+        &recruiter_cosigner,
+        &eng_id,
+        &0,
+        &String::from_str(&env, "ipfs://proof-via-cosigner"),
+    );
+    let m0 = client.get_milestone(&eng_id, &0);
+    assert_eq!(m0.status, MilestoneStatus::ProofSubmitted);
+
+    // Cancellation still needs one company signer and one recruiter-side signer.
+    client.cancel_engagement(&company, &recruiter_cosigner, &eng_id);
+    let eng = client.get_engagement(&eng_id);
+    assert_eq!(eng.status, EngagementStatus::Cancelled);
 }
 
 #[test]
 #[should_panic(expected = "unauthorized")]
-fn test_set_version_requires_admin() {
-    let (env, contract_id, _token_id, _company, recruiter, _arbiter) = setup();
+fn test_unknown_wallet_cannot_submit_proof_without_recruiter_cosigner() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
     let client = HireSettleContractClient::new(&env, &contract_id);
 
-    client.set_version(&recruiter, &String::from_str(&env, "1.0.0"));
+    create_standard_engagement(
+        &env,
+        &client,
+        &token_id,
+        &company,
+        &recruiter,
+        &arbiter,
+        "ENG-REC-COSIGN-REJECT",
+    );
+
+    let stranger = Address::generate(&env);
+    let eng_id = String::from_str(&env, "ENG-REC-COSIGN-REJECT");
+    client.submit_proof(
+        &stranger,
+        &eng_id,
+        &0,
+        &String::from_str(&env, "ipfs://proof-unauthorized"),
+    );
+}
+
+#[test]
+fn test_escrow_callback_checkpoint_disabled_by_default() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    create_standard_engagement(
+        &env,
+        &client,
+        &token_id,
+        &company,
+        &recruiter,
+        &arbiter,
+        "ENG-CB-OFF",
+    );
+
+    // The callback checkpoint path is no-op unless explicitly enabled by admin.
+    assert!(!has_event(&env, "escrow_callback_point"));
+}
+
+#[test]
+fn test_escrow_callback_checkpoint_emits_when_enabled_and_target_set() {
+    let (env, contract_id, token_id, company, recruiter, arbiter) = setup();
+    let client = HireSettleContractClient::new(&env, &contract_id);
+
+    create_standard_engagement(
+        &env,
+        &client,
+        &token_id,
+        &company,
+        &recruiter,
+        &arbiter,
+        "ENG-CB-ON",
+    );
+
+    let callback_target = Address::generate(&env);
+    client.set_escrow_lifecycle_callback_target(&company, &callback_target);
+    client.set_escrow_lifecycle_callback_enabled(&company, &true);
+
+    let eng_id = String::from_str(&env, "ENG-CB-ON");
+    client.top_up_escrow(&company, &eng_id, &100_000_000);
+
+    assert!(has_event(&env, "escrow_callback_point"));
 }

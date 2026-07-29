@@ -378,6 +378,22 @@ pub struct ContractHealth {
     pub total_engagement_count: u64,
 }
 
+/// Reserved escrow lifecycle checkpoint action for future yield strategy
+/// integrations. Emitted only when the admin explicitly enables callback
+/// checkpoints and sets a callback target address.
+#[contracttype]
+#[derive(Clone)]
+pub enum EscrowLifecycleAction {
+    /// Escrow balance increased when an engagement was initially funded.
+    Funded,
+    /// Escrow balance increased from a later top-up.
+    ToppedUp,
+    /// Escrow balance decreased to pay milestone proceeds.
+    PayoutReleased,
+    /// Escrow balance decreased due to a refund back to company.
+    Refunded,
+}
+
 // ============================================================
 // STORAGE KEYS
 // ============================================================
@@ -468,6 +484,14 @@ pub enum DataKey {
     EngagementTag(String),
     /// Optional co-signer address authorized to perform company-gated actions (issue #254).
     CompanyCosigner(Address),
+    /// Optional co-signer address authorized to perform recruiter-gated actions
+    /// (issue #257, recruiter mirror of issue #254).
+    RecruiterCosigner(Address),
+    /// Admin-gated switch for escrow lifecycle callback checkpoints.
+    /// Defaults to `false` (no-op).
+    EscrowLifecycleCallbackEnabled,
+    /// Reserved callback target address for future yield-strategy integration.
+    EscrowLifecycleCallbackTarget,
     /// Active milestone extension proposal for a Locked retention milestone,
     /// awaiting company approval (issue #247).
     MilestoneExtensionProposal(String, u32),
@@ -1195,6 +1219,15 @@ impl HireSettleContract {
 
         let token_client = token::Client::new(&env, &token);
         token_client.transfer(&company, &env.current_contract_address(), &total_amount);
+        Self::on_escrow_lifecycle_checkpoint(
+            &env,
+            &engagement_id,
+            EscrowLifecycleAction::Funded,
+            total_amount,
+            &token,
+            &company,
+            &recruiter,
+        );
 
         let engagement = Engagement {
             id: engagement_id.clone(),
@@ -1658,7 +1691,7 @@ impl HireSettleContract {
             panic!("{}", ERR_ENGAGEMENT_NOT_ACTIVE);
         }
 
-        if recruiter != engagement.recruiter {
+        if !Self::is_authorized_recruiter(&env, &recruiter, &engagement.recruiter) {
             panic!("{}", ERR_UNAUTHORIZED);
         }
 
@@ -1825,6 +1858,15 @@ impl HireSettleContract {
                 );
             }
             Self::distribute_recruiter_payout(&env, &engagement, net_payment, &token_client);
+            Self::on_escrow_lifecycle_checkpoint(
+                &env,
+                &engagement_id,
+                EscrowLifecycleAction::PayoutReleased,
+                -payment,
+                &engagement.token,
+                &engagement.company,
+                &engagement.recruiter,
+            );
         }
 
         let old_status = milestone.status.clone();
@@ -2091,6 +2133,15 @@ impl HireSettleContract {
                 );
             }
             Self::distribute_recruiter_payout(&env, &engagement, net_payment, &token_client);
+            Self::on_escrow_lifecycle_checkpoint(
+                &env,
+                &engagement_id,
+                EscrowLifecycleAction::PayoutReleased,
+                -payment,
+                &engagement.token,
+                &engagement.company,
+                &engagement.recruiter,
+            );
 
             let old_status = milestone.status.clone();
             milestone.status = MilestoneStatus::Resolved;
@@ -2399,6 +2450,15 @@ impl HireSettleContract {
                 );
             }
             Self::distribute_recruiter_payout(&env, &engagement, net_payment, &token_client);
+            Self::on_escrow_lifecycle_checkpoint(
+                &env,
+                &engagement_id,
+                EscrowLifecycleAction::PayoutReleased,
+                -payment,
+                &engagement.token,
+                &engagement.company,
+                &engagement.recruiter,
+            );
 
             let old_status = milestone.status.clone();
             milestone.status = MilestoneStatus::Resolved;
@@ -2742,6 +2802,29 @@ impl HireSettleContract {
             .get(&DataKey::CompanyCosigner(company))
     }
 
+    /// Register a co-signer address that is also authorized to perform
+    /// recruiter-gated actions (submit proof, request exit, etc.) on behalf
+    /// of this recruiter. Only the recruiter address itself can set the
+    /// co-signer.
+    pub fn set_recruiter_cosigner(env: Env, recruiter: Address, cosigner: Address) {
+        recruiter.require_auth();
+        env.storage().persistent().set(
+            &DataKey::RecruiterCosigner(recruiter.clone()),
+            &cosigner,
+        );
+        env.events().publish(
+            (Symbol::new(&env, "recruiter_cosigner_set"),),
+            (recruiter, cosigner),
+        );
+    }
+
+    /// Return the registered co-signer for a recruiter, or `None` if none set.
+    pub fn get_recruiter_cosigner(env: Env, recruiter: Address) -> Option<Address> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::RecruiterCosigner(recruiter))
+    }
+
     /// Internal helper: check if `caller` is either the engagement's company
     /// or the company's registered co-signer.
     fn is_authorized_company(env: &Env, caller: &Address, engagement_company: &Address) -> bool {
@@ -2756,6 +2839,79 @@ impl HireSettleContract {
             Some(c) => caller == &c,
             None => false,
         }
+    }
+
+    /// Internal helper: check if `caller` is either the engagement's recruiter
+    /// or the recruiter's registered co-signer.
+    fn is_authorized_recruiter(
+        env: &Env,
+        caller: &Address,
+        engagement_recruiter: &Address,
+    ) -> bool {
+        if caller == engagement_recruiter {
+            return true;
+        }
+        let cosigner: Option<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::RecruiterCosigner(engagement_recruiter.clone()));
+        match cosigner {
+            Some(c) => caller == &c,
+            None => false,
+        }
+    }
+
+    // ----------------------------------------------------------
+    // ISSUE #258 — RESERVED ESCROW CALLBACK CHECKPOINT
+    // ----------------------------------------------------------
+
+    /// Set (or update) the callback target address reserved for future
+    /// yield-strategy integrations. Admin only.
+    pub fn set_escrow_lifecycle_callback_target(env: Env, admin: Address, target: Address) {
+        Self::assert_admin(&env, &admin);
+        env.storage()
+            .persistent()
+            .set(&DataKey::EscrowLifecycleCallbackTarget, &target);
+        env.events()
+            .publish((Symbol::new(&env, "escrow_callback_target_set"),), target);
+    }
+
+    /// Clear the reserved escrow callback target. Admin only.
+    pub fn clear_escrow_lifecycle_callback_target(env: Env, admin: Address) {
+        Self::assert_admin(&env, &admin);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::EscrowLifecycleCallbackTarget);
+        env.events()
+            .publish((Symbol::new(&env, "escrow_callback_target_cleared"),), ());
+    }
+
+    /// Enable or disable escrow lifecycle callback checkpoints. Admin only.
+    ///
+    /// Defaults to `false`, which keeps the checkpoint path as a no-op.
+    pub fn set_escrow_lifecycle_callback_enabled(env: Env, admin: Address, enabled: bool) {
+        Self::assert_admin(&env, &admin);
+        env.storage()
+            .persistent()
+            .set(&DataKey::EscrowLifecycleCallbackEnabled, &enabled);
+        env.events().publish(
+            (Symbol::new(&env, "escrow_callback_enabled_set"),),
+            enabled,
+        );
+    }
+
+    /// Return `(enabled, target)` for the reserved escrow callback checkpoint.
+    pub fn get_escrow_lifecycle_callback_config(env: Env) -> (bool, Option<Address>) {
+        let enabled: bool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EscrowLifecycleCallbackEnabled)
+            .unwrap_or(false);
+        let target: Option<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EscrowLifecycleCallbackTarget);
+        (enabled, target)
     }
 
     // ----------------------------------------------------------
@@ -2845,7 +3001,7 @@ impl HireSettleContract {
 
         let engagement = Self::get_engagement_internal(&env, &engagement_id);
 
-        if recruiter != engagement.recruiter {
+        if !Self::is_authorized_recruiter(&env, &recruiter, &engagement.recruiter) {
             panic!("{}", ERR_UNAUTHORIZED);
         }
 
@@ -3004,7 +3160,7 @@ impl HireSettleContract {
             panic!("{}", ERR_UNAUTHORIZED);
         }
 
-        if recruiter != engagement.recruiter {
+        if !Self::is_authorized_recruiter(&env, &recruiter, &engagement.recruiter) {
             panic!("{}", ERR_UNAUTHORIZED);
         }
 
@@ -3014,6 +3170,15 @@ impl HireSettleContract {
             &env.current_contract_address(),
             &engagement.company,
             &refund,
+        );
+        Self::on_escrow_lifecycle_checkpoint(
+            &env,
+            &engagement_id,
+            EscrowLifecycleAction::Refunded,
+            -refund,
+            &engagement.token,
+            &engagement.company,
+            &engagement.recruiter,
         );
 
         let old_engagement_status = engagement.status.clone();
@@ -3084,6 +3249,15 @@ impl HireSettleContract {
 
         let token_client = token::Client::new(&env, &engagement.token);
         token_client.transfer(&company, &env.current_contract_address(), &amount);
+        Self::on_escrow_lifecycle_checkpoint(
+            &env,
+            &engagement_id,
+            EscrowLifecycleAction::ToppedUp,
+            amount,
+            &engagement.token,
+            &engagement.company,
+            &engagement.recruiter,
+        );
 
         engagement.total_amount += amount;
         engagement.last_activity_ledger = env.ledger().sequence();
@@ -4046,7 +4220,7 @@ impl HireSettleContract {
             panic!("EngagementNotCompleted");
         }
 
-        if recruiter != engagement.recruiter {
+        if !Self::is_authorized_recruiter(&env, &recruiter, &engagement.recruiter) {
             panic!("{}", ERR_UNAUTHORIZED);
         }
 
@@ -4220,7 +4394,7 @@ impl HireSettleContract {
             panic!("{}", ERR_ENGAGEMENT_NOT_ACTIVE);
         }
 
-        if recruiter != engagement.recruiter {
+        if !Self::is_authorized_recruiter(&env, &recruiter, &engagement.recruiter) {
             panic!("{}", ERR_UNAUTHORIZED);
         }
 
@@ -4532,7 +4706,7 @@ impl HireSettleContract {
             panic!("{}", ERR_ENGAGEMENT_NOT_ACTIVE);
         }
 
-        if recruiter != engagement.recruiter {
+        if !Self::is_authorized_recruiter(&env, &recruiter, &engagement.recruiter) {
             panic!("{}", ERR_UNAUTHORIZED);
         }
 
@@ -4595,6 +4769,15 @@ impl HireSettleContract {
                 &env.current_contract_address(),
                 &engagement.company,
                 &refund,
+            );
+            Self::on_escrow_lifecycle_checkpoint(
+                &env,
+                &engagement_id,
+                EscrowLifecycleAction::Refunded,
+                -refund,
+                &engagement.token,
+                &engagement.company,
+                &engagement.recruiter,
             );
         }
 
@@ -5163,6 +5346,15 @@ impl HireSettleContract {
                 &engagement.company,
                 &refund,
             );
+            Self::on_escrow_lifecycle_checkpoint(
+                &env,
+                &engagement_id,
+                EscrowLifecycleAction::Refunded,
+                -refund,
+                &engagement.token,
+                &engagement.company,
+                &engagement.recruiter,
+            );
         }
 
         let old_engagement_status = engagement.status.clone();
@@ -5365,6 +5557,15 @@ impl HireSettleContract {
                 );
             }
             Self::distribute_recruiter_payout(&env, &engagement, net_payment, &token_client);
+            Self::on_escrow_lifecycle_checkpoint(
+                &env,
+                &engagement_id,
+                EscrowLifecycleAction::PayoutReleased,
+                -payment,
+                &engagement.token,
+                &engagement.company,
+                &engagement.recruiter,
+            );
 
             let old_status = m.status.clone();
             m.status = MilestoneStatus::Confirmed;
@@ -5553,6 +5754,15 @@ impl HireSettleContract {
             );
         }
         Self::distribute_recruiter_payout(&env, &engagement, net_payment, &token_client);
+        Self::on_escrow_lifecycle_checkpoint(
+            &env,
+            &engagement_id,
+            EscrowLifecycleAction::PayoutReleased,
+            -payment,
+            &engagement.token,
+            &engagement.company,
+            &engagement.recruiter,
+        );
 
         let old_status = milestone.status.clone();
         milestone.status = MilestoneStatus::Confirmed;
@@ -5915,6 +6125,55 @@ impl HireSettleContract {
         if !Self::is_authorized_company(env, company, &engagement.company) {
             panic!("{}", ERR_UNAUTHORIZED);
         }
+    }
+
+    /// Reserved hook point for future yield-bearing escrow integrations.
+    ///
+    /// This is intentionally no-op by default: unless admin both enables the
+    /// checkpoint and configures a callback target, the helper returns without
+    /// any side effects. Today it emits an event only, reserving a stable
+    /// lifecycle checkpoint surface without changing escrow behaviour.
+    fn on_escrow_lifecycle_checkpoint(
+        env: &Env,
+        engagement_id: &String,
+        action: EscrowLifecycleAction,
+        escrow_delta: i128,
+        token: &Address,
+        company: &Address,
+        recruiter: &Address,
+    ) {
+        let enabled: bool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EscrowLifecycleCallbackEnabled)
+            .unwrap_or(false);
+        if !enabled {
+            return;
+        }
+
+        let target: Option<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EscrowLifecycleCallbackTarget);
+        let callback_target = match target {
+            Some(addr) => addr,
+            None => return,
+        };
+
+        env.events().publish(
+            (
+                Symbol::new(env, "escrow_callback_point"),
+                engagement_id.clone(),
+            ),
+            (
+                action,
+                escrow_delta,
+                token.clone(),
+                company.clone(),
+                recruiter.clone(),
+                callback_target,
+            ),
+        );
     }
 
     fn get_admin_internal(env: &Env) -> Address {
