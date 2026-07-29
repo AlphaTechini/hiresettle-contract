@@ -306,6 +306,18 @@ pub struct PlatformFee {
     pub treasury: Address,
 }
 
+/// A single fee-tier bracket: engagements whose `total_amount` is at or above
+/// `threshold` pay `bps` instead of the default platform-fee rate.
+/// Configured via `set_fee_tiers` (issue #250).
+#[contracttype]
+#[derive(Clone)]
+pub struct FeeTier {
+    /// Minimum `total_amount` (inclusive) to qualify for this tier.
+    pub threshold: i128,
+    /// Platform fee in basis points applied to engagements in this tier.
+    pub bps: u32,
+}
+
 /// Bundled optional configuration passed as the last argument of `create_engagement`.
 /// Combines `metadata_hash` with the new co-recruiter split fields (issue #56)
 /// to stay within Soroban's 10-parameter limit.
@@ -411,6 +423,8 @@ pub enum DataKey {
     CompanyActiveCount(Address),
     /// Admin-configurable maximum number of replacements allowed per engagement (issue #31, default 3).
     MaxReplacements,
+    /// Admin-configurable fee tiers that scale platform fee by engagement size (issue #250).
+    FeeTiers,
 }
 
 // ============================================================
@@ -527,6 +541,55 @@ impl HireSettleContract {
     pub fn get_platform_fee(env: Env) -> (u32, Address) {
         let fee = Self::get_platform_fee_internal(&env);
         (fee.bps, fee.treasury)
+    }
+
+    /// Admin sets fee tiers that scale the platform fee down for larger
+    /// engagements (issue #250). Each tier specifies a `threshold`
+    /// (minimum `total_amount`) and the `bps` rate that applies. Tiers
+    /// must be sorted by ascending threshold, each `bps` must be ≤ the
+    /// base platform fee, and at most 10 tiers are allowed.
+    ///
+    /// At fee-calculation time the contract walks the tiers from highest
+    /// threshold to lowest and uses the first matching tier's `bps`.
+    /// If no tier matches, the base `platform_fee.bps` applies.
+    ///
+    /// Pass an empty vector to clear all tiers (flat fee for every size).
+    pub fn set_fee_tiers(env: Env, admin: Address, tiers: Vec<FeeTier>) {
+        Self::assert_not_paused(&env);
+        Self::assert_admin(&env, &admin);
+
+        if tiers.len() > 10 {
+            panic!("too many fee tiers");
+        }
+
+        let base_bps = Self::get_platform_fee_internal(&env).bps;
+        for i in 0..tiers.len() {
+            let t = tiers.get(i).unwrap();
+            if t.bps > base_bps {
+                panic!("tier bps exceeds base platform fee");
+            }
+            if t.threshold <= 0 {
+                panic!("tier threshold must be positive");
+            }
+            if i > 0 {
+                let prev = tiers.get(i - 1).unwrap();
+                if t.threshold <= prev.threshold {
+                    panic!("tiers must be sorted by ascending threshold");
+                }
+            }
+        }
+
+        env.storage().persistent().set(&DataKey::FeeTiers, &tiers);
+        env.events()
+            .publish((Symbol::new(&env, "fee_tiers_set"),), tiers.len());
+    }
+
+    /// Return the current fee tiers. Empty vector means no tiering (flat fee).
+    pub fn get_fee_tiers(env: Env) -> Vec<FeeTier> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::FeeTiers)
+            .unwrap_or_else(|| Vec::new(&env))
     }
 
     /// Admin sets the contract version string (issue #16).
@@ -1276,7 +1339,9 @@ impl HireSettleContract {
         let payment = full_share - milestone.replacement_paid_out;
         if payment > 0 {
             let platform_fee = Self::get_platform_fee_internal(&env);
-            let fee_amount = (payment * platform_fee.bps as i128) / 10_000;
+            let effective_bps =
+                Self::resolve_platform_fee_bps(&env, platform_fee.bps, engagement.total_amount);
+            let fee_amount = (payment * effective_bps as i128) / 10_000;
             let net_payment = payment - fee_amount;
             engagement.released_amount += payment;
 
@@ -3525,6 +3590,8 @@ impl HireSettleContract {
         }
 
         let platform_fee = Self::get_platform_fee_internal(&env);
+        let effective_bps =
+            Self::resolve_platform_fee_bps(&env, platform_fee.bps, engagement.total_amount);
         let token_client = token::Client::new(&env, &engagement.token);
 
         for i in 0..milestone_indices.len() {
@@ -3532,7 +3599,7 @@ impl HireSettleContract {
             let mut m = engagement.milestones.get(idx).unwrap();
 
             let payment = (engagement.total_amount * m.payment_percent as i128) / 100;
-            let fee_amount = (payment * platform_fee.bps as i128) / 10_000;
+            let fee_amount = (payment * effective_bps as i128) / 10_000;
             let net_payment = payment - fee_amount;
             engagement.released_amount += payment;
 
@@ -3716,7 +3783,9 @@ impl HireSettleContract {
         // Release payment identically to confirm_milestone.
         let payment = (engagement.total_amount * milestone.payment_percent as i128) / 100;
         let platform_fee = Self::get_platform_fee_internal(&env);
-        let fee_amount = (payment * platform_fee.bps as i128) / 10_000;
+        let effective_bps =
+            Self::resolve_platform_fee_bps(&env, platform_fee.bps, engagement.total_amount);
+        let fee_amount = (payment * effective_bps as i128) / 10_000;
         let net_payment = payment - fee_amount;
         engagement.released_amount += payment;
 
@@ -4089,6 +4158,29 @@ impl HireSettleContract {
                 bps: 0,
                 treasury: Self::get_admin_internal(env),
             })
+    }
+
+    /// Resolve the effective platform-fee bps for an engagement of the given
+    /// `total_amount`. Walks configured fee tiers (highest threshold first)
+    /// and returns the first matching tier's bps, or falls back to the base
+    /// platform fee if no tier matches.
+    fn resolve_platform_fee_bps(env: &Env, base_bps: u32, total_amount: i128) -> u32 {
+        let tiers: Option<Vec<FeeTier>> = env.storage().persistent().get(&DataKey::FeeTiers);
+        if let Some(tiers) = tiers {
+            let len = tiers.len();
+            if len > 0 {
+                // Walk from highest threshold to lowest.
+                let mut i = len;
+                while i > 0 {
+                    i -= 1;
+                    let tier = tiers.get(i).unwrap();
+                    if total_amount >= tier.threshold {
+                        return tier.bps;
+                    }
+                }
+            }
+        }
+        base_bps
     }
 
     fn get_ledgers_per_day_internal(env: &Env) -> u32 {
