@@ -196,6 +196,8 @@ pub struct Engagement {
     /// Optional off-chain attestation hash (e.g. SHA-256 of the contract PDF).
     /// Stored at engagement creation for audit and verification purposes.
     pub contract_pdf_hash: Option<String>,
+    /// Optional list of short string tags for categorization (issue #248, #249).
+    pub tags: Option<Vec<String>>,
 }
 
 /// A lightweight read-only view of an engagement, suitable for list/dashboard APIs.
@@ -230,6 +232,8 @@ pub struct EngagementSummary {
     pub recruiter_split_bps: u32,
     /// Optional off-chain attestation hash (e.g. SHA-256 of the contract PDF).
     pub contract_pdf_hash: Option<String>,
+    /// Optional list of short string tags for categorization (issue #248, #249).
+    pub tags: Option<Vec<String>>,
 }
 
 /// Per-dispute, per-milestone vote tally stored on-chain until the dispute resolves.
@@ -323,6 +327,8 @@ pub struct EngagementConfig {
     /// Optional off-chain attestation hash (e.g. SHA-256 of the contract PDF).
     /// Must be non-empty if provided.
     pub contract_pdf_hash: Option<String>,
+    /// Optional list of short string tags for off-chain categorization (issue #248, #249).
+    pub tags: Option<Vec<String>>,
 }
 
 // ============================================================
@@ -411,6 +417,8 @@ pub enum DataKey {
     CompanyActiveCount(Address),
     /// Admin-configurable maximum number of replacements allowed per engagement (issue #31, default 3).
     MaxReplacements,
+    /// Per-tag index mapping tag string to list of engagement IDs (issue #248, #249).
+    TagEngagements(String),
 }
 
 // ============================================================
@@ -922,6 +930,7 @@ impl HireSettleContract {
             co_recruiter: config.co_recruiter,
             recruiter_split_bps: config.recruiter_split_bps,
             contract_pdf_hash: config.contract_pdf_hash,
+            tags: config.tags.clone(),
         };
 
         env.storage()
@@ -978,6 +987,40 @@ impl HireSettleContract {
             &DataKey::RecruiterEngagements(recruiter.clone()),
             &recruiter_ids,
         );
+
+        // Issue #248 & #249: append engagement_id to per-tag indices.
+        if let Some(ref tags) = config.tags {
+            if tags.len() > 10 {
+                panic!("TooManyTags");
+            }
+            let mut seen_tags = Vec::new(&env);
+            for i in 0..tags.len() {
+                let t = tags.get(i).unwrap();
+                if t.len() == 0 {
+                    panic!("TagEmpty");
+                }
+                if t.len() > 32 {
+                    panic!("TagTooLong");
+                }
+                if !seen_tags.contains(&t) {
+                    seen_tags.push_back(t.clone());
+                    let mut tag_ids: Vec<String> = env
+                        .storage()
+                        .persistent()
+                        .get(&DataKey::TagEngagements(t.clone()))
+                        .unwrap_or_else(|| Vec::new(&env));
+                    tag_ids.push_back(engagement_id.clone());
+                    env.storage()
+                        .persistent()
+                        .set(&DataKey::TagEngagements(t.clone()), &tag_ids);
+                    env.storage().persistent().extend_ttl(
+                        &DataKey::TagEngagements(t.clone()),
+                        100_000,
+                        6_300_000,
+                    );
+                }
+            }
+        }
         env.storage().persistent().extend_ttl(
             &DataKey::RecruiterEngagements(recruiter.clone()),
             100_000,
@@ -2338,6 +2381,7 @@ impl HireSettleContract {
             co_recruiter: engagement.co_recruiter,
             recruiter_split_bps: engagement.recruiter_split_bps,
             contract_pdf_hash: engagement.contract_pdf_hash,
+            tags: engagement.tags,
         }
     }
 
@@ -3144,6 +3188,55 @@ impl HireSettleContract {
             .get(&DataKey::RecruiterEngagements(recruiter))
             .unwrap_or_else(|| Vec::new(&env));
         ids.len()
+    }
+
+    // ----------------------------------------------------------
+    // ISSUE #249 — ENGAGEMENT LIST BY TAG
+    // ----------------------------------------------------------
+
+    /// Return a paginated slice of engagement IDs associated with a given tag.
+    /// `page` is 0-indexed; out-of-range pages return an empty vec.
+    pub fn get_engagements_by_tag(
+        env: Env,
+        tag: String,
+        page: u32,
+        page_size: u32,
+    ) -> Vec<String> {
+        let ids: Vec<String> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TagEngagements(tag))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let total = ids.len();
+        if page_size == 0 {
+            return Vec::new(&env);
+        }
+        let start = page.saturating_mul(page_size);
+        if start >= total {
+            return Vec::new(&env);
+        }
+        let end = start.saturating_add(page_size).min(total);
+        let mut result = Vec::new(&env);
+        for i in start..end {
+            result.push_back(ids.get(i).unwrap());
+        }
+        result
+    }
+
+    /// Return the total number of engagements associated with a given tag.
+    pub fn get_tag_engagement_count(env: Env, tag: String) -> u32 {
+        let ids: Vec<String> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TagEngagements(tag))
+            .unwrap_or_else(|| Vec::new(&env));
+        ids.len()
+    }
+
+    /// Return the tags assigned to an engagement, if any.
+    pub fn get_engagement_tags(env: Env, engagement_id: String) -> Option<Vec<String>> {
+        Self::get_engagement_internal(&env, &engagement_id).tags
     }
 
     // ----------------------------------------------------------
