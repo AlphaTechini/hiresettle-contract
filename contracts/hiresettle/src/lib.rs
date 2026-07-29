@@ -417,6 +417,7 @@ pub enum DataKey {
 // CONTRACT
 // ============================================================
 
+/// Milestone-based recruiter fee escrow contract.
 #[contract]
 pub struct HireSettleContract;
 
