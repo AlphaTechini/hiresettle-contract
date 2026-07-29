@@ -33,7 +33,6 @@ fn setup() -> (Env, Address, Address, Address, Address, Address) {
         .register_stellar_asset_contract_v2(token_admin.clone())
         .address();
     let token_client = token::StellarAssetClient::new(&env, &token_id);
-
     let company = Address::generate(&env);
     let recruiter = Address::generate(&env);
     let arbiter = Address::generate(&env);
@@ -110,11 +109,13 @@ fn create_standard_engagement(
 
 fn has_event(env: &Env, event_name: &str) -> bool {
     let expected = Symbol::new(env, event_name);
-    let events = env.events().all();
-    for i in 0..events.len() {
-        let (_, topics, _) = events.get(i).unwrap();
-        let topic: Symbol = topics.get(0).unwrap().try_into_val(env).unwrap();
-        if topic == expected {
+    for (_, topics, _) in env.events().all().iter() {
+        let matches = topics
+            .get(0)
+            .and_then(|v| v.try_into_val(env).ok())
+            .map(|s: Symbol| s == expected)
+            .unwrap_or(false);
+        if matches {
             return true;
         }
     }
@@ -139,6 +140,7 @@ fn default_config() -> EngagementConfig {
         co_recruiter: None,
         recruiter_split_bps: 10_000,
         contract_pdf_hash: None,
+        tags: None,
     }
 }
 
@@ -1243,6 +1245,7 @@ fn test_metadata_hash_present() {
             co_recruiter: None,
             recruiter_split_bps: 10_000,
             contract_pdf_hash: None,
+            tags: None,
         },
     );
 
@@ -1293,6 +1296,7 @@ fn test_metadata_hash_empty_string_rejected() {
             co_recruiter: None,
             recruiter_split_bps: 10_000,
             contract_pdf_hash: None,
+            tags: None,
         },
     );
 }
@@ -1313,6 +1317,7 @@ fn test_co_recruiter_60_40_split() {
         co_recruiter: Some(co_recruiter.clone()),
         recruiter_split_bps: 6_000,
         contract_pdf_hash: None,
+        tags: None,
     };
 
     client.create_engagement(
@@ -1397,6 +1402,7 @@ fn test_split_bps_over_10000_rejected() {
         co_recruiter: Some(co_recruiter),
         recruiter_split_bps: 10_001,
         contract_pdf_hash: None,
+        tags: None,
     };
 
     client.create_engagement(
@@ -1429,6 +1435,7 @@ fn test_co_recruiter_gets_remainder() {
         co_recruiter: Some(co_recruiter.clone()),
         recruiter_split_bps: 3_333,
         contract_pdf_hash: None,
+        tags: None,
     };
 
     client.create_engagement(
@@ -1476,6 +1483,7 @@ fn test_co_recruiter_summary_fields() {
         co_recruiter: Some(co_recruiter.clone()),
         recruiter_split_bps: 7_000,
         contract_pdf_hash: None,
+        tags: None,
     };
 
     client.create_engagement(
@@ -1512,6 +1520,7 @@ fn test_split_bps_10000_accepted() {
         co_recruiter: Some(co_recruiter.clone()),
         recruiter_split_bps: 10_000,
         contract_pdf_hash: None,
+        tags: None,
     };
 
     client.create_engagement(
@@ -7673,17 +7682,18 @@ fn test_recruiter_transfer_payout() {
         "ENG-RTR-PO",
     );
 
-    // Propose and accept recruiter transfer
-    client.propose_recruiter_transfer(&recruiter, &eng_id, &new_recruiter);
-    client.accept_recruiter_transfer(&company, &eng_id);
-
-    // Confirm a milestone — payout should go to new_recruiter
+    // Submit proof before transfer
     client.submit_proof(
         &new_recruiter,
         &eng_id,
         &0,
         &String::from_str(&env, "ipfs://proof"),
     );
+
+    // Propose and accept recruiter transfer
+    client.propose_recruiter_transfer(&recruiter, &eng_id, &new_recruiter);
+    client.accept_recruiter_transfer(&company, &eng_id);
+
     client.confirm_milestone(&company, &eng_id, &0);
 
     let new_recruiter_balance = token_client.balance(&new_recruiter);
@@ -7782,13 +7792,38 @@ fn test_get_arbiter_votes_default_before_any_votes() {
 fn test_multi_arbiter_quorum_with_three_arbiters_and_quorum_two() {
     let (env, contract_id, token_id, company, recruiter, _arbiter) = setup();
     let client = HireSettleContractClient::new(&env, &contract_id);
-    let token_client = token::Client::new(&env, &token_id);
+    let _token_client = token::Client::new(&env, &token_id);
 
     let a1 = Address::generate(&env);
     let a2 = Address::generate(&env);
     let a3 = Address::generate(&env);
 
-    let eng_id = String::from_str(&env, "ENG-MULTI-ARB-3");
+f    let eng_id = String::from_str(&env, "ENG-MULTI-ARB-3");
+    let milestones = vec![
+        &env,
+        Milestone {
+            name: String::from_str(&env, "Placement"),
+            payment_percent: 50,
+            kind: MilestoneKind::Placement,
+            valid_after_ledger: 0,
+            proof_hash: String::from_str(&env, ""),
+            status: MilestoneStatus::Pending,
+            proof_submitted_at: 0,
+            replacement_paid_out: 0,
+        },
+        Milestone {
+            name: String::from_str(&env, "Retention"),
+            payment_percent: 50,
+            kind: MilestoneKind::Placement,
+            valid_after_ledger: 0,
+            proof_hash: String::from_str(&env, ""),
+            status: MilestoneStatus::Pending,
+            proof_submitted_at: 0,
+            replacement_paid_out: 0,
+        },
+    ];
+
+    let eng_id = String::from_str(&env, "ENG-AVOTES-TALLY");
 
     client.create_engagement(
         &eng_id,
@@ -7802,6 +7837,11 @@ fn test_multi_arbiter_quorum_with_three_arbiters_and_quorum_two() {
         &1_000_000_000,
         &String::from_str(&env, "Engineer"),
         &build_milestones(&env),
+        &ArbiterSetup { arbiters: vec![&env, a1.clone(), a2.clone(), a3.clone()], quorum: 2 },
+        &token_id,
+        &1_000_000_000,
+        &String::from_str(&env, "Engineer"),
+        &milestones,
         &vec![&env, 30u32, 90u32],
         &default_config(),
     );
