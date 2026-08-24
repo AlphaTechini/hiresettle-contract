@@ -140,6 +140,7 @@ fn default_config() -> EngagementConfig {
         co_recruiter: None,
         recruiter_split_bps: 10_000,
         contract_pdf_hash: None,
+        referrer: None,
         tags: None,
     }
 }
@@ -1344,6 +1345,7 @@ fn test_metadata_hash_present() {
             co_recruiter: None,
             recruiter_split_bps: 10_000,
             contract_pdf_hash: None,
+            referrer: None,
             tags: None,
         },
     );
@@ -1395,6 +1397,7 @@ fn test_metadata_hash_empty_string_rejected() {
             co_recruiter: None,
             recruiter_split_bps: 10_000,
             contract_pdf_hash: None,
+            referrer: None,
             tags: None,
         },
     );
@@ -1416,6 +1419,7 @@ fn test_co_recruiter_60_40_split() {
         co_recruiter: Some(co_recruiter.clone()),
         recruiter_split_bps: 6_000,
         contract_pdf_hash: None,
+        referrer: None,
         tags: None,
     };
 
@@ -1501,6 +1505,7 @@ fn test_split_bps_over_10000_rejected() {
         co_recruiter: Some(co_recruiter),
         recruiter_split_bps: 10_001,
         contract_pdf_hash: None,
+        referrer: None,
         tags: None,
     };
 
@@ -1534,6 +1539,7 @@ fn test_co_recruiter_gets_remainder() {
         co_recruiter: Some(co_recruiter.clone()),
         recruiter_split_bps: 3_333,
         contract_pdf_hash: None,
+        referrer: None,
         tags: None,
     };
 
@@ -1582,6 +1588,7 @@ fn test_co_recruiter_summary_fields() {
         co_recruiter: Some(co_recruiter.clone()),
         recruiter_split_bps: 7_000,
         contract_pdf_hash: None,
+        referrer: None,
         tags: None,
     };
 
@@ -1619,6 +1626,7 @@ fn test_split_bps_10000_accepted() {
         co_recruiter: Some(co_recruiter.clone()),
         recruiter_split_bps: 10_000,
         contract_pdf_hash: None,
+        referrer: None,
         tags: None,
     };
 
@@ -7862,18 +7870,19 @@ fn test_recruiter_transfer_payout() {
         "ENG-RTR-PO",
     );
 
-    // Submit proof before transfer
+    // Propose and accept recruiter transfer
+    client.propose_recruiter_transfer(&recruiter, &eng_id, &new_recruiter);
+    client.accept_recruiter_transfer(&company, &eng_id);
+
+    // Confirm a milestone — payout should go to new_recruiter. Proof must be
+    // submitted by whoever is now the engagement's recruiter (issue #269's
+    // multi-signer authorization requires caller == engagement.recruiter).
     client.submit_proof(
         &new_recruiter,
         &eng_id,
         &0,
         &String::from_str(&env, "ipfs://proof"),
     );
-
-    // Propose and accept recruiter transfer
-    client.propose_recruiter_transfer(&recruiter, &eng_id, &new_recruiter);
-    client.accept_recruiter_transfer(&company, &eng_id);
-
     client.confirm_milestone(&company, &eng_id, &0);
 
     let new_recruiter_balance = token_client.balance(&new_recruiter);
@@ -7960,7 +7969,9 @@ fn test_get_arbiter_votes_default_before_any_votes() {
         &client,
         &token_id,
         &company,
-        &env, &client, &token_id, &company, &recruiter, &arbiter, "ENG-AVOTES-EMPTY",
+        &recruiter,
+        &arbiter,
+        "ENG-AVOTES-EMPTY",
     );
 
     // No vote record exists yet — should return the zero default.
@@ -7976,38 +7987,13 @@ fn test_get_arbiter_votes_default_before_any_votes() {
 fn test_multi_arbiter_quorum_with_three_arbiters_and_quorum_two() {
     let (env, contract_id, token_id, company, recruiter, _arbiter) = setup();
     let client = HireSettleContractClient::new(&env, &contract_id);
-    let _token_client = token::Client::new(&env, &token_id);
+    let token_client = token::Client::new(&env, &token_id);
 
     let a1 = Address::generate(&env);
     let a2 = Address::generate(&env);
     let a3 = Address::generate(&env);
 
-f    let eng_id = String::from_str(&env, "ENG-MULTI-ARB-3");
-    let milestones = vec![
-        &env,
-        Milestone {
-            name: String::from_str(&env, "Placement"),
-            payment_percent: 50,
-            kind: MilestoneKind::Placement,
-            valid_after_ledger: 0,
-            proof_hash: String::from_str(&env, ""),
-            status: MilestoneStatus::Pending,
-            proof_submitted_at: 0,
-            replacement_paid_out: 0,
-        },
-        Milestone {
-            name: String::from_str(&env, "Retention"),
-            payment_percent: 50,
-            kind: MilestoneKind::Placement,
-            valid_after_ledger: 0,
-            proof_hash: String::from_str(&env, ""),
-            status: MilestoneStatus::Pending,
-            proof_submitted_at: 0,
-            replacement_paid_out: 0,
-        },
-    ];
-
-    let eng_id = String::from_str(&env, "ENG-AVOTES-TALLY");
+    let eng_id = String::from_str(&env, "ENG-MULTI-ARB-3");
 
     client.create_engagement(
         &eng_id,
@@ -8021,22 +8007,46 @@ f    let eng_id = String::from_str(&env, "ENG-MULTI-ARB-3");
         &1_000_000_000,
         &String::from_str(&env, "Engineer"),
         &build_milestones(&env),
-        &ArbiterSetup { arbiters: vec![&env, a1.clone(), a2.clone(), a3.clone()], quorum: 2 },
-        &token_id,
-        &1_000_000_000,
-        &String::from_str(&env, "Engineer"),
-        &milestones,
         &vec![&env, 30u32, 90u32],
         &default_config(),
     );
 
     client.submit_proof(
         &recruiter,
-        &arbiter,
-        "ENG-AVOTES-EMPTY",
+        &eng_id,
+        &0,
+        &String::from_str(&env, "ipfs://proof-av"),
     );
+    client.raise_dispute(&company, &eng_id, &0, &String::from_str(&env, "dispute"));
 
-    // No vote record exists yet — should return the zero default.
+    // Before any vote, counts are zero.
+    let counts = client.get_arbiter_votes(&eng_id, &0);
+    assert_eq!(counts.approve_votes, 0);
+    assert_eq!(counts.reject_votes, 0);
+
+    // First arbiter approves — 1 approve, 0 reject.
+    client.cast_arbiter_vote(&a1, &eng_id, &0, &true);
+    let counts = client.get_arbiter_votes(&eng_id, &0);
+    assert_eq!(counts.approve_votes, 1);
+    assert_eq!(counts.reject_votes, 0);
+
+    // Second arbiter rejects — 1 approve, 1 reject.
+    // Quorum of 2 approves not yet reached; reject threshold (>1) not met
+    // either, so the dispute remains open.
+    client.cast_arbiter_vote(&a2, &eng_id, &0, &false);
+    let counts = client.get_arbiter_votes(&eng_id, &0);
+    assert_eq!(counts.approve_votes, 1);
+    assert_eq!(counts.reject_votes, 1);
+
+    // Third arbiter approves — 2 approves reach quorum; dispute resolved.
+    // The vote record is cleared on resolution, so get_arbiter_votes reverts
+    // to its default zero state.
+    client.cast_arbiter_vote(&a3, &eng_id, &0, &true);
+    let m0 = client.get_milestone(&eng_id, &0);
+    assert_eq!(m0.status, MilestoneStatus::Resolved);
+    assert_eq!(token_client.balance(&recruiter), 300_000_000);
+
+    // Vote record cleared — back to default zeros.
     let counts = client.get_arbiter_votes(&eng_id, &0);
     assert_eq!(counts.approve_votes, 0);
     assert_eq!(counts.reject_votes, 0);
@@ -8523,8 +8533,8 @@ fn test_escrow_callback_checkpoint_emits_when_enabled_and_target_set() {
     );
 
     let callback_target = Address::generate(&env);
-    client.set_escrow_lifecycle_callback_target(&company, &callback_target);
-    client.set_escrow_lifecycle_callback_enabled(&company, &true);
+    client.set_escrow_callback_target(&company, &callback_target);
+    client.set_escrow_callback_enabled(&company, &true);
 
     let eng_id = String::from_str(&env, "ENG-CB-ON");
     client.top_up_escrow(&company, &eng_id, &100_000_000);

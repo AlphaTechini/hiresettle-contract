@@ -378,6 +378,107 @@ pub struct ContractHealth {
     pub total_engagement_count: u64,
 }
 
+/// Running tally of ratings received by a recruiter or company, keyed by
+/// address (issue #244). Stored as sum + count rather than a running average
+/// to keep the update arithmetic exact and avoid precision drift from
+/// repeatedly re-averaging.
+#[contracttype]
+#[derive(Clone)]
+pub struct RatingRecord {
+    /// Sum of every rating received. Each rating is 1–5, so this cannot
+    /// realistically overflow `u32`.
+    pub total_score: u32,
+    /// Number of ratings received.
+    pub count: u32,
+}
+
+/// Read-only reputation summary returned by `get_recruiter_rating` and
+/// `get_company_rating` (issue #244).
+#[contracttype]
+#[derive(Clone)]
+pub struct RatingSummary {
+    /// Average rating scaled by 100 to keep two decimal places without
+    /// floating point — e.g. `425` means 4.25 stars. `0` when `count` is 0.
+    pub average_x100: u32,
+    /// Number of ratings received. `0` for an address that has never been rated.
+    pub count: u32,
+    /// Sum of every rating received, so callers can re-derive the average at a
+    /// different precision or merge tallies off-chain.
+    pub total_score: u32,
+}
+
+/// Full point-in-time snapshot of every admin-configurable parameter,
+/// returned by `get_config_snapshot` (issue #240) so off-chain callers don't
+/// need to call each individual getter (`get_platform_fee`, `get_arbiter_fee`,
+/// `get_confirm_window`, …) to reconstruct the current configuration, and can
+/// tell the defaults applied when a parameter has never been explicitly set.
+#[contracttype]
+#[derive(Clone)]
+pub struct ConfigSnapshot {
+    /// Contract version string — see `get_version`.
+    pub version: String,
+    /// Current admin address — see `get_admin`.
+    pub admin: Address,
+    /// `true` once the admin has permanently renounced the role (issue #59).
+    /// When set, every admin-gated setter panics with `"NoAdmin"`.
+    pub admin_renounced: bool,
+    /// Whether the contract is globally paused — see `is_paused`.
+    pub paused: bool,
+    /// Platform fee in basis points — see `get_platform_fee`.
+    pub platform_fee_bps: u32,
+    /// Treasury receiving platform fees — see `get_platform_fee`.
+    pub platform_fee_treasury: Address,
+    /// Arbiter fee in basis points (issue #52) — see `get_arbiter_fee`.
+    pub arbiter_fee_bps: u32,
+    /// Configured super-arbiter for escalated disputes (issue #246), if any.
+    pub super_arbiter: Option<Address>,
+    /// Confirm window in ledgers — see `get_confirm_window`.
+    pub confirm_window_ledgers: u32,
+    /// Dispute window in ledgers — see `get_dispute_window`.
+    pub dispute_window_ledgers: u32,
+    /// Proof resubmission cooldown in ledgers — see `set_proof_cooldown`.
+    pub proof_cooldown_ledgers: u32,
+    /// Due-soon notification window in ledgers (issue #241) —
+    /// see `get_due_soon_window`.
+    pub due_soon_window_ledgers: u32,
+    /// Amendment proposal TTL in ledgers — see `get_amendment_ttl`.
+    pub amendment_ttl_ledgers: u32,
+    /// Milestone extension proposal TTL in ledgers (issue #247) —
+    /// see `get_extension_ttl`.
+    pub extension_ttl_ledgers: u32,
+    /// Inactivity timeout in ledgers (issue #38) —
+    /// see `get_inactivity_timeout_ledgers`.
+    pub inactivity_timeout_ledgers: u32,
+    /// Storage TTL extension target in ledgers (issue #40) —
+    /// see `get_storage_ttl_extend_to`.
+    pub storage_ttl_extend_to: u32,
+    /// Upgrade time-lock duration in ledgers (issue #69) —
+    /// see `get_upgrade_lock_duration`.
+    pub upgrade_lock_duration_ledgers: u32,
+    /// Ledgers-per-day constant (issue #41) — see `get_ledgers_per_day`.
+    pub ledgers_per_day: u32,
+    /// Maximum milestone count per engagement (issue #21) —
+    /// see `get_max_milestones`.
+    pub max_milestones: u32,
+    /// Maximum retention window in days (issue #18) —
+    /// see `get_max_retention_days`.
+    pub max_retention_days: u32,
+    /// Maximum replacements per engagement (issue #31) —
+    /// see `get_max_replacements`.
+    pub max_replacements: u32,
+    /// Maximum simultaneously active engagements per company —
+    /// see `get_max_active_per_company`.
+    pub max_active_per_company: u32,
+    /// Maximum proof hash length in characters (issue #68) —
+    /// see `get_max_proof_hash_length`.
+    pub max_proof_hash_length: u32,
+    /// Minimum engagement amount in the token's smallest unit (issue #17) —
+    /// see `get_min_amount`.
+    pub min_engagement_amount: i128,
+    /// Whether the token allowlist is being enforced (issue #26).
+    pub token_allowlist_enabled: bool,
+}
+
 /// Reserved escrow lifecycle checkpoint action for future yield strategy
 /// integrations. Emitted only when the admin explicitly enables callback
 /// checkpoints and sets a callback target address.
@@ -398,6 +499,52 @@ pub enum EscrowLifecycleAction {
 // STORAGE KEYS
 // ============================================================
 
+/// Discriminator for a single admin-configurable scalar setting, nested inside
+/// `DataKey::Config` so each setting is still its own distinct storage key.
+/// Grouped into one wrapper variant to keep `DataKey` itself under the
+/// contract-spec union case limit of 50 (soroban_sdk's `ScSpecUdtUnionV0`).
+#[contracttype]
+#[derive(Clone)]
+pub enum ConfigKey {
+    /// Admin-configurable proof resubmission cooldown in ledgers (default 2 880).
+    ProofCooldown,
+    /// Admin-configurable TTL extension for amendment proposals (persistent).
+    AmendmentTTL,
+    /// Admin-configurable ledgers-per-day constant (issue #41).
+    LedgersPerDay,
+    /// Admin-configurable max retention days cap (issue #18).
+    MaxRetentionDays,
+    /// Admin-configurable inactivity timeout in ledgers (issue #38).
+    InactivityTimeoutLedgers,
+    /// Admin-configurable storage TTL extension in ledgers (issue #40).
+    StorageTtlExtendTo,
+    /// Admin-configurable confirm window in ledgers (default 86_400 — ~5 days).
+    ConfirmWindow,
+    /// Admin-configurable dispute window in ledgers (default 51_840 — ~3 days).
+    DisputeWindow,
+    /// Minimum engagement amount in stroops to prevent dust engagements (issue #17).
+    MinEngagementAmount,
+    /// Admin-configurable upgrade time-lock duration in ledgers (issue #69, default 17_280).
+    UpgradeLockDuration,
+    /// Admin-configurable max proof hash length in characters (issue #68, default 200).
+    MaxProofHashLength,
+    /// Admin-configurable max milestone count (issue #21, default 10).
+    MaxMilestones,
+    /// Arbiter fee in basis points (0–200, max 2%) deducted from payout on dispute approval (issue #52).
+    ArbiterFee,
+    /// Admin-configurable maximum simultaneous active engagements per company (default 50).
+    MaxActivePerCompany,
+    /// Admin-configurable maximum number of replacements allowed per engagement (issue #31, default 3).
+    MaxReplacements,
+    /// Admin-configurable TTL extension for milestone extension proposals (issue #247).
+    MilestoneExtensionTTL,
+    /// Admin-configurable due-soon notification window in ledgers (issue #241,
+    /// default 17_280 — ~1 day).
+    DueSoonWindow,
+    /// Admin-configured referral discount in basis points (issue #251).
+    ReferralDiscountBps,
+}
+
 /// Contract storage key space. Instance keys reset between transactions;
 /// persistent keys survive across ledgers.
 #[contracttype]
@@ -416,8 +563,6 @@ pub enum DataKey {
     PendingAdmin,
     /// Proposed new recruiter address awaiting company acceptance (issue #44).
     ProposedRecruiterTransfer(String),
-    /// Admin-configurable proof resubmission cooldown in ledgers (default 2 880).
-    ProofCooldown,
     /// Ledger at which the last proof was submitted for (engagement_id, milestone_index).
     LastProofAt(String, u32),
     /// Running vote tally for a disputed (engagement_id, milestone_index).
@@ -426,8 +571,6 @@ pub enum DataKey {
     AmendmentProposal(String, u32),
     /// Amendment log entries for an engagement milestone (persistent).
     AmendmentLog(String, u32),
-    /// Admin-configurable TTL extension for amendment proposals (persistent).
-    AmendmentTTL,
     /// Total number of engagements ever created (issue #34).
     EngagementCount,
     /// Per-company ordered list of engagement IDs (issue #35).
@@ -438,8 +581,6 @@ pub enum DataKey {
     AllowedTokens,
     /// Whether the token allowlist is enabled (issue #26).
     AllowlistEnabled,
-    /// Admin-configurable ledgers-per-day constant (issue #41).
-    LedgersPerDay,
     /// Dispute reason string stored per (engagement_id, milestone_index) (issue #50).
     DisputeReason(String, u32),
     /// Structured reason code stored per (engagement_id, replacement_index)
@@ -448,38 +589,14 @@ pub enum DataKey {
     /// Number of replacements ever requested for an engagement (issue #51).
     /// Acts as the next replacement_index when incremented.
     ReplacementCount(String),
-    /// Admin-configurable max retention days cap (issue #18).
-    MaxRetentionDays,
-    /// Admin-configurable inactivity timeout in ledgers (issue #38).
-    InactivityTimeoutLedgers,
-    /// Admin-configurable storage TTL extension in ledgers (issue #40).
-    StorageTtlExtendTo,
-    /// Admin-configurable confirm window in ledgers (default 86_400 — ~5 days).
-    ConfirmWindow,
-    /// Admin-configurable dispute window in ledgers (default 51_840 — ~3 days).
-    DisputeWindow,
     /// Contract version string (e.g. "0.2.0") for deployment verification (issue #16).
     Version,
-    /// Minimum engagement amount in stroops to prevent dust engagements (issue #17).
-    MinEngagementAmount,
     /// Pending contract WASM upgrade proposal (issue #69).
     PendingUpgrade,
-    /// Admin-configurable upgrade time-lock duration in ledgers (issue #69, default 17_280).
-    UpgradeLockDuration,
-    /// Admin-configurable max proof hash length in characters (issue #68, default 200).
-    MaxProofHashLength,
-    /// Admin-configurable max milestone count (issue #21, default 10).
-    MaxMilestones,
-    /// Arbiter fee in basis points (0–200, max 2%) deducted from payout on dispute approval (issue #52).
-    ArbiterFee,
     /// Set to true once admin has permanently renounced their role (issue #59).
     AdminRenounced,
-    /// Admin-configurable maximum simultaneous active engagements per company (default 50).
-    MaxActivePerCompany,
     /// Per-company count of currently active (non-terminal) engagements.
     CompanyActiveCount(Address),
-    /// Admin-configurable maximum number of replacements allowed per engagement (issue #31, default 3).
-    MaxReplacements,
     /// Per-tag list of engagement IDs (issue #249).
     EngagementTag(String),
     /// Optional co-signer address authorized to perform company-gated actions (issue #254).
@@ -489,14 +606,22 @@ pub enum DataKey {
     RecruiterCosigner(Address),
     /// Admin-gated switch for escrow lifecycle callback checkpoints.
     /// Defaults to `false` (no-op).
-    EscrowLifecycleCallbackEnabled,
+    EscrowCallbackEnabled,
     /// Reserved callback target address for future yield-strategy integration.
-    EscrowLifecycleCallbackTarget,
+    EscrowCallbackTarget,
+    /// Fee tiers for tiered platform fee (issue #250).
+    FeeTiers,
+    /// Whether a recruiter has been rated for this engagement (issue #242).
+    RecruiterRated(String),
+    /// Whether a company has been rated for this engagement (issue #243).
+    CompanyRated(String),
+    /// Running rating tally for a recruiter address (issue #244).
+    RecruiterRating(Address),
+    /// Running rating tally for a company address (issue #244).
+    CompanyRating(Address),
     /// Active milestone extension proposal for a Locked retention milestone,
     /// awaiting company approval (issue #247).
     MilestoneExtensionProposal(String, u32),
-    /// Admin-configurable TTL extension for milestone extension proposals (issue #247).
-    MilestoneExtensionTTL,
     /// Admin-configurable super-arbiter address for tie-breaking escalated
     /// disputes (issue #246).
     SuperArbiter,
@@ -508,9 +633,6 @@ pub enum DataKey {
     EscalatedDispute(String, u32),
     /// Per-tag index mapping tag string to list of engagement IDs (issue #248, #249).
     TagEngagements(String),
-    /// Admin-configurable due-soon notification window in ledgers (issue #241,
-    /// default 17_280 — ~1 day).
-    DueSoonWindow,
     /// Set once a `milestone_due_soon` event has been emitted for
     /// (engagement_id, milestone_index), so the notification fires at most once
     /// per unlock deadline (issue #241).
@@ -521,6 +643,11 @@ pub enum DataKey {
     /// Global ordered list of every engagement ID ever created (issue #237).
     /// Backs `get_engagement_ids_by_status`.
     AllEngagements,
+    /// Admin-configured list of recognised referrer addresses (issue #251).
+    Referrers,
+    /// Wraps a `ConfigKey` so every admin-tunable scalar setting shares one
+    /// `DataKey` variant instead of each needing its own. See `ConfigKey`.
+    Config(ConfigKey),
 }
 
 // ============================================================
@@ -591,7 +718,7 @@ impl HireSettleContract {
     /// - `DataKey::Paused`: Set to `false`
     /// - `DataKey::PlatformFee`: Set to 0 bps with treasury `admin`
     /// - `DataKey::Version`: Set to `DEFAULT_VERSION` ("0.2.0")
-    /// - `DataKey::MinEngagementAmount`: Set to `DEFAULT_MIN_ENGAGEMENT_AMOUNT` (100,000 stroops)
+    /// - `DataKey::Config(ConfigKey::MinEngagementAmount)`: Set to `DEFAULT_MIN_ENGAGEMENT_AMOUNT` (100,000 stroops)
     ///
     /// # One-Time-Only / Calling Twice
     /// Note: No already-initialized guard is currently present. If invoked again, it will overwrite
@@ -618,7 +745,7 @@ impl HireSettleContract {
 
         // Issue #17: Initialize minimum engagement amount
         env.storage().persistent().set(
-            &DataKey::MinEngagementAmount,
+            &DataKey::Config(ConfigKey::MinEngagementAmount),
             &DEFAULT_MIN_ENGAGEMENT_AMOUNT,
         );
     }
@@ -653,6 +780,93 @@ impl HireSettleContract {
     pub fn get_platform_fee(env: Env) -> (u32, Address) {
         let fee = Self::get_platform_fee_internal(&env);
         (fee.bps, fee.treasury)
+    }
+
+    /// Admin adds a referrer address to the recognised referral list (issue #251).
+    pub fn add_referrer(env: Env, admin: Address, referrer: Address) {
+        Self::assert_not_paused(&env);
+        Self::assert_admin(&env, &admin);
+
+        let mut list: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Referrers)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        // Prevent duplicates.
+        for i in 0..list.len() {
+            if list.get(i).unwrap() == referrer {
+                panic!("referrer already exists");
+            }
+        }
+        list.push_back(referrer.clone());
+        env.storage().persistent().set(&DataKey::Referrers, &list);
+        env.events()
+            .publish((Symbol::new(&env, "referrer_added"),), referrer);
+    }
+
+    /// Admin removes a referrer address from the recognised referral list.
+    pub fn remove_referrer(env: Env, admin: Address, referrer: Address) {
+        Self::assert_not_paused(&env);
+        Self::assert_admin(&env, &admin);
+
+        let list: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Referrers)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut new_list: Vec<Address> = Vec::new(&env);
+        let mut found = false;
+        for i in 0..list.len() {
+            let addr = list.get(i).unwrap();
+            if addr == referrer {
+                found = true;
+            } else {
+                new_list.push_back(addr);
+            }
+        }
+        if !found {
+            panic!("referrer not found");
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::Referrers, &new_list);
+        env.events()
+            .publish((Symbol::new(&env, "referrer_removed"),), referrer);
+    }
+
+    /// Return the list of recognised referrer addresses.
+    pub fn get_referrers(env: Env) -> Vec<Address> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Referrers)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Admin sets the referral discount in basis points (issue #251).
+    /// When a recognised referrer is attached to an engagement, the platform
+    /// fee is reduced by this amount (but never below 0).
+    /// Maximum 500 bps (same as max platform fee).
+    pub fn set_referral_discount_bps(env: Env, admin: Address, bps: u32) {
+        Self::assert_not_paused(&env);
+        Self::assert_admin(&env, &admin);
+        if bps > MAX_PLATFORM_FEE_BPS {
+            panic!("discount too high");
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::Config(ConfigKey::ReferralDiscountBps), &bps);
+        env.events()
+            .publish((Symbol::new(&env, "referral_discount_set"),), bps);
+    }
+
+    /// Return the current referral discount in basis points (default 0).
+    pub fn get_referral_discount_bps(env: Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Config(ConfigKey::ReferralDiscountBps))
+            .unwrap_or(0u32)
     }
 
     /// Admin sets fee tiers that scale the platform fee down for larger
@@ -734,7 +948,7 @@ impl HireSettleContract {
 
         env.storage()
             .persistent()
-            .set(&DataKey::MinEngagementAmount, &amount);
+            .set(&DataKey::Config(ConfigKey::MinEngagementAmount), &amount);
         env.events()
             .publish((Symbol::new(&env, "min_amount_set"),), amount);
     }
@@ -944,13 +1158,13 @@ impl HireSettleContract {
         }
         env.storage()
             .instance()
-            .set(&DataKey::ProofCooldown, &ledgers);
+            .set(&DataKey::Config(ConfigKey::ProofCooldown), &ledgers);
     }
 
     fn get_proof_cooldown(env: &Env) -> u32 {
         env.storage()
             .instance()
-            .get(&DataKey::ProofCooldown)
+            .get(&DataKey::Config(ConfigKey::ProofCooldown))
             .unwrap_or(DEFAULT_PROOF_COOLDOWN)
     }
 
@@ -1179,7 +1393,7 @@ impl HireSettleContract {
         let max_active: u32 = env
             .storage()
             .instance()
-            .get(&DataKey::MaxActivePerCompany)
+            .get(&DataKey::Config(ConfigKey::MaxActivePerCompany))
             .unwrap_or(DEFAULT_MAX_ACTIVE_PER_COMPANY);
         if active_count >= max_active {
             panic!("CompanyActiveLimitReached");
@@ -1480,7 +1694,7 @@ impl HireSettleContract {
         }
         env.storage()
             .instance()
-            .set(&DataKey::DueSoonWindow, &ledgers);
+            .set(&DataKey::Config(ConfigKey::DueSoonWindow), &ledgers);
         env.events()
             .publish((Symbol::new(&env, "due_soon_window_set"),), ledgers);
     }
@@ -1490,7 +1704,7 @@ impl HireSettleContract {
     pub fn get_due_soon_window(env: Env) -> u32 {
         env.storage()
             .instance()
-            .get(&DataKey::DueSoonWindow)
+            .get(&DataKey::Config(ConfigKey::DueSoonWindow))
             .unwrap_or(DEFAULT_DUE_SOON_WINDOW_LEDGERS)
     }
 
@@ -1997,7 +2211,7 @@ impl HireSettleContract {
         let dispute_window = env
             .storage()
             .instance()
-            .get(&DataKey::DisputeWindow)
+            .get(&DataKey::Config(ConfigKey::DisputeWindow))
             .unwrap_or(DEFAULT_DISPUTE_WINDOW_LEDGERS);
 
         if current_ledger > milestone.proof_submitted_at + dispute_window {
@@ -2119,7 +2333,7 @@ impl HireSettleContract {
             let arbiter_fee_bps: u32 = env
                 .storage()
                 .instance()
-                .get(&DataKey::ArbiterFee)
+                .get(&DataKey::Config(ConfigKey::ArbiterFee))
                 .unwrap_or(0u32);
             let arbiter_fee_amount = (payment * arbiter_fee_bps as i128) / 10_000;
             let net_payment = payment - arbiter_fee_amount;
@@ -2298,14 +2512,6 @@ impl HireSettleContract {
             panic!("{}", ERR_ENGAGEMENT_NOT_ACTIVE);
         }
 
-        if !Self::is_authorized_company(&env, &company, &engagement.company) {
-            panic!("{}", ERR_UNAUTHORIZED);
-        }
-
-        let placement_confirmed = {
-            let m0 = engagement.milestones.get(0).unwrap();
-            m0.status == MilestoneStatus::Confirmed || m0.status == MilestoneStatus::Resolved
-        };
         let milestone = Self::get_milestone_or_panic(&engagement, milestone_index);
 
         if milestone.status != MilestoneStatus::Disputed {
@@ -2324,7 +2530,7 @@ impl HireSettleContract {
         let dispute_window = env
             .storage()
             .instance()
-            .get(&DataKey::DisputeWindow)
+            .get(&DataKey::Config(ConfigKey::DisputeWindow))
             .unwrap_or(DEFAULT_DISPUTE_WINDOW_LEDGERS);
 
         let current_ledger = env.ledger().sequence();
@@ -2436,7 +2642,7 @@ impl HireSettleContract {
             let arbiter_fee_bps: u32 = env
                 .storage()
                 .instance()
-                .get(&DataKey::ArbiterFee)
+                .get(&DataKey::Config(ConfigKey::ArbiterFee))
                 .unwrap_or(0u32);
             let arbiter_fee_amount = (payment * arbiter_fee_bps as i128) / 10_000;
             let net_payment = payment - arbiter_fee_amount;
@@ -2763,7 +2969,7 @@ impl HireSettleContract {
         Self::assert_admin(&env, &admin);
         env.storage()
             .instance()
-            .set(&DataKey::MaxReplacements, &count);
+            .set(&DataKey::Config(ConfigKey::MaxReplacements), &count);
         env.events()
             .publish((Symbol::new(&env, "max_replacements_set"),), count);
     }
@@ -2867,21 +3073,21 @@ impl HireSettleContract {
 
     /// Set (or update) the callback target address reserved for future
     /// yield-strategy integrations. Admin only.
-    pub fn set_escrow_lifecycle_callback_target(env: Env, admin: Address, target: Address) {
+    pub fn set_escrow_callback_target(env: Env, admin: Address, target: Address) {
         Self::assert_admin(&env, &admin);
         env.storage()
             .persistent()
-            .set(&DataKey::EscrowLifecycleCallbackTarget, &target);
+            .set(&DataKey::EscrowCallbackTarget, &target);
         env.events()
             .publish((Symbol::new(&env, "escrow_callback_target_set"),), target);
     }
 
     /// Clear the reserved escrow callback target. Admin only.
-    pub fn clear_escrow_lifecycle_callback_target(env: Env, admin: Address) {
+    pub fn clear_escrow_callback_target(env: Env, admin: Address) {
         Self::assert_admin(&env, &admin);
         env.storage()
             .persistent()
-            .remove(&DataKey::EscrowLifecycleCallbackTarget);
+            .remove(&DataKey::EscrowCallbackTarget);
         env.events()
             .publish((Symbol::new(&env, "escrow_callback_target_cleared"),), ());
     }
@@ -2889,11 +3095,11 @@ impl HireSettleContract {
     /// Enable or disable escrow lifecycle callback checkpoints. Admin only.
     ///
     /// Defaults to `false`, which keeps the checkpoint path as a no-op.
-    pub fn set_escrow_lifecycle_callback_enabled(env: Env, admin: Address, enabled: bool) {
+    pub fn set_escrow_callback_enabled(env: Env, admin: Address, enabled: bool) {
         Self::assert_admin(&env, &admin);
         env.storage()
             .persistent()
-            .set(&DataKey::EscrowLifecycleCallbackEnabled, &enabled);
+            .set(&DataKey::EscrowCallbackEnabled, &enabled);
         env.events().publish(
             (Symbol::new(&env, "escrow_callback_enabled_set"),),
             enabled,
@@ -2901,16 +3107,16 @@ impl HireSettleContract {
     }
 
     /// Return `(enabled, target)` for the reserved escrow callback checkpoint.
-    pub fn get_escrow_lifecycle_callback_config(env: Env) -> (bool, Option<Address>) {
+    pub fn get_escrow_callback_config(env: Env) -> (bool, Option<Address>) {
         let enabled: bool = env
             .storage()
             .persistent()
-            .get(&DataKey::EscrowLifecycleCallbackEnabled)
+            .get(&DataKey::EscrowCallbackEnabled)
             .unwrap_or(false);
         let target: Option<Address> = env
             .storage()
             .persistent()
-            .get(&DataKey::EscrowLifecycleCallbackTarget);
+            .get(&DataKey::EscrowCallbackTarget);
         (enabled, target)
     }
 
@@ -3291,7 +3497,7 @@ impl HireSettleContract {
     pub fn get_min_amount(env: Env) -> i128 {
         env.storage()
             .persistent()
-            .get(&DataKey::MinEngagementAmount)
+            .get(&DataKey::Config(ConfigKey::MinEngagementAmount))
             .unwrap_or(DEFAULT_MIN_ENGAGEMENT_AMOUNT)
     }
 
@@ -3458,6 +3664,7 @@ impl HireSettleContract {
             co_recruiter: engagement.co_recruiter,
             recruiter_split_bps: engagement.recruiter_split_bps,
             contract_pdf_hash: engagement.contract_pdf_hash,
+            referrer: engagement.referrer,
             tags: engagement.tags,
         }
     }
@@ -3500,6 +3707,8 @@ impl HireSettleContract {
                     co_recruiter: engagement.co_recruiter,
                     recruiter_split_bps: engagement.recruiter_split_bps,
                     contract_pdf_hash: engagement.contract_pdf_hash,
+                    referrer: engagement.referrer,
+                    tags: engagement.tags,
                 });
             }
         }
@@ -3778,11 +3987,11 @@ impl HireSettleContract {
 
         env.storage()
             .persistent()
-            .set(&DataKey::AmendmentTTL, &ledgers);
+            .set(&DataKey::Config(ConfigKey::AmendmentTTL), &ledgers);
 
         env.storage()
             .persistent()
-            .extend_ttl(&DataKey::AmendmentTTL, 100_000, 6_300_000);
+            .extend_ttl(&DataKey::Config(ConfigKey::AmendmentTTL), 100_000, 6_300_000);
     }
 
     /// Get the current amendment proposal TTL in ledgers.
@@ -3790,7 +3999,7 @@ impl HireSettleContract {
     pub fn get_amendment_ttl(env: Env) -> u32 {
         env.storage()
             .persistent()
-            .get(&DataKey::AmendmentTTL)
+            .get(&DataKey::Config(ConfigKey::AmendmentTTL))
             .unwrap_or(17_280)
     }
 
@@ -3831,7 +4040,7 @@ impl HireSettleContract {
         let ttl = env
             .storage()
             .persistent()
-            .get(&DataKey::AmendmentTTL)
+            .get(&DataKey::Config(ConfigKey::AmendmentTTL))
             .unwrap_or(17_280);
 
         let proposal = AmendmentProposal {
@@ -4344,11 +4553,11 @@ impl HireSettleContract {
 
         env.storage()
             .persistent()
-            .set(&DataKey::MilestoneExtensionTTL, &ledgers);
+            .set(&DataKey::Config(ConfigKey::MilestoneExtensionTTL), &ledgers);
 
         env.storage()
             .persistent()
-            .extend_ttl(&DataKey::MilestoneExtensionTTL, 100_000, 6_300_000);
+            .extend_ttl(&DataKey::Config(ConfigKey::MilestoneExtensionTTL), 100_000, 6_300_000);
     }
 
     /// Get the current milestone extension proposal TTL in ledgers.
@@ -4356,7 +4565,7 @@ impl HireSettleContract {
     pub fn get_extension_ttl(env: Env) -> u32 {
         env.storage()
             .persistent()
-            .get(&DataKey::MilestoneExtensionTTL)
+            .get(&DataKey::Config(ConfigKey::MilestoneExtensionTTL))
             .unwrap_or(DEFAULT_EXTENSION_TTL)
     }
 
@@ -5040,9 +5249,9 @@ impl HireSettleContract {
         }
     }
 
-    /// Return a paginated slice of engagement IDs for a given tag.
-    /// `page` is 0-indexed; out-of-range pages return an empty vec.
-    pub fn get_engagements_by_tag(
+    /// Return a paginated slice of engagement IDs currently in a given status
+    /// (issue #237). `page` is 0-indexed; out-of-range pages return an empty vec.
+    pub fn get_engagement_ids_by_status(
         env: Env,
         status: EngagementStatus,
         page: u32,
@@ -5161,7 +5370,7 @@ impl HireSettleContract {
         ids.len()
     }
 
-4    // ----------------------------------------------------------
+    // ----------------------------------------------------------
     // ISSUE #41 — CONFIGURABLE LEDGERS PER DAY
     // ----------------------------------------------------------
 
@@ -5173,7 +5382,7 @@ impl HireSettleContract {
         }
         env.storage()
             .instance()
-            .set(&DataKey::LedgersPerDay, &value);
+            .set(&DataKey::Config(ConfigKey::LedgersPerDay), &value);
         env.events()
             .publish((Symbol::new(&env, "ledgers_per_day_set"),), value);
     }
@@ -5198,7 +5407,7 @@ impl HireSettleContract {
         Self::assert_admin(&env, &admin);
         env.storage()
             .instance()
-            .set(&DataKey::MaxRetentionDays, &days);
+            .set(&DataKey::Config(ConfigKey::MaxRetentionDays), &days);
         env.events()
             .publish((Symbol::new(&env, "max_retention_days_set"),), days);
     }
@@ -5207,7 +5416,7 @@ impl HireSettleContract {
     pub fn get_max_retention_days(env: Env) -> u32 {
         env.storage()
             .instance()
-            .get(&DataKey::MaxRetentionDays)
+            .get(&DataKey::Config(ConfigKey::MaxRetentionDays))
             .unwrap_or(DEFAULT_MAX_RETENTION_DAYS)
     }
 
@@ -5226,7 +5435,7 @@ impl HireSettleContract {
         Self::assert_admin(&env, &admin);
         env.storage()
             .instance()
-            .set(&DataKey::MaxMilestones, &count);
+            .set(&DataKey::Config(ConfigKey::MaxMilestones), &count);
         env.events()
             .publish((Symbol::new(&env, "max_milestones_set"),), count);
     }
@@ -5235,7 +5444,7 @@ impl HireSettleContract {
     pub fn get_max_milestones(env: Env) -> u32 {
         env.storage()
             .instance()
-            .get(&DataKey::MaxMilestones)
+            .get(&DataKey::Config(ConfigKey::MaxMilestones))
             .unwrap_or(DEFAULT_MAX_MILESTONES)
     }
 
@@ -5256,7 +5465,7 @@ impl HireSettleContract {
         }
         env.storage()
             .instance()
-            .set(&DataKey::MaxActivePerCompany, &count);
+            .set(&DataKey::Config(ConfigKey::MaxActivePerCompany), &count);
         env.events()
             .publish((Symbol::new(&env, "max_active_per_company_set"),), count);
     }
@@ -5266,7 +5475,7 @@ impl HireSettleContract {
     pub fn get_max_active_per_company(env: Env) -> u32 {
         env.storage()
             .instance()
-            .get(&DataKey::MaxActivePerCompany)
+            .get(&DataKey::Config(ConfigKey::MaxActivePerCompany))
             .unwrap_or(DEFAULT_MAX_ACTIVE_PER_COMPANY)
     }
 
@@ -5287,7 +5496,7 @@ impl HireSettleContract {
         Self::assert_admin(&env, &admin);
         env.storage()
             .instance()
-            .set(&DataKey::InactivityTimeoutLedgers, &ledgers);
+            .set(&DataKey::Config(ConfigKey::InactivityTimeoutLedgers), &ledgers);
         env.events()
             .publish((Symbol::new(&env, "inactivity_timeout_set"),), ledgers);
     }
@@ -5296,7 +5505,7 @@ impl HireSettleContract {
     pub fn get_inactivity_timeout_ledgers(env: Env) -> u32 {
         env.storage()
             .instance()
-            .get(&DataKey::InactivityTimeoutLedgers)
+            .get(&DataKey::Config(ConfigKey::InactivityTimeoutLedgers))
             .unwrap_or(DEFAULT_INACTIVITY_TIMEOUT_LEDGERS)
     }
 
@@ -5389,7 +5598,7 @@ impl HireSettleContract {
         Self::assert_admin(&env, &admin);
         env.storage()
             .instance()
-            .set(&DataKey::StorageTtlExtendTo, &ledgers);
+            .set(&DataKey::Config(ConfigKey::StorageTtlExtendTo), &ledgers);
         env.events()
             .publish((Symbol::new(&env, "storage_ttl_extend_to_set"),), ledgers);
     }
@@ -5398,7 +5607,7 @@ impl HireSettleContract {
     pub fn get_storage_ttl_extend_to(env: Env) -> u32 {
         env.storage()
             .instance()
-            .get(&DataKey::StorageTtlExtendTo)
+            .get(&DataKey::Config(ConfigKey::StorageTtlExtendTo))
             .unwrap_or(DEFAULT_STORAGE_TTL_EXTEND_TO)
     }
 
@@ -5651,7 +5860,7 @@ impl HireSettleContract {
         Self::assert_admin(&env, &admin);
         env.storage()
             .instance()
-            .set(&DataKey::ConfirmWindow, &ledgers);
+            .set(&DataKey::Config(ConfigKey::ConfirmWindow), &ledgers);
         env.events()
             .publish((Symbol::new(&env, "confirm_window_set"),), ledgers);
     }
@@ -5660,7 +5869,7 @@ impl HireSettleContract {
     pub fn get_confirm_window(env: Env) -> u32 {
         env.storage()
             .instance()
-            .get(&DataKey::ConfirmWindow)
+            .get(&DataKey::Config(ConfigKey::ConfirmWindow))
             .unwrap_or(DEFAULT_CONFIRM_WINDOW_LEDGERS)
     }
 
@@ -5674,7 +5883,7 @@ impl HireSettleContract {
         Self::assert_admin(&env, &admin);
         env.storage()
             .instance()
-            .set(&DataKey::DisputeWindow, &ledgers);
+            .set(&DataKey::Config(ConfigKey::DisputeWindow), &ledgers);
         env.events()
             .publish((Symbol::new(&env, "dispute_window_set"),), ledgers);
     }
@@ -5683,7 +5892,7 @@ impl HireSettleContract {
     pub fn get_dispute_window(env: Env) -> u32 {
         env.storage()
             .instance()
-            .get(&DataKey::DisputeWindow)
+            .get(&DataKey::Config(ConfigKey::DisputeWindow))
             .unwrap_or(DEFAULT_DISPUTE_WINDOW_LEDGERS)
     }
 
@@ -5722,7 +5931,7 @@ impl HireSettleContract {
         let window = env
             .storage()
             .instance()
-            .get(&DataKey::ConfirmWindow)
+            .get(&DataKey::Config(ConfigKey::ConfirmWindow))
             .unwrap_or(DEFAULT_CONFIRM_WINDOW_LEDGERS);
 
         if current_ledger <= milestone.proof_submitted_at + window {
@@ -5864,7 +6073,7 @@ impl HireSettleContract {
         let lock_duration: u32 = env
             .storage()
             .instance()
-            .get(&DataKey::UpgradeLockDuration)
+            .get(&DataKey::Config(ConfigKey::UpgradeLockDuration))
             .unwrap_or(LEDGERS_PER_DAY);
 
         let execute_after_ledger = env.ledger().sequence() + lock_duration;
@@ -5916,7 +6125,7 @@ impl HireSettleContract {
         Self::assert_admin(&env, &admin);
         env.storage()
             .instance()
-            .set(&DataKey::UpgradeLockDuration, &ledgers);
+            .set(&DataKey::Config(ConfigKey::UpgradeLockDuration), &ledgers);
         env.events()
             .publish((Symbol::new(&env, "upgrade_lock_duration_set"),), ledgers);
     }
@@ -5926,7 +6135,7 @@ impl HireSettleContract {
     pub fn get_upgrade_lock_duration(env: Env) -> u32 {
         env.storage()
             .instance()
-            .get(&DataKey::UpgradeLockDuration)
+            .get(&DataKey::Config(ConfigKey::UpgradeLockDuration))
             .unwrap_or(LEDGERS_PER_DAY)
     }
 
@@ -5943,7 +6152,7 @@ impl HireSettleContract {
         }
         env.storage()
             .instance()
-            .set(&DataKey::MaxProofHashLength, &len);
+            .set(&DataKey::Config(ConfigKey::MaxProofHashLength), &len);
         env.events()
             .publish((Symbol::new(&env, "max_proof_hash_length_set"),), len);
     }
@@ -5965,7 +6174,7 @@ impl HireSettleContract {
         if bps > MAX_ARBITER_FEE_BPS {
             panic!("ArbiterFeeTooHigh");
         }
-        env.storage().instance().set(&DataKey::ArbiterFee, &bps);
+        env.storage().instance().set(&DataKey::Config(ConfigKey::ArbiterFee), &bps);
         env.events()
             .publish((Symbol::new(&env, "arbiter_fee_set"),), bps);
     }
@@ -5975,7 +6184,7 @@ impl HireSettleContract {
     pub fn get_arbiter_fee(env: Env) -> u32 {
         env.storage()
             .instance()
-            .get(&DataKey::ArbiterFee)
+            .get(&DataKey::Config(ConfigKey::ArbiterFee))
             .unwrap_or(0u32)
     }
 
@@ -6145,7 +6354,7 @@ impl HireSettleContract {
         let enabled: bool = env
             .storage()
             .persistent()
-            .get(&DataKey::EscrowLifecycleCallbackEnabled)
+            .get(&DataKey::EscrowCallbackEnabled)
             .unwrap_or(false);
         if !enabled {
             return;
@@ -6154,7 +6363,7 @@ impl HireSettleContract {
         let target: Option<Address> = env
             .storage()
             .persistent()
-            .get(&DataKey::EscrowLifecycleCallbackTarget);
+            .get(&DataKey::EscrowCallbackTarget);
         let callback_target = match target {
             Some(addr) => addr,
             None => return,
@@ -6333,24 +6542,51 @@ impl HireSettleContract {
         base_bps
     }
 
+    /// If the engagement has a recognised referrer, reduce the given bps
+    /// by the admin-configured referral discount (never below 0).
+    fn apply_referral_discount(env: &Env, bps: u32, referrer: &Option<Address>) -> u32 {
+        if let Some(ref_addr) = referrer {
+            let referrers: Option<Vec<Address>> =
+                env.storage().persistent().get(&DataKey::Referrers);
+            if let Some(list) = referrers {
+                let mut recognised = false;
+                for i in 0..list.len() {
+                    if list.get(i).unwrap() == *ref_addr {
+                        recognised = true;
+                        break;
+                    }
+                }
+                if recognised {
+                    let discount: u32 = env
+                        .storage()
+                        .persistent()
+                        .get(&DataKey::Config(ConfigKey::ReferralDiscountBps))
+                        .unwrap_or(0u32);
+                    return if discount >= bps { 0 } else { bps - discount };
+                }
+            }
+        }
+        bps
+    }
+
     fn get_ledgers_per_day_internal(env: &Env) -> u32 {
         env.storage()
             .instance()
-            .get(&DataKey::LedgersPerDay)
+            .get(&DataKey::Config(ConfigKey::LedgersPerDay))
             .unwrap_or(LEDGERS_PER_DAY)
     }
 
     fn get_max_proof_hash_length_internal(env: &Env) -> u32 {
         env.storage()
             .instance()
-            .get(&DataKey::MaxProofHashLength)
+            .get(&DataKey::Config(ConfigKey::MaxProofHashLength))
             .unwrap_or(MAX_PROOF_HASH_LENGTH)
     }
 
     fn get_max_replacements_internal(env: &Env) -> u32 {
         env.storage()
             .instance()
-            .get(&DataKey::MaxReplacements)
+            .get(&DataKey::Config(ConfigKey::MaxReplacements))
             .unwrap_or(DEFAULT_MAX_REPLACEMENTS)
     }
 
