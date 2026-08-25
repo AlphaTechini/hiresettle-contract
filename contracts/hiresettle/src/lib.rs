@@ -5085,6 +5085,35 @@ impl HireSettleContract {
             .unwrap_or(0u64)
     }
 
+    /// Return the number of engagements attributed to a given referrer.
+    ///
+    /// This scans the global engagement index and counts stored referrer
+    /// attribution, regardless of the engagement's current lifecycle status.
+    /// Missing engagement records are skipped when their persistent storage has
+    /// expired.
+    pub fn get_referral_engagement_count(env: Env, referrer: Address) -> u32 {
+        let ids: Vec<String> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AllEngagements)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut count: u32 = 0;
+        for i in 0..ids.len() {
+            let id = ids.get(i).unwrap();
+            if let Some(engagement) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, Engagement>(&DataKey::Engagement(id))
+            {
+                if engagement.referrer.as_ref() == Some(&referrer) {
+                    count = count.saturating_add(1);
+                }
+            }
+        }
+        count
+    }
+
     // ----------------------------------------------------------
     // ISSUE #35 — ENGAGEMENT LIST BY COMPANY
     // ----------------------------------------------------------
