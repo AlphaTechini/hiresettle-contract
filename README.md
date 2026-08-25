@@ -657,7 +657,6 @@ All read-only functions are permissionless and require no authentication.
 | Function | Arguments | Return Type |
 |---|---|---|
 | `get_engagement_count` | — | `u64` |
-| `get_referral_engagement_count` | `referrer: Address` | `u32` |
 | `get_company_engagement_count` | `company: Address` | `u32` |
 | `get_engagements_by_company` | `company: Address`, `page: u32`, `page_size: u32` | `Vec<String>` |
 | `get_company_active_count` | `company: Address` | `u32` |
